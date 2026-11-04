@@ -175,6 +175,9 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
   if (OB_SUCC(ret)) {
     if (has_api_key && !access_key_.empty() && OB_FAIL(encrypt_access_key_(allocator, access_key_, access_key_))) {
       LOG_WARN("failed to encrypt access key", K(ret));
+    } else if (OB_ISNULL(access_key_.ptr())) {
+      // ALTER 未携带 access_key 时，避免把空串退化成 NULL（NULL 会导致后续解密/请求返回 -4152）
+      access_key_.assign_ptr("", 0);
     } else if (OB_FAIL(check_valid())) {
     }
   }
@@ -224,8 +227,10 @@ int ObAiModelEndpointInfo::get_unencrypted_access_key(common::ObIAllocator &allo
 {
   int ret = OB_SUCCESS;
   if (access_key_.empty()) {
-    // Ollama 等本地部署的 provider 允许空 access key，此时无需解密
-    unencrypted_access_key.reset();
+    // Ollama 等本地部署的 provider 允许空 access key，此时无需解密。
+    // 注意：必须给出“非空指针 + 长度 0”的空串，不能 reset 成 NULL，
+    // 否则后续 ob_write_string/请求构造会因 NULL 值报 OB_ERR_NULL_VALUE(-4152)。
+    unencrypted_access_key.assign_ptr("", 0);
   } else if (OB_FAIL(decrypt_access_key_(allocator, access_key_, unencrypted_access_key))) {
   }
   return ret;
