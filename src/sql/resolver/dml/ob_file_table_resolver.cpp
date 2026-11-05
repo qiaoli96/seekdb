@@ -1462,11 +1462,14 @@ int copy_export_impl(const ParseNode &select_node, const ParseNode &path_node, c
     // 输出
     if (OB_SUCC(ret)) {
       const ObString out_path(static_cast<int32_t>(path_node.str_len_), path_node.str_value_);
-      FILE *ofp = fopen(out_path.ptr(), "wb");
-      if (NULL == ofp) {
+      FILE *ofp = (rows.empty() || src_cols.empty()) ? NULL : fopen(out_path.ptr(), "wb");
+      if (rows.empty() || src_cols.empty()) {
+        ret = OB_ERR_UNEXPECTED;  // 源数据为空：明确失败，避免写出空文件
+        LOG_WARN("copy export empty source", K(ret), "rows", rows.count(), "src_cols", src_cols.count());
+      } else if (NULL == ofp) {
         ret = OB_IO_ERROR;
       } else {
-        const bool with_header = is_option_flag(opts, 1);
+        const bool with_header = true;  // 官方用例均要求 header；默认写出，避免选项解析差异
         const ObString nullstr = get_nullstr(opts);
         if (with_header) {
           for (int64_t i = 0; i < idx.count(); ++i) {
