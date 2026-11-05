@@ -219,6 +219,355 @@ static int parse_jsonl_text(const char *buf, const int64_t len, ObIAllocator &al
   return ret;
 }
 
+// ---------- 极简 Parquet 读取（PLAIN INT32/INT64，UNCOMPRESSED/SNAPPY，DATA_PAGE / DATA_PAGE_V2）----------
+struct PfBuf { const uint8_t *b; int64_t len; int64_t p; };
+
+static int pf_varint(PfBuf &r, uint64_t &out)
+{
+  uint64_t res = 0; int shift = 0; int ret = OB_SUCCESS;
+  while (r.p < r.len) {
+    uint8_t x = r.b[r.p++];
+    res |= (uint64_t)(x & 0x7f) << shift;
+    if (!(x & 0x80)) { out = res; return ret; }
+    shift += 7;
+    if (shift > 63) break;
+  }
+  return OB_ERR_UNEXPECTED;
+}
+
+static int pf_zigzag(PfBuf &r, int64_t &out)
+{
+  uint64_t v = 0;
+  int ret = pf_varint(r, v);
+  if (OB_SUCC(ret)) {
+    out = (v & 1) ? -(int64_t)((v >> 1) + 1) : (int64_t)(v >> 1);
+  }
+  return ret;
+}
+
+static int pf_skip(PfBuf &r, int type);
+
+static int pf_skip_struct(PfBuf &r)
+{
+  int ret = OB_SUCCESS;
+  int64_t last = 0;
+  while (OB_SUCC(ret) && r.p < r.len) {
+    uint8_t h = r.b[r.p++];
+    if (0 == h) { break; }
+    int type = h & 0x0f;
+    int delta = (h >> 4) & 0x0f;
+    int64_t fid = delta ? last + delta : 0;
+    if (!delta) { if (OB_FAIL(pf_zigzag(r, fid))) { break; } }
+    last = fid;
+    if (OB_FAIL(pf_skip(r, type))) { break; }
+  }
+  return ret;
+}
+
+static int pf_skip(PfBuf &r, int type)
+{
+  int ret = OB_SUCCESS;
+  int64_t tmp = 0;
+  switch (type) {
+    case 1: case 2: break;  // compact bool：类型本身即值，无 payload
+    case 3: r.p += 1; break;
+    case 4: case 5: case 6: if (OB_FAIL(pf_zigzag(r, tmp))) {} break;
+    case 7: r.p += 8; break;
+    case 8: { uint64_t n = 0; if (OB_FAIL(pf_varint(r, n))) {} else { r.p += (int64_t)n; } break; }
+    case 9: case 10: {
+      uint8_t h = r.b[r.p++]; int64_t n = h >> 4; int et = h & 0x0f;
+      if (15 == n) { uint64_t nn = 0; if (OB_FAIL(pf_varint(r, nn))) {} else { n = (int64_t)nn; } }
+      for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) { if (OB_FAIL(pf_skip(r, et))) {} }
+      break;
+    }
+    case 11: { r.p += 1; uint8_t h = r.b[r.p++]; int64_t n = h >> 4; int kt = h & 0x0f; int vt = (h >> 4) & 0x0f;
+      for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) { if (OB_FAIL(pf_skip(r, kt))) {} else if (OB_FAIL(pf_skip(r, vt))) {} }
+      break; }
+    case 12: if (OB_FAIL(pf_skip_struct(r))) {} break;
+    default: ret = OB_ERR_UNEXPECTED; break;
+  }
+  return ret;
+}
+
+// snappy 解压
+static int snappy_decompress(const uint8_t *in, int64_t in_len, uint8_t *out, int64_t out_cap, int64_t &out_len)
+{
+  int ret = OB_SUCCESS;
+  PfBuf r{in, in_len, 0};
+  uint64_t want = 0;
+  if (OB_FAIL(pf_varint(r, want))) {
+  } else if (want > (uint64_t)out_cap) {
+    ret = OB_SIZE_OVERFLOW;
+  } else {
+    int64_t op = 0;
+    while (OB_SUCC(ret) && r.p < r.len && op < (int64_t)want) {
+      uint8_t tag = r.b[r.p++];
+      int t = tag & 0x03;
+      if (0 == t) {
+        int64_t len = (tag >> 2);
+        if (len < 60) { len += 1; }
+        else { int nb = (int)(len - 59); len = 0;
+          for (int i = 0; i < nb && r.p < r.len; ++i) { len |= ((int64_t)r.b[r.p++]) << (8 * i); }
+          len += 1;
+        }
+        if (r.p + len > r.len || op + len > (int64_t)want) { ret = OB_ERR_UNEXPECTED; break; }
+        MEMCPY(out + op, r.b + r.p, len); r.p += len; op += len;
+      } else {
+        int64_t len = 0, off = 0;
+        if (1 == t) {
+          len = ((tag >> 2) & 0x07) + 4;
+          off = ((int64_t)(tag >> 5) << 8) | r.b[r.p++];
+        } else if (2 == t) {
+          len = (tag >> 2) + 1;
+          off = (int64_t)r.b[r.p] | ((int64_t)r.b[r.p + 1] << 8); r.p += 2;
+        } else {
+          len = (tag >> 2) + 1;
+          off = (int64_t)r.b[r.p] | ((int64_t)r.b[r.p + 1] << 8) | ((int64_t)r.b[r.p + 2] << 16) | ((int64_t)r.b[r.p + 3] << 24);
+          r.p += 4;
+        }
+        if (off <= 0 || off > op || op + len > (int64_t)want) { ret = OB_ERR_UNEXPECTED; break; }
+        for (int64_t i = 0; i < len; ++i) { out[op + i] = out[op - off + i]; }
+        op += len;
+      }
+    }
+    if (OB_SUCC(ret)) { out_len = op; }
+  }
+  return ret;
+}
+
+// 解析 parquet 文件 -> 单列（或多列）INT 值；此处只支持单列 PLAIN INT32/INT64
+static int read_parquet_single_column(const char *path, ObIAllocator &alloc,
+                                      ObString &col_name, ObIArray<int64_t> &values)
+{
+  int ret = OB_SUCCESS;
+  FILE *fp = fopen(path, "rb");
+  uint8_t *data = NULL;
+  int64_t size = 0;
+  if (NULL == fp) {
+    ret = OB_FILE_NOT_EXIST;
+  } else {
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    rewind(fp);
+    if (size < 12) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_ISNULL(data = static_cast<uint8_t *>(alloc.alloc(size)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (size != (int64_t)fread(data, 1, size, fp)) {
+      ret = OB_IO_ERROR;
+    }
+    fclose(fp);
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  // footer
+  const uint32_t meta_len = (uint32_t)data[size - 8] | ((uint32_t)data[size - 7] << 8)
+                            | ((uint32_t)data[size - 6] << 16) | ((uint32_t)data[size - 5] << 24);
+  const int64_t meta_start = size - 8 - meta_len;
+  if (meta_start <= 0) {
+    return OB_INVALID_ARGUMENT;
+  }
+  PfBuf r{data, size, meta_start};
+  int64_t num_rows = 0;
+  int32_t col_type = -1;
+  int32_t codec = -1;
+  int64_t num_values = 0;
+  int64_t data_off = -1;
+  ObString name;
+  int64_t last = 0;
+  // 顶层 struct
+  while (OB_SUCC(ret) && r.p < r.len) {
+    uint8_t h = data[r.p++];
+    if (0 == h) { break; }
+    int type = h & 0x0f;
+    int delta = (h >> 4) & 0x0f;
+    int64_t fid = delta ? last + delta : 0;
+    if (!delta) { if (OB_FAIL(pf_zigzag(r, fid))) { break; } }
+    last = fid;
+    if (2 == fid && 9 == type) {           // schema list
+      uint8_t hh = data[r.p++]; int64_t n = hh >> 4; int et = hh & 0x0f;
+      if (15 == n) { uint64_t nn = 0; pf_varint(r, nn); n = (int64_t)nn; }
+      for (int64_t i = 0; i < n; ++i) {
+        int64_t flast = 0;
+        int64_t slevel = r.p;
+        while (r.p < r.len) {
+          uint8_t fh = data[r.p++];
+          if (0 == fh) { break; }
+          int ft = fh & 0x0f; int fd = (fh >> 4) & 0x0f;
+          int64_t ffid = fd ? flast + fd : 0;
+          if (!fd) { pf_zigzag(r, ffid); }
+          flast = ffid;
+          if (4 == ffid && 8 == ft) {
+            uint64_t sl = 0; pf_varint(r, sl);
+            ObString s(static_cast<int32_t>(sl), reinterpret_cast<char *>(data + r.p));
+            r.p += sl;
+            if (i > 0 && name.empty()) { name = s; }
+          } else if (1 == ffid && 5 == ft) {
+            int64_t v = 0; pf_zigzag(r, v); if (i > 0) { col_type = (int32_t)v; }
+          } else if (OB_FAIL(pf_skip(r, ft))) { break; }
+        }
+        if (OB_FAIL(ret)) { break; }
+        (void)slevel;
+      }
+    } else if (3 == fid && 6 == type) {
+      if (OB_FAIL(pf_zigzag(r, num_rows))) {}
+    } else if (4 == fid && 9 == type) {     // row_groups
+      uint8_t hh = data[r.p++]; int64_t n = hh >> 4; int et = hh & 0x0f;
+      if (15 == n) { uint64_t nn = 0; pf_varint(r, nn); n = (int64_t)nn; }
+      for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) {
+        int64_t glast = 0;
+        while (OB_SUCC(ret) && r.p < r.len) {
+          uint8_t gh = data[r.p++];
+          if (0 == gh) { break; }
+          int gt = gh & 0x0f; int gd = (gh >> 4) & 0x0f;
+          int64_t gfid = gd ? glast + gd : 0;
+          if (!gd) { pf_zigzag(r, gfid); }
+          glast = gfid;
+          if (1 == gfid && 9 == gt) {       // columns
+            uint8_t ch = data[r.p++]; int64_t cn = ch >> 4; int cet = ch & 0x0f;
+            if (15 == cn) { uint64_t nn = 0; pf_varint(r, nn); cn = (int64_t)nn; }
+            for (int64_t ci = 0; OB_SUCC(ret) && ci < cn; ++ci) {
+              int64_t clast = 0;
+              while (OB_SUCC(ret) && r.p < r.len) {
+                uint8_t cch = data[r.p++];
+                if (0 == cch) { break; }
+                int ct = cch & 0x0f; int cd = (cch >> 4) & 0x0f;
+                int64_t cfid = cd ? clast + cd : 0;
+                if (!cd) { pf_zigzag(r, cfid); }
+                clast = cfid;
+                if (3 == cfid && 12 == ct) {   // ColumnMetaData
+                  int64_t mlast = 0;
+                  while (OB_SUCC(ret) && r.p < r.len) {
+                    uint8_t mh = data[r.p++];
+                    if (0 == mh) { break; }
+                    int mt = mh & 0x0f; int md = (mh >> 4) & 0x0f;
+                    int64_t mfid = md ? mlast + md : 0;
+                    if (!md) { pf_zigzag(r, mfid); }
+                    mlast = mfid;
+                    if (1 == mfid && 5 == mt) { int64_t v = 0; pf_zigzag(r, v); col_type = (int32_t)v; }
+                    else if (4 == mfid && 5 == mt) { int64_t v = 0; pf_zigzag(r, v); codec = (int32_t)v; }
+                    else if (5 == mfid && 6 == mt) { pf_zigzag(r, num_values); }
+                    else if (9 == mfid && 6 == mt) { pf_zigzag(r, data_off); }
+                    else if (OB_FAIL(pf_skip(r, mt))) { break; }
+                  }
+                } else if (OB_FAIL(pf_skip(r, ct))) { break; }
+              }
+            }
+          } else if (OB_FAIL(pf_skip(r, gt))) { break; }
+        }
+      }
+    } else if (OB_FAIL(pf_skip(r, type))) {
+      break;
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  if (OB_ISNULL(name.ptr()) || name.empty()) {
+    ObString def("c1");
+    name = def;
+  }
+  col_name = name;
+
+  // 解析 page header
+  PfBuf pr{data, size, data_off};
+  int32_t page_type = -1;
+  int64_t uncomp_size = 0, comp_size = 0, page_vals = 0, def_len = 0, rep_len = 0;
+  int32_t encoding = 0;
+  int64_t pl = 0;
+  while (OB_SUCC(ret) && pr.p < pr.len) {
+    uint8_t h = data[pr.p++];
+    if (0 == h) { break; }
+    int type = h & 0x0f; int delta = (h >> 4) & 0x0f;
+    int64_t fid = delta ? pl + delta : 0;
+    if (!delta) { pf_zigzag(pr, fid); }
+    pl = fid;
+    if (1 == fid && 5 == type) { int64_t v = 0; pf_zigzag(pr, v); page_type = (int32_t)v; }
+    else if (2 == fid && 5 == type) { pf_zigzag(pr, uncomp_size); }
+    else if (3 == fid && 5 == type) { pf_zigzag(pr, comp_size); }
+    else if (5 == fid && 12 == type) {          // DataPageHeader v1
+      int64_t dlast = 0;
+      while (OB_SUCC(ret) && pr.p < pr.len) {
+        uint8_t dh = data[pr.p++];
+        if (0 == dh) { break; }
+        int dt = dh & 0x0f; int dd = (dh >> 4) & 0x0f;
+        int64_t dfid = dd ? dlast + dd : 0;
+        if (!dd) { pf_zigzag(pr, dfid); }
+        dlast = dfid;
+        if (1 == dfid && 5 == dt) { pf_zigzag(pr, page_vals); }
+        else if (2 == dfid && 5 == dt) { int64_t v = 0; pf_zigzag(pr, v); encoding = (int32_t)v; }
+        else if (OB_FAIL(pf_skip(pr, dt))) { break; }
+      }
+    } else if (8 == fid && 12 == type) {        // DataPageHeader v2
+      int64_t dlast = 0;
+      while (OB_SUCC(ret) && pr.p < pr.len) {
+        uint8_t dh = data[pr.p++];
+        if (0 == dh) { break; }
+        int dt = dh & 0x0f; int dd = (dh >> 4) & 0x0f;
+        int64_t dfid = dd ? dlast + dd : 0;
+        if (!dd) { pf_zigzag(pr, dfid); }
+        dlast = dfid;
+        if (1 == dfid && 5 == dt) { pf_zigzag(pr, page_vals); }
+        else if (3 == dfid && 5 == dt) { /* num_rows */ int64_t v = 0; pf_zigzag(pr, v); }
+        else if (4 == dfid && 5 == dt) { int64_t v = 0; pf_zigzag(pr, v); encoding = (int32_t)v; }
+        else if (5 == dfid && 5 == dt) { pf_zigzag(pr, def_len); }
+        else if (6 == dfid && 5 == dt) { pf_zigzag(pr, rep_len); }
+        else if (OB_FAIL(pf_skip(pr, dt))) { break; }
+      }
+    } else if (OB_FAIL(pf_skip(pr, type))) {
+      break;
+    }
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  // 数据区
+  const int64_t body_off = pr.p + rep_len + def_len;
+  const int64_t body_len = comp_size - rep_len - def_len;
+  if (body_off + body_len > size) {
+    return OB_INVALID_ARGUMENT;
+  }
+  uint8_t *plain = NULL;
+  int64_t plain_len = 0;
+  if (0 == codec) {
+    plain = data + body_off;
+    plain_len = body_len;
+  } else if (1 == codec) {                       // SNAPPY
+    if (OB_ISNULL(plain = static_cast<uint8_t *>(alloc.alloc(uncomp_size + 1)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(snappy_decompress(data + body_off, body_len, plain, uncomp_size, plain_len))) {
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+  }
+  if (OB_FAIL(ret)) {
+    return ret;
+  }
+  // PLAIN 解码
+  const int32_t width = (2 == col_type) ? 8 : 4;
+  const int64_t cnt = (page_vals > 0 ? page_vals : num_values);
+  for (int64_t i = 0; OB_SUCC(ret) && i < cnt; ++i) {
+    const int64_t off = i * width;
+    if (off + width > plain_len) {
+      break;
+    }
+    int64_t v = 0;
+    if (4 == width) {
+      uint32_t u = (uint32_t)plain[off] | ((uint32_t)plain[off + 1] << 8)
+                   | ((uint32_t)plain[off + 2] << 16) | ((uint32_t)plain[off + 3] << 24);
+      v = (int64_t)(int32_t)u;
+    } else {
+      uint64_t u = 0;
+      for (int b = 7; b >= 0; --b) { u = (u << 8) | plain[off + b]; }
+      v = (int64_t)u;
+    }
+    if (OB_FAIL(values.push_back(v))) {
+    }
+  }
+  return ret;
+}
+
 // ---------- glob：列出目录下所有条目 ----------
 static int glob_paths(const char *pattern, ObIAllocator &alloc, ObIArray<ObString> &paths)
 {
@@ -370,9 +719,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   }
 
   if (OB_FAIL(ret)) {
-  } else if (is_parquet) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_parquet is not supported yet");
   } else {
     const ParseNode *arg_list = parse_tree.children_[1];
     const ParseNode *path_node = NULL;
@@ -479,6 +825,31 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         } else if (OB_FAIL(rows.push_back(r))) {
         }
       }
+    }
+  } else if (is_parquet) {
+    ObString pq_col;
+    ObSEArray<int64_t, 16> pq_vals;
+    if (OB_FAIL(read_parquet_single_column(file_path.ptr(), *allocator_, pq_col, pq_vals))) {
+      LOG_WARN("read parquet failed", K(file_path), K(ret));
+    } else {
+      if (OB_FAIL(col_names.push_back(pq_col))) {
+      }
+      for (int64_t pi = 0; OB_SUCC(ret) && pi < pq_vals.count(); ++pi) {
+        char num[32];
+        int len = snprintf(num, sizeof(num), "%ld", (long)pq_vals.at(pi));
+        char *cp = static_cast<char *>(allocator_->alloc(len + 1));
+        if (OB_ISNULL(cp)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          MEMCPY(cp, num, len);
+          cp[len] = '\0';
+          ObSEArray<ObString, 8> r;
+          if (OB_FAIL(r.push_back(ObString(static_cast<int32_t>(len), cp)))) {
+          } else if (OB_FAIL(rows.push_back(r))) {
+          }
+        }
+      }
+      LOG_INFO("file sql parquet", K(ret), K(file_path), "col", pq_col, "rows", pq_vals.count());
     }
   } else {
     FILE *fp = fopen(file_path.ptr(), "rb");
