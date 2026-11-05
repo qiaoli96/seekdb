@@ -10876,9 +10876,40 @@ tbl_name
 | relation_name '(' expr_list ')'
 {
   if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
-    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 2, $1, $3);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 4, $1, $3, NULL, NULL);
   } else {
-    /* FROM 位置只允许表名/子查询/表函数，其他函数名直接报语法错误 */
+    YYABORT;
+  }
+}
+| relation_name '(' expr_list ')' relation_name
+{
+  if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 4, $1, $3, $5, NULL);
+  } else {
+    YYABORT;
+  }
+}
+| relation_name '(' expr_list ')' AS relation_name
+{
+  if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 4, $1, $3, $6, NULL);
+  } else {
+    YYABORT;
+  }
+}
+| relation_name '(' expr_list ')' relation_name '(' relation_name_list ')'
+{
+  if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 4, $1, $3, $5, $7);
+  } else {
+    YYABORT;
+  }
+}
+| relation_name '(' expr_list ')' AS relation_name '(' relation_name_list ')'
+{
+  if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 4, $1, $3, $6, $8);
+  } else {
     YYABORT;
   }
 }
