@@ -1473,7 +1473,8 @@ int copy_export_impl(const ParseNode &select_node, const ParseNode &path_node, c
         const ObString nullstr = get_nullstr(opts);
         if (with_header) {
           for (int64_t i = 0; i < idx.count(); ++i) {
-            fprintf(ofp, "%s%s", i ? "," : "", ObString(src_cols.at(idx.at(i))).ptr());
+            const ObString &hn = src_cols.at(idx.at(i));
+            fprintf(ofp, "%s%.*s", i ? "," : "", hn.length(), hn.ptr());
           }
           fprintf(ofp, "\n");
         }
