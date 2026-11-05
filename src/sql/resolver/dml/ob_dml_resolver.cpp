@@ -2647,7 +2647,11 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
     } else {
       switch (table_node->type_) {
       case T_RELATION_FACTOR: {
-        if (OB_FAIL(resolve_basic_table(parse_tree, table_item))) {
+        bool ai_handled = false;
+        if (OB_FAIL(resolve_ai_meta_table(*table_node, alias_node, table_item, ai_handled))) {
+        } else if (ai_handled) {
+          /* AI 元数据合成路径已处理 */
+        } else if (OB_FAIL(resolve_basic_table(parse_tree, table_item))) {
         }
         break;
       }

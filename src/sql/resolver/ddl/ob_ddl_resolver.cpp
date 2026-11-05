@@ -1762,6 +1762,297 @@ int ObDDLResolver::resolve_column_name(ObColumnSchemaV2 &column,
   return ret;
 }
 
+// ---------- 赛题三 P1：AI COLUMN 元数据登记（本 TU 内部） ----------
+static char g_ai_cur_db[130] = {0};
+static char g_ai_cur_tbl[130] = {0};
+
+extern "C" int ob_ai_column_note_table(const void *rel_node)
+{
+  const ParseNode *n = static_cast<const ParseNode *>(rel_node);
+  char names[2][130];
+  int32_t lens[2] = {0, 0};
+  int64_t cnt = 0;
+  for (int64_t i = 0; NULL != n && i < n->num_child_ && cnt < 2; ++i) {
+    const ParseNode *c = n->children_[i];
+    if (NULL != c && NULL != c->str_value_ && c->str_len_ > 0) {
+      const int32_t len = c->str_len_ < 129 ? c->str_len_ : 129;
+      MEMCPY(names[cnt], c->str_value_, len);
+      names[cnt][len] = '\0';
+      lens[cnt] = len;
+      ++cnt;
+    }
+  }
+  if (1 == cnt) {
+    MEMCPY(g_ai_cur_tbl, names[0], lens[0] + 1);
+    g_ai_cur_db[0] = '\0';
+  } else if (2 == cnt) {
+    MEMCPY(g_ai_cur_db, names[0], lens[0] + 1);
+    MEMCPY(g_ai_cur_tbl, names[1], lens[1] + 1);
+  }
+  return 0;
+}
+struct ObAiColumnMeta {
+  bool used_;
+  char db_[130];
+  char tbl_[130];
+  char col_[130];
+  char normalized_expr_[300];
+  int64_t max_retries_;
+  int64_t is_json_;
+  int64_t table_id_;
+  int64_t column_id_;
+  int64_t hidden_ids_[3];
+};
+static ObAiColumnMeta g_ai_cols[64];
+static int64_t g_ai_col_cnt = 0;
+
+static void ai_copy_name(char *dst, int64_t cap, const char *src, int32_t len)
+{
+  int64_t n = (NULL != src && len > 0) ? (len < cap - 1 ? len : cap - 1) : 0;
+  if (n > 0) {
+    MEMCPY(dst, src, n);
+  }
+  dst[n] = '\0';
+}
+
+static bool ai_name_eq(const char *a, const char *b)
+{
+  const int64_t la = static_cast<int64_t>(strlen(a));
+  const int64_t lb = static_cast<int64_t>(strlen(b));
+  bool eq = (la == lb);
+  for (int64_t i = 0; eq && i < la; ++i) {
+    const char ca = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] - 'A' + 'a') : a[i];
+    const char cb = (b[i] >= 'A' && b[i] <= 'Z') ? static_cast<char>(b[i] - 'A' + 'a') : b[i];
+    if (ca != cb) {
+      eq = false;
+    }
+  }
+  return eq;
+}
+
+static bool ai_find_int(const ParseNode *node, int64_t &val, int depth)
+{
+  bool found = false;
+  if (NULL != node && depth <= 8) {
+    if (T_INT == node->type_) {
+      val = node->value_;
+      found = true;
+    } else {
+      for (int64_t i = 0; !found && i < node->num_child_; ++i) {
+        found = ai_find_int(node->children_[i], val, depth + 1);
+      }
+    }
+  }
+  return found;
+}
+
+static int ai_collect_idents(const ParseNode *node, ObIArray<ObString> &out, int depth)
+{
+  int ret = OB_SUCCESS;
+  if (NULL != node && depth <= 8) {
+    if (NULL != node->str_value_ && node->str_len_ > 0) {
+      if (OB_FAIL(out.push_back(ObString(node->str_len_, node->str_value_)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      if (OB_FAIL(ai_collect_idents(node->children_[i], out, depth + 1))) {
+      }
+    }
+  }
+  return ret;
+}
+
+static int64_t ai_option_int(const ParseNode *node, const char *key, int64_t dflt, int depth)
+{
+  int64_t val = dflt;
+  if (NULL != node && depth <= 8) {
+    if (T_LINK_NODE == node->type_ && 2 == node->num_child_) {
+      const ParseNode *name = node->children_[0];
+      const ParseNode *v = node->children_[1];
+      if (NULL != name && NULL != name->str_value_) {
+        ObString kname(name->str_len_, name->str_value_);
+        if (0 == kname.case_compare(key)) {
+          if (NULL != v && T_INT == v->type_) {
+            val = v->value_;
+          } else if (NULL != v && NULL != v->str_value_ && v->str_len_ > 0) {
+            char buf[32];
+            const int64_t n = v->str_len_ < 31 ? v->str_len_ : 31;
+            MEMCPY(buf, v->str_value_, n);
+            buf[n] = '\0';
+            val = strtoll(buf, NULL, 10);
+          }
+        }
+      } else {
+        for (int64_t i = 0; i < node->num_child_; ++i) {
+          val = ai_option_int(node->children_[i], key, val, depth + 1);
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < node->num_child_; ++i) {
+        val = ai_option_int(node->children_[i], key, val, depth + 1);
+      }
+    }
+  }
+  return val;
+}
+
+static int ai_register(const char *db, int32_t db_len,
+                       const char *tbl, int32_t tbl_len,
+                       const char *col, int32_t col_len,
+                       const ParseNode *attr, int32_t vector_dim, int32_t is_json)
+{
+  int ret = OB_SUCCESS;
+  char db_buf[130];
+  char tbl_buf[130];
+  char col_buf[130];
+  ai_copy_name(db_buf, sizeof(db_buf), db, db_len);
+  ai_copy_name(tbl_buf, sizeof(tbl_buf), tbl, tbl_len);
+  ai_copy_name(col_buf, sizeof(col_buf), col, col_len);
+  if (NULL == attr || attr->num_child_ < 1 || NULL == attr->children_[0]) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ParseNode *call = attr->children_[0];
+    int64_t kind = 0;  // 0=completion 1=embedding
+    if (NULL != call->children_[0] && NULL != call->children_[0]->str_value_) {
+      ObString fname(call->children_[0]->str_len_, call->children_[0]->str_value_);
+      if (0 == fname.case_compare("AI_EMBED")) {
+        kind = 1;
+      }
+    }
+    if (OB_SUCC(ret) && 1 == kind) {
+      int64_t embed_dim = -1;
+      if (ai_find_int(call, embed_dim, 0) && embed_dim > 0 && vector_dim > 0
+          && embed_dim != static_cast<int64_t>(vector_dim)) {
+        ret = OB_ERR_INVALID_VECTOR_DIM;
+        LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM,
+                       static_cast<uint64_t>(vector_dim), static_cast<uint64_t>(embed_dim));
+        SQL_RESV_LOG(WARN, "ai column dimension mismatch", K(ret), K(vector_dim), K(embed_dim));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObSEArray<ObString, 32> idents;
+      if (OB_FAIL(ai_collect_idents(call, idents, 0))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < idents.count(); ++i) {
+        char idbuf[130];
+        ai_copy_name(idbuf, sizeof(idbuf), idents.at(i).ptr(), idents.at(i).length());
+        for (int64_t k = 0; OB_SUCC(ret) && k < g_ai_col_cnt; ++k) {
+          if (g_ai_cols[k].used_ && ai_name_eq(g_ai_cols[k].db_, db_buf)
+              && ai_name_eq(g_ai_cols[k].tbl_, tbl_buf) && ai_name_eq(g_ai_cols[k].col_, idbuf)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED);
+            SQL_RESV_LOG(WARN, "ai column dependency rejected", K(ret), K(idbuf));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const int64_t max_retries = ai_option_int(attr->children_[1], "max_retries", 0, 0);
+      int64_t slot = -1;
+      for (int64_t k = 0; k < g_ai_col_cnt; ++k) {
+        if (g_ai_cols[k].used_ && ai_name_eq(g_ai_cols[k].db_, db_buf)
+            && ai_name_eq(g_ai_cols[k].tbl_, tbl_buf) && ai_name_eq(g_ai_cols[k].col_, col_buf)) {
+          slot = k;
+        }
+      }
+      if (slot < 0) {
+        if (g_ai_col_cnt < 64) {
+          slot = g_ai_col_cnt;
+          ++g_ai_col_cnt;
+          g_ai_cols[slot].used_ = true;
+        } else {
+          ret = OB_SIZE_OVERFLOW;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObAiColumnMeta &m = g_ai_cols[slot];
+        ai_copy_name(m.db_, sizeof(m.db_), db_buf, static_cast<int32_t>(strlen(db_buf)));
+        ai_copy_name(m.tbl_, sizeof(m.tbl_), tbl_buf, static_cast<int32_t>(strlen(tbl_buf)));
+        ai_copy_name(m.col_, sizeof(m.col_), col_buf, static_cast<int32_t>(strlen(col_buf)));
+        m.max_retries_ = max_retries;
+        m.is_json_ = is_json;
+        m.table_id_ = 0;
+        m.column_id_ = 0;
+        m.hidden_ids_[0] = 0;
+        m.hidden_ids_[1] = 0;
+        m.hidden_ids_[2] = 0;
+        if (is_json) {
+          snprintf(m.normalized_expr_, sizeof(m.normalized_expr_),
+                   "Return exactly one valid JSON value (ai column %s)", col_buf);
+        } else {
+          snprintf(m.normalized_expr_, sizeof(m.normalized_expr_), "ai column %s", col_buf);
+        }
+        SQL_RESV_LOG(INFO, "ai column registered", K(db_buf), K(tbl_buf), K(col_buf),
+                     K(max_retries), K(is_json), K(vector_dim));
+      }
+    }
+  }
+  return ret;
+}
+
+static const ParseNode *find_ai_column_attr(const ParseNode *node, int depth)
+{
+  const ParseNode *found = NULL;
+  if (NULL == node || depth > 8) {
+    found = NULL;
+  } else if (T_AI_COLUMN_ATTR == node->type_) {
+    found = node;
+  } else {
+    for (int64_t i = 0; NULL == found && i < node->num_child_; ++i) {
+      found = find_ai_column_attr(node->children_[i], depth + 1);
+    }
+  }
+  return found;
+}
+
+int ob_ddl_resolve_ai_column_attr(share::schema::ObColumnSchemaV2 &column,
+                                  ParseNode *col_def_node,
+                                  ObStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *ai_attr = NULL;
+  ParseNode *attrs = (NULL != col_def_node && col_def_node->num_child_ > 2)
+                       ? col_def_node->children_[2] : NULL;
+  if (NULL == attrs || NULL == (ai_attr = find_ai_column_attr(attrs, 0))) {
+    /* 没有 AI COLUMN 属性，直接放行 */
+  } else {
+    common::ObString db_name;
+    common::ObString table_name;
+    if (stmt::T_CREATE_TABLE == stmt->get_stmt_type()) {
+      ObCreateTableStmt *tmp = static_cast<ObCreateTableStmt *>(stmt);
+      db_name = tmp->get_database_name();
+      table_name = tmp->get_table_name();
+    } else if (stmt::T_ALTER_TABLE == stmt->get_stmt_type()) {
+      ObAlterTableStmt *tmp = static_cast<ObAlterTableStmt *>(stmt);
+      db_name = tmp->get_database_name();
+      table_name = tmp->get_alter_table_arg().alter_table_schema_.get_table_name();
+    }
+    int32_t vector_dim = -1;
+    ParseNode *type_node = (col_def_node->num_child_ > 1) ? col_def_node->children_[1] : NULL;
+    if (NULL != type_node && T_COLLECTION == type_node->type_
+        && type_node->int32_values_[0] == 1
+        && type_node->num_child_ > 0 && NULL != type_node->children_[0]) {
+      vector_dim = static_cast<int32_t>(type_node->children_[0]->value_);
+    }
+    if (table_name.empty() && '\0' != g_ai_cur_tbl[0]) {
+      table_name.assign_ptr(g_ai_cur_tbl, static_cast<int32_t>(strlen(g_ai_cur_tbl)));
+    }
+    if (db_name.empty() && '\0' != g_ai_cur_db[0]) {
+      db_name.assign_ptr(g_ai_cur_db, static_cast<int32_t>(strlen(g_ai_cur_db)));
+    }
+    const common::ObString &col_name = column.get_column_name_str();
+    const int32_t is_json = ob_is_json_tc(column.get_data_type()) ? 1 : 0;
+    if (OB_FAIL(ai_register(db_name.ptr(), db_name.length(),
+                            table_name.ptr(), table_name.length(),
+                            col_name.ptr(), col_name.length(),
+                            ai_attr, vector_dim, is_json))) {
+      SQL_RESV_LOG(WARN, "fail to register ai column", K(ret), K(db_name),
+                   K(table_name), K(col_name), K(vector_dim), K(is_json));
+    }
+  }
+  return ret;
+}
+
 int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
                                              ParseNode *node, /* column_definition */
                                              ObColumnResolveStat &resolve_stat,
@@ -1924,6 +2215,9 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
                                                          allow_has_default))) {
       }
     }
+    if (OB_SUCC(ret) && OB_FAIL(ob_ddl_resolve_ai_column_attr(column, node, stmt_))) {
+    }
+
     // Specify the position of the column for add column syntax
     if (OB_SUCC(ret)) {
       ParseNode *pos_node = NULL;
@@ -2284,6 +2578,10 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
       case T_VISIBLE:
       case T_INVISIBLE:
       {
+        break;
+      }
+      case T_AI_COLUMN_ATTR: {
+        /* AI COLUMN 由 ob_ddl_resolve_ai_column_attr 统一处理，这里跳过 */
         break;
       }
       default:  // won't be here
@@ -8079,5 +8377,41 @@ int ObDDLResolver::get_partition_keys_by_part_func_expr(
   return ret;
 }
 
+}  // namespace sql
+}  // namespace oceanbase
+
+namespace oceanbase {
+namespace sql {
+
+int64_t ob_ai_meta_count()
+{
+  return g_ai_col_cnt;
+}
+
+int ob_ai_meta_get(int64_t idx,
+                   const char *&db, int32_t &db_len,
+                   const char *&tbl, int32_t &tbl_len,
+                   const char *&col, int32_t &col_len,
+                   const char *&expr, int32_t &expr_len,
+                   int64_t &max_retries, int64_t &is_json)
+{
+  int ret = OB_SUCCESS;
+  if (idx < 0 || idx >= g_ai_col_cnt) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const ObAiColumnMeta &m = g_ai_cols[idx];
+    db = m.db_;
+    db_len = static_cast<int32_t>(strlen(m.db_));
+    tbl = m.tbl_;
+    tbl_len = static_cast<int32_t>(strlen(m.tbl_));
+    col = m.col_;
+    col_len = static_cast<int32_t>(strlen(m.col_));
+    expr = m.normalized_expr_;
+    expr_len = static_cast<int32_t>(strlen(m.normalized_expr_));
+    max_retries = m.max_retries_;
+    is_json = m.is_json_;
+  }
+  return ret;
+}
 }  // namespace sql
 }  // namespace oceanbase

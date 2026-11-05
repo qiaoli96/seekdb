@@ -669,6 +669,10 @@ protected:
                                       common::ObIArray<ObRawExpr*> &check_exprs,
                                       ObIArray<int64_t> *check_flags = NULL);
   int resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int resolve_ai_meta_table(const ParseNode &table_node,
+                           const ParseNode *alias_node,
+                           TableItem *&table_item,
+                           bool &handled);
   int gen_file_table_column_items(const int64_t column_cnt,
                                   const ObIArray<ObRawExprResType> &res_types,
                                   const ObIArray<ObString> &col_names,

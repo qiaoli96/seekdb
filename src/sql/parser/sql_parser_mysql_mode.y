@@ -31,6 +31,10 @@ int ob_copy_export_from_node(const void *select_node, const void *path_node,
 extern "C"
 #endif
 int ob_describe_rewrite(void *select_node);
+#ifdef __cplusplus
+extern "C"
+#endif
+int ob_ai_column_note_table(const void *rel_node);
 }
 
 %code {
@@ -458,7 +462,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_float_precision opt_number_precision
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
-%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list opt_ai_column_with ai_column_option_list ai_column_option
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -4570,6 +4574,7 @@ create_table_stmt:
 create_with_opt_hint special_table_type TABLE opt_if_not_exists relation_factor '(' table_element_list ')'
 opt_table_option_list opt_partition_option
 {
+  (void)ob_ai_column_note_table($5);
   ParseNode *table_elements = NULL;
   ParseNode *table_options = NULL;
   (void)($1);
@@ -6227,6 +6232,25 @@ column_attribute_list
 { $$ = NULL; }
 ;
 
+opt_ai_column_with:
+  /*EMPTY*/
+  { $$ = NULL; }
+| WITH '(' ai_column_option_list ')'
+  { $$ = $3; }
+;
+
+ai_column_option_list:
+  ai_column_option_list ',' ai_column_option
+  { malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+| ai_column_option
+  { $$ = $1; }
+;
+
+ai_column_option:
+  relation_name COMP_EQ expr
+  { malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+
 column_attribute_list:
 column_attribute_list column_attribute
 {
@@ -6238,7 +6262,11 @@ column_attribute_list column_attribute
 }
 
 column_attribute:
-not NULLX
+| AI COLUMN '(' expr ')' opt_ai_column_with
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ATTR, 2, $4, $6);
+}
+| not NULLX
 {
   (void)($1) ;
   (void)($2) ; /* make bison mute */
@@ -14794,6 +14822,7 @@ relation_factor TO relation_factor
 alter_table_stmt:
 alter_with_opt_hint TABLE relation_factor alter_table_actions
 {
+  (void)ob_ai_column_note_table($3);
   ParseNode *table_actions = NULL;
   merge_nodes(table_actions, result, T_ALTER_TABLE_ACTION_LIST, $4);
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE, 4, $3, table_actions, NULL, $1);
