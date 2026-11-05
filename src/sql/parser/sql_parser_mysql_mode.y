@@ -22,6 +22,15 @@
 %error-verbose
 %code requires {
 #include "parse_node.h"
+#ifdef __cplusplus
+extern "C"
+#endif
+int ob_copy_export_from_node(const void *select_node, const void *path_node,
+                             const void *options_node);
+#ifdef __cplusplus
+extern "C"
+#endif
+int ob_describe_rewrite(void *select_node);
 }
 
 %code {
@@ -543,8 +552,52 @@ END_P SET_VAR DELIMITER
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
+%type <node> opt_copy_options copy_option_list copy_option
 %start sql_stmt
+
+
 %%
+opt_copy_options:
+  /* empty */
+  {
+    $$ = NULL;
+  }
+| '(' copy_option_list ')'
+  {
+    $$ = $2;
+  }
+;
+
+copy_option_list:
+  copy_option
+  {
+    $$ = $1;
+  }
+| copy_option_list ',' copy_option
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+  }
+;
+
+copy_option:
+  relation_name
+  {
+    malloc_terminal_node($$, result->malloc_pool_, T_INT);
+    $$->value_ = (0 == strncasecmp($1->str_value_, "header", $1->str_len_)) ? 1 : 0;
+  }
+| relation_name relation_name
+  {
+    malloc_terminal_node($$, result->malloc_pool_, T_INT);
+    $$->value_ = (0 == strncasecmp($1->str_value_, "format", $1->str_len_)) ? 2 : 0;
+  }
+| relation_name complex_string_literal
+  {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ALIAS, 2, $1, $2);
+  }
+;
+
+
+
 ////////////////////////////////////////////////////////////////
 sql_stmt:
 stmt_list
@@ -585,6 +638,23 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | DESCRIBE select_stmt
+  {
+    if (0 != ob_describe_rewrite($2)) {
+      YYABORT;
+    } else {
+      $$ = $2;
+      question_mark_issue($$, result);
+    }
+  }
+  | COPY '(' select_stmt ')' TO complex_string_literal opt_copy_options
+  {
+    if (0 != ob_copy_export_from_node($3, $6, $7)) {
+      YYABORT;
+    } else {
+      malloc_non_terminal_node($$, result->malloc_pool_, T_COMMIT, 1, NULL);
+    }
+  }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;

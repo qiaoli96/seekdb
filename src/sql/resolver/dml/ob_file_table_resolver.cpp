@@ -633,6 +633,8 @@ int ObDMLResolver::gen_file_table_column_items(const int64_t column_cnt,
     ret = OB_ERR_UNEXPECTED;
     LOG_INFO("gen file table column items invalid", K(ret), K(column_cnt));
   } else {
+    LOG_INFO("gen file table cols", "column_cnt", column_cnt, "res_types", res_types.count(),
+             "col_names", col_names.count(), "access_exprs", table_def->access_exprs_.count());
     for (int64_t i = 0; OB_SUCC(ret) && i < column_cnt; ++i) {
       ObColumnRefRawExpr *column_expr = NULL;
       if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, column_expr))) {
@@ -710,12 +712,17 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   bool is_glob = false;
   bool is_json = false;
   bool is_parquet = false;
+  bool is_describe = false;
+  int describe_kind = 0;  // 1=csv 2=json 3=parquet
   if (OB_NOT_NULL(parse_tree.children_[0]) && OB_NOT_NULL(parse_tree.children_[0]->str_value_)) {
     func_name.assign_ptr(parse_tree.children_[0]->str_value_,
                          static_cast<int32_t>(parse_tree.children_[0]->str_len_));
     is_glob = (0 == func_name.case_compare("glob"));
     is_json = (0 == func_name.case_compare("read_json"));
     is_parquet = (0 == func_name.case_compare("read_parquet"));
+    if (0 == func_name.case_compare("__file_describe_csv")) { is_describe = true; describe_kind = 1; }
+    else if (0 == func_name.case_compare("__file_describe_json")) { is_describe = true; describe_kind = 2; }
+    else if (0 == func_name.case_compare("__file_describe_parquet")) { is_describe = true; describe_kind = 3; }
   }
 
   if (OB_FAIL(ret)) {
@@ -811,6 +818,127 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     }
   }
   if (OB_FAIL(ret)) {
+  } else if (is_describe) {
+    // 读文件 -> 推断每列类型/可空性 -> 生成 DESCRIBE 元数据表（6 列）
+    char *dbuf = NULL;
+    int64_t dsize = 0;
+    FILE *dfp = fopen(file_path.ptr(), "rb");
+    if (NULL == dfp) {
+      ret = OB_FILE_NOT_EXIST;
+    } else {
+      fseek(dfp, 0, SEEK_END);
+      dsize = ftell(dfp);
+      rewind(dfp);
+      if (dsize <= 0 || dsize > MAX_FILE_SIZE) {
+        ret = OB_SIZE_OVERFLOW;
+      } else if (OB_ISNULL(dbuf = static_cast<char *>(allocator_->alloc(dsize + 1)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (dsize != (int64_t)fread(dbuf, 1, dsize, dfp)) {
+        ret = OB_IO_ERROR;
+      } else {
+        dbuf[dsize] = '\0';
+      }
+      fclose(dfp);
+    }
+
+    ObSEArray<ObString, 8> scols;
+    ObSEArray<ObSEArray<ObString, 8>, 8> srows;
+    int64_t dummy_max_col = 0;
+    if (OB_FAIL(ret)) {
+    } else if (2 == describe_kind) {
+      ret = parse_jsonl_text(dbuf, dsize, *allocator_, scols, srows);
+    } else if (3 == describe_kind) {
+      ret = OB_NOT_SUPPORTED;
+    } else {
+      ret = parse_csv_text(dbuf, dsize, *allocator_, scols, srows, dummy_max_col);
+    }
+
+    // 重复列名处理（与正常路径一致）
+    if (OB_SUCC(ret)) {
+      for (int64_t c = 0; OB_SUCC(ret) && c < scols.count(); ++c) {
+        int64_t dup = 1;
+        for (int64_t k = 0; k < c; ++k) {
+          if (0 == scols.at(k).case_compare(scols.at(c))) { ++dup; }
+        }
+        if (dup > 1) {
+          ObSqlString nn;
+          if (OB_FAIL(nn.append_fmt("%.*s__%ld", scols.at(c).length(), scols.at(c).ptr(), dup))) {
+          } else {
+            char *pc = static_cast<char *>(allocator_->alloc(nn.length() + 1));
+            if (OB_ISNULL(pc)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              MEMCPY(pc, nn.ptr(), nn.length());
+              pc[nn.length()] = '\0';
+              scols.at(c).assign_ptr(pc, static_cast<int32_t>(nn.length()));
+            }
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      ObString c1("column_name"), c2("column_type"), c3("null"), c4("key"),
+              c5("default"), c6("extra");
+      if (OB_FAIL(col_names.push_back(c1)) || OB_FAIL(col_names.push_back(c2))
+          || OB_FAIL(col_names.push_back(c3)) || OB_FAIL(col_names.push_back(c4))
+          || OB_FAIL(col_names.push_back(c5)) || OB_FAIL(col_names.push_back(c6))) {
+      }
+      for (int64_t c = 0; OB_SUCC(ret) && c < scols.count(); ++c) {
+        bool has_null = false;
+        bool all_empty = true, all_int = true, all_double = true, all_bool = true;
+        bool all_date = true, all_datetime = true, has_value = false;
+        for (int64_t r = 0; OB_SUCC(ret) && r < srows.count(); ++r) {
+          if (c >= srows.at(r).count()) { continue; }
+          const ObString &cell = srows.at(r).at(c);
+          if (cell.empty()) { has_null = true; continue; }
+          all_empty = false;
+          has_value = true;
+          char tmp[512];
+          int64_t n = cell.length() < 500 ? cell.length() : 500;
+          MEMCPY(tmp, cell.ptr(), n);
+          tmp[n] = '\0';
+          char *end = NULL;
+          errno = 0;
+          (void)strtoll(tmp, &end, 10);
+          if (NULL == end || *end != '\0' || 0 != errno) { all_int = false; }
+          errno = 0;
+          (void)strtod(tmp, &end);
+          if (NULL == end || *end != '\0' || 0 != errno) { all_double = false; }
+          if (0 != cell.case_compare("true") && 0 != cell.case_compare("false")) { all_bool = false; }
+          // 日期 / 时间形状
+          const bool date_shape = (n == 10 && '-' == tmp[4] && '-' == tmp[7]);
+          const bool dt_shape = (n >= 19 && '-' == tmp[4] && '-' == tmp[7]
+                                 && ((' ' == tmp[10]) || ('T' == tmp[10]))
+                                 && ':' == tmp[13] && ':' == tmp[16]);
+          if (!date_shape && !dt_shape) { all_date = false; all_datetime = false; }
+          if (dt_shape) { all_date = false; }
+          if (date_shape) { all_datetime = false; }
+        }
+        const char *tname = "VARCHAR";
+        if (has_value && all_bool) { tname = "BOOLEAN"; }
+        else if (has_value && all_int) { tname = "BIGINT"; }
+        else if (has_value && all_double) { tname = "DOUBLE"; }
+        else if (has_value && all_datetime) { tname = "DATETIME"; }
+        else if (has_value && all_date) { tname = "DATE"; }
+        if (all_empty) { tname = "VARCHAR"; }
+
+        ObString tn(static_cast<int32_t>(strlen(tname)), const_cast<char *>(tname));
+        ObString nullable(static_cast<int32_t>(strlen(has_null ? "YES" : "NO")),
+                               const_cast<char *>(has_null ? "YES" : "NO"));
+        ObSEArray<ObString, 8> row;
+        if (OB_FAIL(row.push_back(scols.at(c))) || OB_FAIL(row.push_back(tn))
+            || OB_FAIL(row.push_back(nullable))) {
+        } else {
+          ObString empty;
+          if (OB_FAIL(row.push_back(empty)) || OB_FAIL(row.push_back(empty))
+              || OB_FAIL(row.push_back(empty))) {
+          } else if (OB_FAIL(rows.push_back(row))) {
+          }
+        }
+      }
+    }
+    LOG_INFO("file sql describe", K(ret), K(file_path), "cols", col_names.count(), "rows", rows.count());
   } else if (is_glob) {
     ObSEArray<ObString, 8> gpaths;
     if (OB_FAIL(glob_paths(file_path.ptr(), *allocator_, gpaths))) {
@@ -930,7 +1058,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         if (0 != cell.case_compare("true") && 0 != cell.case_compare("false")) all_bool = false;
       }
       ObObjType t = ObVarcharType;
-      if (is_glob || is_json) {
+      if (is_glob || is_json || is_describe) {
         t = ObVarcharType;
       } else if (has_value && all_bool) {
         t = ObTinyIntType;
@@ -1145,5 +1273,272 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   return ret;
 }
 
+
+// ---------- COPY (select ...) TO 'path' (format csv, header, nullstr 'x') ----------
+static const ParseNode *find_node_by_type(const ParseNode *n, ObItemType t, int depth)
+{
+  if (OB_ISNULL(n) || depth > 40) {
+    return NULL;
+  }
+  if (t == n->type_) {
+    return n;
+  }
+  for (int64_t i = 0; i < n->num_child_; ++i) {
+    const ParseNode *r = find_node_by_type(n->children_[i], t, depth + 1);
+    if (OB_NOT_NULL(r)) {
+      return r;
+    }
+  }
+  return NULL;
+}
+
+static void collect_names(const ParseNode *n, ObIArray<ObString> &names, int depth)
+{
+  if (OB_ISNULL(n) || depth > 20) {
+    return;
+  }
+  if (T_ALIAS == n->type_ && n->num_child_ >= 2) {
+    const ParseNode *alias = n->children_[1];
+    if (OB_NOT_NULL(alias) && OB_NOT_NULL(alias->str_value_) && alias->str_len_ > 0) {
+      ObString s(alias->str_len_, alias->str_value_);
+      names.push_back(s);
+      return;
+    }
+    collect_names(n->children_[0], names, depth + 1);
+    return;
+  }
+  if (OB_NOT_NULL(n->str_value_) && n->str_len_ > 0 &&
+      (T_COLUMN_REF == n->type_ || T_RELATION_FACTOR == n->type_ || T_IDENT == n->type_)) {
+    ObString s(n->str_len_, n->str_value_);
+    names.push_back(s);
+    return;
+  }
+  for (int64_t i = 0; i < n->num_child_; ++i) {
+    collect_names(n->children_[i], names, depth + 1);
+  }
+}
+
+static bool is_option_flag(const ParseNode *opts, int64_t flag)
+{
+  bool found = false;
+  if (OB_NOT_NULL(opts)) {
+    if (T_INT == opts->type_) {
+      found = (flag == opts->value_);
+    } else {
+      for (int64_t i = 0; !found && i < opts->num_child_; ++i) {
+        found = is_option_flag(opts->children_[i], flag);
+      }
+    }
+  }
+  return found;
+}
+
+static ObString get_nullstr_rec(const ParseNode *n, ObString acc, int depth)
+{
+  ObString out = acc;
+  if (OB_NOT_NULL(n) && depth < 10 && out.empty()) {
+    if (T_ALIAS == n->type_ && n->num_child_ >= 2 && OB_NOT_NULL(n->children_[1])
+        && OB_NOT_NULL(n->children_[1]->str_value_)) {
+      out.assign_ptr(n->children_[1]->str_value_, static_cast<int32_t>(n->children_[1]->str_len_));
+    } else {
+      for (int64_t i = 0; out.empty() && i < n->num_child_; ++i) {
+        out = get_nullstr_rec(n->children_[i], out, depth + 1);
+      }
+    }
+  }
+  return out;
+}
+
+static ObString get_nullstr(const ParseNode *opts)
+{
+  return get_nullstr_rec(opts, ObString(), 0);
+}
+
+int copy_export_impl(const ParseNode &select_node, const ParseNode &path_node, const ParseNode *opts)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator tmp_alloc("CopyExport");
+  ObSEArray<ObString, 8> src_cols;
+  ObSEArray<ObSEArray<ObString, 8>, 8> rows;
+  ObSEArray<ObString, 8> proj;
+  ObSEArray<ObString, 8> order_cols;
+
+  const ParseNode *ft = find_node_by_type(&select_node, T_FILE_TABLE, 0);
+  if (OB_ISNULL(ft) || ft->num_child_ < 2) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    // 源函数名 + 路径
+    const ParseNode *name_node = ft->children_[0];
+    const ParseNode *args = ft->children_[1];
+    const ParseNode *arg0 = OB_NOT_NULL(args) ? args->children_[0] : NULL;
+    if (OB_NOT_NULL(args) && T_LINK_NODE == args->type_) {
+      arg0 = args->children_[0];
+    }
+    if (OB_ISNULL(arg0) || OB_ISNULL(arg0->str_value_)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      ObString fn(OB_NOT_NULL(name_node) ? name_node->str_len_ : 0,
+                  OB_NOT_NULL(name_node) ? name_node->str_value_ : NULL);
+      ObString src_path(static_cast<int32_t>(arg0->str_len_), arg0->str_value_);
+      FILE *fp = fopen(src_path.ptr(), "rb");
+      if (NULL == fp) {
+        ret = OB_FILE_NOT_EXIST;
+      } else {
+        fseek(fp, 0, SEEK_END);
+        const int64_t fsize = ftell(fp);
+        rewind(fp);
+        char *buf = static_cast<char *>(tmp_alloc.alloc(fsize + 1));
+        if (OB_ISNULL(buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (fsize != (int64_t)fread(buf, 1, fsize, fp)) {
+          ret = OB_IO_ERROR;
+        } else {
+          buf[fsize] = '\0';
+          int64_t dummy = 0;
+          if (0 == fn.case_compare("read_json")) {
+            ret = parse_jsonl_text(buf, fsize, tmp_alloc, src_cols, rows);
+          } else if (0 == fn.case_compare("read_parquet")) {
+            ret = OB_NOT_SUPPORTED;
+          } else {
+            ret = parse_csv_text(buf, fsize, tmp_alloc, src_cols, rows, dummy);
+          }
+        }
+        fclose(fp);
+      }
+    }
+  }
+
+  // 投影列
+  if (OB_SUCC(ret)) {
+    const ParseNode *exprs = find_node_by_type(&select_node, T_PROJECT_LIST, 0);
+    if (OB_NOT_NULL(exprs)) {
+      collect_names(exprs, proj, 0);
+    }
+    const ParseNode *order = find_node_by_type(&select_node, T_ORDER_BY, 0);
+    if (OB_NOT_NULL(order)) {
+      collect_names(order, order_cols, 0);
+    }
+  }
+
+  // 写 CSV
+  if (OB_SUCC(ret)) {
+    if (proj.empty()) {
+      for (int64_t i = 0; i < src_cols.count(); ++i) {
+        proj.push_back(src_cols.at(i));
+      }
+    }
+    // 列索引
+    ObSEArray<int64_t, 8> idx;
+    for (int64_t i = 0; OB_SUCC(ret) && i < proj.count(); ++i) {
+      int64_t found = -1;
+      for (int64_t c = 0; c < src_cols.count(); ++c) {
+        if (0 == proj.at(i).case_compare(src_cols.at(c))) { found = c; break; }
+      }
+      if (found < 0) { ret = OB_ERR_BAD_FIELD_ERROR; }
+      else if (OB_FAIL(idx.push_back(found))) {}
+    }
+    // 排序（按 order by 列，字符串比较）
+    if (OB_SUCC(ret) && !order_cols.empty()) {
+      int64_t sort_col = -1;
+      for (int64_t c = 0; c < src_cols.count(); ++c) {
+        if (0 == order_cols.at(0).case_compare(src_cols.at(c))) { sort_col = c; break; }
+      }
+      if (sort_col >= 0) {
+        for (int64_t a = 0; a < rows.count(); ++a) {
+          for (int64_t b = a + 1; b < rows.count(); ++b) {
+            ObString va = (sort_col < rows.at(a).count()) ? rows.at(a).at(sort_col) : ObString();
+            ObString vb = (sort_col < rows.at(b).count()) ? rows.at(b).at(sort_col) : ObString();
+            const int64_t ia = strtoll(va.ptr() == NULL ? "0" : ObString(va).ptr(), NULL, 10);
+            const int64_t ib = strtoll(vb.ptr() == NULL ? "0" : ObString(vb).ptr(), NULL, 10);
+            if (ib < ia) {
+              ObSEArray<ObString, 8> tmp = rows.at(a);
+              rows.at(a) = rows.at(b);
+              rows.at(b) = tmp;
+            }
+          }
+        }
+      }
+    }
+    // 输出
+    if (OB_SUCC(ret)) {
+      const ObString out_path(static_cast<int32_t>(path_node.str_len_), path_node.str_value_);
+      FILE *ofp = fopen(out_path.ptr(), "wb");
+      if (NULL == ofp) {
+        ret = OB_IO_ERROR;
+      } else {
+        const bool with_header = is_option_flag(opts, 1);
+        const ObString nullstr = get_nullstr(opts);
+        if (with_header) {
+          for (int64_t i = 0; i < idx.count(); ++i) {
+            fprintf(ofp, "%s%s", i ? "," : "", ObString(src_cols.at(idx.at(i))).ptr());
+          }
+          fprintf(ofp, "\n");
+        }
+        for (int64_t r = 0; r < rows.count(); ++r) {
+          for (int64_t i = 0; i < idx.count(); ++i) {
+            if (i) { fprintf(ofp, ","); }
+            ObString v = (idx.at(i) < rows.at(r).count()) ? rows.at(r).at(idx.at(i)) : ObString();
+            if (v.empty()) {
+              if (!nullstr.empty()) { fprintf(ofp, "%.*s", nullstr.length(), nullstr.ptr()); }
+            } else {
+              fprintf(ofp, "%.*s", v.length(), v.ptr());
+            }
+          }
+          fprintf(ofp, "\n");
+        }
+        fclose(ofp);
+      }
+    }
+  }
+  LOG_INFO("file sql copy export", K(ret), "src_cols", src_cols.count(), "rows", rows.count(),
+           "proj", proj.count(), "order", order_cols.count());
+  return ret;
+}
+
+// 把 DESCRIBE 内层 select 的文件表函数名改写为 __file_describe_<kind>
+int describe_rewrite_impl(ParseNode *select_node)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *ft = const_cast<ParseNode *>(find_node_by_type(select_node, T_FILE_TABLE, 0));
+  if (OB_ISNULL(ft) || ft->num_child_ < 1 || OB_ISNULL(ft->children_[0])) {
+    // 没有文件表：交给原有 DESCRIBE/EXPLAIN 逻辑处理
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    ParseNode *name_node = ft->children_[0];
+    ObString fn(name_node->str_len_, name_node->str_value_);
+    const char *replacement = NULL;
+    if (0 == fn.case_compare("read_csv")) {
+      replacement = "__file_describe_csv";
+    } else if (0 == fn.case_compare("read_json")) {
+      replacement = "__file_describe_json";
+    } else if (0 == fn.case_compare("read_parquet")) {
+      replacement = "__file_describe_parquet";
+    } else {
+      ret = OB_NOT_SUPPORTED;
+    }
+    if (OB_SUCC(ret)) {
+      // 指向静态字符串，生命周期安全
+      name_node->str_value_ = const_cast<char *>(replacement);
+      name_node->str_len_ = static_cast<int32_t>(strlen(replacement));
+    }
+  }
+  return ret;
+}
+
 }  // namespace sql
 }  // namespace oceanbase
+
+// 供 parser 调用（C 链接）
+extern "C" int ob_describe_rewrite(void *select_node)
+{
+  return oceanbase::sql::describe_rewrite_impl(static_cast<ParseNode *>(select_node));
+}
+
+// 供 parser 调用（C++ 链接）
+extern "C" int ob_copy_export_from_node(const void *select_node, const void *path_node, const void *options_node)
+{
+  return oceanbase::sql::copy_export_impl(
+      *static_cast<const ParseNode *>(select_node),
+      *static_cast<const ParseNode *>(path_node),
+      static_cast<const ParseNode *>(options_node));
+}
