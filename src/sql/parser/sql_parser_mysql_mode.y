@@ -23,6 +23,35 @@
 %code requires {
 #include "parse_node.h"
 }
+
+%code {
+/* ---- file-sql helper ---- */
+#include <string.h>
+static bool is_file_table_func(const char *name, int32_t len)
+{
+  static const char *names[] = {"read_csv", "read_json", "read_parquet", "glob"};
+  bool hit = false;
+  if (NULL != name) {
+    for (int i = 0; !hit && i < 4; i++) {
+      const char *cand = names[i];
+      int32_t clen = (int32_t)strlen(cand);
+      if (clen == len) {
+        hit = true;
+        for (int32_t k = 0; k < len && hit; k++) {
+          char a = name[k];
+          if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+          }
+          if (a != cand[k]) {
+            hit = false;
+          }
+        }
+      }
+    }
+  }
+  return hit;
+}
+}
 %{
 #include <stdint.h>
 #define YYDEBUG 1
@@ -10843,6 +10872,15 @@ tbl_name
 | unnest_expr
 {
   $$ = $1;
+}
+| relation_name '(' expr_list ')'
+{
+  if (is_file_table_func(($1)->str_value_, ($1)->str_len_)) {
+    malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE, 2, $1, $3);
+  } else {
+    /* FROM 位置只允许表名/子查询/表函数，其他函数名直接报语法错误 */
+    YYABORT;
+  }
 }
 | hybrid_search_expr
 {

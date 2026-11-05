@@ -668,6 +668,11 @@ protected:
                                       const share::schema::ObTableSchema *table_schema,
                                       common::ObIArray<ObRawExpr*> &check_exprs,
                                       ObIArray<int64_t> *check_flags = NULL);
+  int resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int gen_file_table_column_items(const int64_t column_cnt,
+                                  const ObIArray<ObRawExprResType> &res_types,
+                                  const ObIArray<ObString> &col_names,
+                                  TableItem &table_item);
   int gen_values_table_column_items(const int64_t column_cnt,
                                     const ObIArray<ObRawExprResType> &res_types,
                                     TableItem &table_item);

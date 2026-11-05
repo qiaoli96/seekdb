@@ -2719,6 +2719,10 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_FILE_TABLE: {
+        OZ (resolve_file_table_item(*table_node, table_item));
+        break;
+      }
       case T_VALUES_TABLE_EXPRESSION: {
         if (OB_FAIL(resolve_values_table_item(*table_node, table_item))) {
         }

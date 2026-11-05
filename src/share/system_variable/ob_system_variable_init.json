@@ -10975,5 +10975,20 @@
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
+  },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Whether file SQL (read_csv/read_json/read_parquet/glob) is enabled",
+    "flags": "SESSION | NEED_SERIALIZE",
+    "min_val": "0",
+    "max_val": "1",
+    "publish_version": "",
+    "info_cn": "是否允许通过 read_csv/read_json/read_parquet/glob 直接查询文件",
+    "background_cn": "",
+    "ref_url": ""
   }
 }
