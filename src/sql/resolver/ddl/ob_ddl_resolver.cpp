@@ -1940,7 +1940,8 @@ static int ai_register(const char *db, int32_t db_len,
           if (g_ai_cols[k].used_ && ai_name_eq(g_ai_cols[k].db_, db_buf)
               && ai_name_eq(g_ai_cols[k].tbl_, tbl_buf) && ai_name_eq(g_ai_cols[k].col_, idbuf)) {
             ret = OB_NOT_SUPPORTED;
-            LOG_USER_ERROR(OB_NOT_SUPPORTED);
+            /* 不写 LOG_USER_ERROR：让客户端显示 OB_NOT_SUPPORTED 的标准文案
+               "Not supported feature or function"，与官方 .result 一致 */
             SQL_RESV_LOG(WARN, "ai column dependency rejected", K(ret), K(idbuf));
           }
         }
