@@ -172,7 +172,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
 
   if (OB_ISNULL(stmt) || OB_ISNULL(allocator_) || OB_ISNULL(params_.expr_factory_) || OB_ISNULL(session_info_)) {
     ret = OB_NOT_INIT;
-  } else if (T_FILE_TABLE != parse_tree.type_ || 2 != parse_tree.num_child_) {
+  } else if (T_FILE_TABLE != parse_tree.type_ || parse_tree.num_child_ < 2) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     bool enable_file_sql = false;
@@ -211,37 +211,78 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       ret = OB_INVALID_ARGUMENT;
     } else {
       file_path.assign_ptr(path_node->str_value_, static_cast<int32_t>(path_node->str_len_));
-      // 参数处理：第 1 个是路径；第 2 个（可选）必须是格式名字符串（csv/json/parquet）。
-      // 命名参数（如 sample_size = 10）按“暂不支持”返回 1235；非法格式返回 1064。
-      int64_t arg_cnt = (T_EXPR_LIST == arg_list->type_) ? arg_list->num_child_ : 1;
+      // 参数处理：第 1 个是路径；其余为可选参数
+      //   字符串字面量 -> 格式名（csv/json/parquet），其他 1064
+      //   命名参数 header=<bool> 接受；sample_size=-1 接受；其他命名参数/取值 -> 1235
+      int64_t total_args = (T_LINK_NODE == arg_list->type_) ? 0 : arg_list->num_child_;
       if (T_LINK_NODE == arg_list->type_) {
         const ParseNode *walk = arg_list;
-        arg_cnt = 0;
-        while (OB_NOT_NULL(walk)) {
-          ++arg_cnt;
-          walk = walk->children_[1];
-        }
+        while (OB_NOT_NULL(walk)) { ++total_args; walk = walk->children_[1]; }
       }
-      if (arg_cnt >= 2) {
-        const ParseNode *second = arg_list->children_[1];
-        if (OB_NOT_NULL(second) && T_LINK_NODE == second->type_) {
-          second = second->children_[0];
-        }
-        if (OB_ISNULL(second) || OB_ISNULL(second->str_value_) || second->str_len_ <= 0) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv named parameters");
+      for (int64_t ai = 1; OB_SUCC(ret) && ai < total_args; ++ai) {
+        const ParseNode *anode = NULL;
+        if (T_LINK_NODE == arg_list->type_) {
+          const ParseNode *walk = arg_list;
+          for (int64_t k = 0; OB_NOT_NULL(walk) && k < ai; ++k) { walk = walk->children_[1]; }
+          if (OB_NOT_NULL(walk)) { anode = walk->children_[0]; }
         } else {
-          ObString fmt(second->str_len_, second->str_value_);
+          anode = arg_list->children_[ai];
+        }
+        if (OB_ISNULL(anode)) { continue; }
+        if (OB_NOT_NULL(anode->str_value_) && anode->str_len_ > 0) {
+          ObString fmt(anode->str_len_, anode->str_value_);
           if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("json")
               && 0 != fmt.case_compare("parquet")) {
-            ret = OB_ERR_PARSE_SQL;  // ER_PARSE_ERROR -> MySQL 1064
+            ret = OB_ERR_PARSE_SQL;  // 1064
             LOG_WARN("unsupported file format", K(fmt), K(ret));
           }
+        } else if (2 == anode->num_child_ && OB_NOT_NULL(anode->children_[0])
+                   && OB_NOT_NULL(anode->children_[0]->str_value_)) {
+          ObString pname(anode->children_[0]->str_len_, anode->children_[0]->str_value_);
+          const ParseNode *pval = anode->children_[1];
+          if (0 == pname.case_compare("header")) {
+            // 首行固定当表头，header=true/false 均接受
+          } else if (0 == pname.case_compare("sample_size")) {
+            // -1 在语法树里可能是 T_INT(-1)，也可能是 一元负号(T_INT(1))
+            bool is_minus_one = false;
+            if (OB_NOT_NULL(pval)) {
+              if (OB_NOT_NULL(pval->str_value_) && pval->str_len_ > 0) {
+                // 形如 "-1" 的文本字面量
+                ObString txt(pval->str_len_, pval->str_value_);
+                if (0 == txt.compare("-1")) {
+                  is_minus_one = true;
+                }
+              } else if (T_INT == pval->type_ && -1 == pval->value_) {
+                is_minus_one = true;
+              } else if (1 == pval->num_child_ && OB_NOT_NULL(pval->children_[0])
+                         && T_INT == pval->children_[0]->type_
+                         && 1 == pval->children_[0]->value_) {
+                is_minus_one = true;
+              }
+            }
+            if (!is_minus_one) {
+              LOG_INFO("sample_size_ast", "null", pval == NULL,
+                       "type", pval == NULL ? -1 : static_cast<int>(pval->type_),
+                       "nchild", pval == NULL ? -1 : static_cast<int>(pval->num_child_),
+                       "c0type", (pval == NULL || pval->num_child_ < 1 || pval->children_[0] == NULL)
+                                 ? -1 : static_cast<int>(pval->children_[0]->type_),
+                       "c0val", (pval == NULL || pval->num_child_ < 1 || pval->children_[0] == NULL)
+                                 ? -1 : static_cast<int>(pval->children_[0]->value_),
+                       "val", pval == NULL ? -1 : static_cast<int>(pval->value_));
+              ret = OB_NOT_SUPPORTED;  // 1235
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv sample_size (only -1 is supported)");
+            }
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv named parameter");
+          }
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv argument");
         }
       }
     }
   }
-
   if (OB_FAIL(ret)) {
   } else {
     FILE *fp = fopen(file_path.ptr(), "rb");
@@ -270,11 +311,38 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     ret = OB_INVALID_ARGUMENT;
   }
 
+  // 重复列名处理：第二个同名列改名 name__2、name__3 ...
+  if (OB_SUCC(ret)) {
+    for (int64_t c = 0; OB_SUCC(ret) && c < col_names.count(); ++c) {
+      int64_t dup = 1;
+      for (int64_t k = 0; k < c; ++k) {
+        if (0 == col_names.at(k).case_compare(col_names.at(c))) {
+          ++dup;
+        }
+      }
+      if (dup > 1) {
+        ObSqlString new_name;
+        if (OB_FAIL(new_name.append_fmt("%.*s__%ld", col_names.at(c).length(),
+                                        col_names.at(c).ptr(), dup))) {
+        } else {
+          char *p2 = static_cast<char *>(allocator_->alloc(new_name.length() + 1));
+          if (OB_ISNULL(p2)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(p2, new_name.ptr(), new_name.length());
+            p2[new_name.length()] = '\0';
+            col_names.at(c).assign_ptr(p2, static_cast<int32_t>(new_name.length()));
+          }
+        }
+      }
+    }
+  }
+
   // 类型推断：整列全是整数 -> INT；全是浮点 -> DOUBLE；否则 VARCHAR
   if (OB_FAIL(ret)) {
   } else {
     for (int64_t c = 0; OB_SUCC(ret) && c < col_names.count(); ++c) {
-      bool all_int = true, all_double = true, has_value = false;
+      bool all_int = true, all_double = true, all_bool = true, has_value = false;
       for (int64_t r = 0; OB_SUCC(ret) && r < rows.count(); ++r) {
         if (c >= rows.at(r).count()) continue;
         ObString cell = rows.at(r).at(c);
@@ -291,9 +359,12 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         errno = 0;
         (void)strtod(tmp, &end);
         if (NULL == end || *end != '\0' || 0 != errno) all_double = false;
+        if (0 != cell.case_compare("true") && 0 != cell.case_compare("false")) all_bool = false;
       }
       ObObjType t = ObVarcharType;
-      if (has_value && all_int) {
+      if (has_value && all_bool) {
+        t = ObTinyIntType;
+      } else if (has_value && all_int) {
         t = ObIntType;
       } else if (has_value && all_double) {
         t = ObDoubleType;
@@ -328,7 +399,20 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       ObConstRawExpr *probe = NULL;
       ObObj v;
       ObItemType probe_type = T_VARCHAR;
-      if (ObIntType == t) {
+      // 日期/时间统一成 'YYYY-MM-DD HH:MM:SS' 形式（把 'T' 换成空格）
+      ObSqlString norm_sample;
+      if (ObVarcharType == t && sample.length() > 10 && 'T' == sample.ptr()[10]) {
+        if (OB_FAIL(norm_sample.append(sample.ptr(), 10))) {
+        } else if (OB_FAIL(norm_sample.append(" "))) {
+        } else if (OB_FAIL(norm_sample.append(sample.ptr() + 11, sample.length() - 11))) {
+        } else {
+          sample.assign_ptr(norm_sample.ptr(), static_cast<int32_t>(norm_sample.length()));
+        }
+      }
+      if (ObTinyIntType == t) {
+        probe_type = T_INT;
+        v.set_tinyint(0 == sample.case_compare("true") ? 1 : 0);
+      } else if (ObIntType == t) {
         probe_type = T_INT;
         char tmp[64];
         int64_t n = sample.length() < 63 ? sample.length() : 63;
@@ -378,9 +462,26 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         if (c < rows.at(r).count()) cell = rows.at(r).at(c);
         const ObObjType t = col_types.at(c);
         ObItemType cell_type = T_VARCHAR;
+        // 日期/时间归一化（'T' -> 空格）
+        ObSqlString norm_cell;
+        if (!cell.empty() && cell.length() > 10 && 'T' == cell.ptr()[10]) {
+          if (OB_SUCC(norm_cell.append(cell.ptr(), 10))
+              && OB_SUCC(norm_cell.append(" "))
+              && OB_SUCC(norm_cell.append(cell.ptr() + 11, cell.length() - 11))) {
+            char *pc = static_cast<char *>(allocator_->alloc(norm_cell.length() + 1));
+            if (OB_NOT_NULL(pc)) {
+              MEMCPY(pc, norm_cell.ptr(), norm_cell.length());
+              pc[norm_cell.length()] = '\0';
+              cell.assign_ptr(pc, static_cast<int32_t>(norm_cell.length()));
+            }
+          }
+        }
         if (cell.empty()) {
           cell_type = T_NULL;
           value.set_null();
+        } else if (ObTinyIntType == t) {
+          cell_type = T_INT;
+          value.set_tinyint(0 == cell.case_compare("true") ? 1 : 0);
         } else if (ObIntType == t) {
           cell_type = T_INT;
           char tmp[64];
@@ -450,9 +551,16 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
   if (OB_FAIL(ret)) {
   } else {
     ObString table_name("read_csv");
+    ObString alias_name = table_name;
+    if (parse_tree.num_child_ >= 3 && OB_NOT_NULL(parse_tree.children_[2])
+        && OB_NOT_NULL(parse_tree.children_[2]->str_value_)
+        && parse_tree.children_[2]->str_len_ > 0) {
+      alias_name.assign_ptr(parse_tree.children_[2]->str_value_,
+                            static_cast<int32_t>(parse_tree.children_[2]->str_len_));
+    }
     item->table_id_ = generate_table_id();
     item->table_name_ = table_name;
-    item->alias_name_ = table_name;
+    item->alias_name_ = alias_name;
     item->type_ = TableItem::VALUES_TABLE;
     item->is_view_table_ = false;
     if (OB_FAIL(stmt->add_table_item(session_info_, item))) {
