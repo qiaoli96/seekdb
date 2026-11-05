@@ -183,6 +183,13 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     } else if (!enable_file_sql) {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "file sql is disabled, set session enable_file_sql = on first");
+    } else {
+      // 文件表在 resolve 阶段就把文件内容读成常量表；若计划进入全局缓存，
+      // 不同文件路径/文件变更都会复用旧计划（读到旧数据）。
+      // 等价于用户写了 NO_USE_PLAN_CACHE hint：本条语句既不写入也不命中计划缓存。
+      // ObQueryCtx::get_global_hint() 只提供 const 引用，但该对象本身是可写的
+      ObGlobalHint &global_hint = const_cast<ObGlobalHint &>(params_.query_ctx_->get_global_hint());
+      global_hint.merge_plan_cache_hint(ObPlanCachePolicy::OB_USE_PLAN_CACHE_NONE);
     }
   }
 
@@ -316,6 +323,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
           MEMCPY(p, sample.ptr(), sample.length());
           p[sample.length()] = '\0';
           v.set_string(ObVarcharType, ObString(static_cast<int32_t>(sample.length()), p));
+          v.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
         }
       }
       if (OB_FAIL(ret)) {
@@ -368,6 +376,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
             MEMCPY(p, cell.ptr(), cell.length());
             p[cell.length()] = '\0';
             value.set_string(ObVarcharType, ObString(static_cast<int32_t>(cell.length()), p));
+            value.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
           }
         }
         if (OB_FAIL(ret)) {
