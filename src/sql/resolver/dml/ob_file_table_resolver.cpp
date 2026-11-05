@@ -211,6 +211,22 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       ret = OB_INVALID_ARGUMENT;
     } else {
       file_path.assign_ptr(path_node->str_value_, static_cast<int32_t>(path_node->str_len_));
+      // 第二参数（可选）为格式名：read_* 只接受 csv/json/parquet；其余（如 xml）报语法错 1064
+      if (OB_SUCC(ret) && (T_EXPR_LIST == arg_list->type_ || T_LINK_NODE == arg_list->type_)
+          && arg_list->num_child_ >= 2) {
+        const ParseNode *fmt_node = arg_list->children_[1];
+        if (T_LINK_NODE == arg_list->type_) {
+          fmt_node = NULL;  // 链式列表需要逐个下钻，暂不支持第二参数
+        }
+        if (OB_NOT_NULL(fmt_node) && OB_NOT_NULL(fmt_node->str_value_) && fmt_node->str_len_ > 0) {
+          ObString fmt(fmt_node->str_len_, fmt_node->str_value_);
+          if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("json")
+              && 0 != fmt.case_compare("parquet")) {
+            ret = OB_ERR_PARSE_SQL;  // ER_PARSE_ERROR -> MySQL 1064
+            LOG_WARN("unsupported file format", K(fmt), K(ret));
+          }
+        }
+      }
     }
   }
 
