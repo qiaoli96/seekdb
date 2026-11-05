@@ -938,7 +938,12 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
         }
       }
     }
-    LOG_INFO("file sql describe", K(ret), K(file_path), "cols", col_names.count(), "rows", rows.count());
+    // 保证元数据表固定 6 列（防止意外多出列导致输出多一列 NULL）
+    while (col_names.count() > 6) {
+      col_names.pop_back();
+    }
+    LOG_INFO("file sql describe", K(ret), K(file_path), "cols", col_names.count(), "rows", rows.count(),
+             "first_row_cells", rows.empty() ? 0 : rows.at(0).count());
   } else if (is_glob) {
     ObSEArray<ObString, 8> gpaths;
     if (OB_FAIL(glob_paths(file_path.ptr(), *allocator_, gpaths))) {
@@ -1000,7 +1005,9 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
     }
   }
 
-  if (OB_FAIL(ret)) {
+  if (is_glob || is_parquet || is_describe) {
+    // 这些路径已在各自分支内构造好 col_names/rows；跳过通用解析，否则会多出一列空列名
+  } else if (OB_FAIL(ret)) {
   } else if (is_json && OB_FAIL(parse_jsonl_text(file_data, file_size, *allocator_, col_names, rows))) {
   } else if (!is_json && OB_FAIL(parse_csv_text(file_data, file_size, *allocator_, col_names, rows, max_columns))) {
   } else if (col_names.empty()) {
