@@ -211,15 +211,27 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableIte
       ret = OB_INVALID_ARGUMENT;
     } else {
       file_path.assign_ptr(path_node->str_value_, static_cast<int32_t>(path_node->str_len_));
-      // 第二参数（可选）为格式名：read_* 只接受 csv/json/parquet；其余（如 xml）报语法错 1064
-      if (OB_SUCC(ret) && (T_EXPR_LIST == arg_list->type_ || T_LINK_NODE == arg_list->type_)
-          && arg_list->num_child_ >= 2) {
-        const ParseNode *fmt_node = arg_list->children_[1];
-        if (T_LINK_NODE == arg_list->type_) {
-          fmt_node = NULL;  // 链式列表需要逐个下钻，暂不支持第二参数
+      // 参数处理：第 1 个是路径；第 2 个（可选）必须是格式名字符串（csv/json/parquet）。
+      // 命名参数（如 sample_size = 10）按“暂不支持”返回 1235；非法格式返回 1064。
+      int64_t arg_cnt = (T_EXPR_LIST == arg_list->type_) ? arg_list->num_child_ : 1;
+      if (T_LINK_NODE == arg_list->type_) {
+        const ParseNode *walk = arg_list;
+        arg_cnt = 0;
+        while (OB_NOT_NULL(walk)) {
+          ++arg_cnt;
+          walk = walk->children_[1];
         }
-        if (OB_NOT_NULL(fmt_node) && OB_NOT_NULL(fmt_node->str_value_) && fmt_node->str_len_ > 0) {
-          ObString fmt(fmt_node->str_len_, fmt_node->str_value_);
+      }
+      if (arg_cnt >= 2) {
+        const ParseNode *second = arg_list->children_[1];
+        if (OB_NOT_NULL(second) && T_LINK_NODE == second->type_) {
+          second = second->children_[0];
+        }
+        if (OB_ISNULL(second) || OB_ISNULL(second->str_value_) || second->str_len_ <= 0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "read_csv named parameters");
+        } else {
+          ObString fmt(second->str_len_, second->str_value_);
           if (0 != fmt.case_compare("csv") && 0 != fmt.case_compare("json")
               && 0 != fmt.case_compare("parquet")) {
             ret = OB_ERR_PARSE_SQL;  // ER_PARSE_ERROR -> MySQL 1064
