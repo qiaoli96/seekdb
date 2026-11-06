@@ -10,6 +10,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include "observer/omt/ob_ai_service.h"
+#include "share/rc/ob_server_runtime.h"
 static bool g_ai_internal_file_table = false;
 
 namespace oceanbase
@@ -1561,6 +1569,7 @@ static void aim_copy(char *dst, int64_t cap, const char *src, int32_t len)
 
 // ---------- 赛题三 P2：AI 列逐行状态机（内存，模拟异步 worker） ----------
 int ob_ai_meta_get_tmpl(int64_t idx, const char *&tmpl, int32_t &len);
+int ob_ai_meta_get_model(int64_t idx, const char *&model, int32_t &len);
 
 static const int32_t AI_NAME_CAP = 130;
 static const int32_t AI_VAL_CAP = 512;
@@ -1571,6 +1580,13 @@ static const int AI_ST_NONE = 0;
 static const int AI_ST_PENDING = 1;
 static const int AI_ST_READY = 2;
 
+static const int32_t AI_ROW_MAX_COLS = 6;
+
+struct ObAiRowVal {
+  char name_[48];
+  char val_[192];
+};
+
 struct ObAiRowTask {
   bool used_;
   char db_[AI_NAME_CAP];
@@ -1579,7 +1595,10 @@ struct ObAiRowTask {
   char rowkey_[256];
   char input_[AI_VAL_CAP];
   int state_;
+  bool committed_;
   int64_t touch_us_;
+  int64_t col_cnt_;
+  ObAiRowVal vals_[AI_ROW_MAX_COLS];
 };
 
 struct ObAiColTask {
@@ -1610,6 +1629,7 @@ struct ObAiEndTransSnap {
   int64_t col_cnt_;
 };
 
+static bool g_ai_write_uncommitted = false;
 static ObAiRowTask g_ai_rows[AI_MAX_ROW_TASK];
 static int64_t g_ai_row_cnt = 0;
 static ObAiColTask g_ai_cols_state[AI_MAX_COL_TASK];
@@ -1632,6 +1652,23 @@ static void ai_fmt_datetime(int64_t us, char *buf, int64_t cap)
            tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
            tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
            static_cast<long>(us % 1000000));
+}
+
+// 解析出的标识符可能带反引号/双引号，比较前先剥掉
+static void ai_strip_quotes(const char *src, int32_t len, char *out, int64_t cap)
+{
+  int32_t b = 0;
+  int32_t e = len;
+  if (NULL != src && e >= 2 && ("`"[0] == src[0] || '"' == src[0])
+      && src[e - 1] == src[0]) {
+    b = 1;
+    e = len - 1;
+  }
+  if (NULL == src || e <= b) {
+    out[0] = '\0';
+  } else {
+    aim_copy(out, cap, src + b, e - b);
+  }
 }
 
 static bool ai_eq(const char *a, const char *b)
@@ -1715,6 +1752,7 @@ static ObAiRowTask *ai_touch_row(const char *db, const char *tbl, const char *co
       aim_copy(r->tbl_, sizeof(r->tbl_), tbl, static_cast<int32_t>(strlen(tbl)));
       aim_copy(r->col_, sizeof(r->col_), col, static_cast<int32_t>(strlen(col)));
       aim_copy(r->rowkey_, sizeof(r->rowkey_), rowkey, static_cast<int32_t>(strlen(rowkey)));
+      r->committed_ = !g_ai_write_uncommitted;
     }
   }
   return r;
@@ -1783,7 +1821,7 @@ static void ai_set_col_state(const char *db, const char *tbl, const char *col)
   for (int64_t i = 0; !pending && i < g_ai_row_cnt; ++i) {
     const ObAiRowTask &r = g_ai_rows[i];
     if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl) && ai_eq(r.col_, col)
-        && AI_ST_PENDING == r.state_) {
+        && AI_ST_READY != r.state_) {
       pending = true;
     }
   }
@@ -2041,10 +2079,29 @@ static bool ai_relation_of(const ParseNode *rel, char *db, int64_t dbcap,
   return ok;
 }
 
+static void ai_collect_colrefs(const ParseNode *n, ObIArray<const ParseNode *> &out,
+                               int depth)
+{
+  if (NULL == n || depth > 24) {
+  } else {
+    if (T_COLUMN_REF == n->type_ && NULL != n->str_value_ && n->str_len_ > 0) {
+      (void)out.push_back(n);
+    }
+    for (int64_t i = 0; i < n->num_child_; ++i) {
+      ai_collect_colrefs(n->children_[i], out, depth + 1);
+    }
+  }
+}
+
 static bool ai_colref_is(const ParseNode *n, const char *col)
 {
-  return NULL != n && T_COLUMN_REF == n->type_ && NULL != n->str_value_
-         && ai_len_eq(n->str_value_, n->str_len_, col);
+  bool hit = false;
+  if (NULL != n && T_COLUMN_REF == n->type_ && NULL != n->str_value_) {
+    char name[AI_NAME_CAP];
+    ai_strip_quotes(n->str_value_, static_cast<int32_t>(n->str_len_), name, sizeof(name));
+    hit = ai_eq(name, col);
+  }
+  return hit;
 }
 
 static bool ai_meta_at(int64_t idx, char *db, char *tbl, char *col)
@@ -2079,6 +2136,9 @@ static bool ai_tmpl_at(int64_t idx, char *buf, int64_t cap)
   }
   return ok;
 }
+
+static void ai_row_val_put(ObAiRowTask &r, const char *name, const char *val);
+static bool ai_stmt_has_table(ObDMLStmt *stmt, const char *tbl);
 
 static bool ai_pk_name(ObSchemaChecker *sc, const char *db,
                        const char *tbl, char *out, int64_t cap)
@@ -2156,7 +2216,8 @@ static void ai_apply_insert(const char *db, const char *tbl,
   for (int64_t i = 0; NULL != cl && i < ai_list_size(cl) && col_cnt < 32; ++i) {
     const ParseNode *c = ai_list_item(cl, i);
     if (NULL != c && NULL != c->str_value_ && c->str_len_ > 0) {
-      aim_copy(col_names[col_cnt], AI_NAME_CAP, c->str_value_, c->str_len_);
+      ai_strip_quotes(c->str_value_, static_cast<int32_t>(c->str_len_),
+                      col_names[col_cnt], AI_NAME_CAP);
       ++col_cnt;
     }
   }
@@ -2182,9 +2243,13 @@ static void ai_apply_insert(const char *db, const char *tbl,
           ObAiNameValSet vals;
           ai_vs_reset(vals);
           const int64_t vcnt = ai_list_size(row);
-          for (int64_t v = 0; v < vcnt && v < col_cnt; ++v) {
+          char row_vals[32][AI_VAL_CAP];
+          bool row_has[32];
+          for (int64_t v = 0; v < vcnt && v < col_cnt && v < 32; ++v) {
             char vb[AI_VAL_CAP];
-            if (ai_node_literal(ai_list_item(row, v), vb, sizeof(vb))) {
+            row_has[v] = ai_node_literal(ai_list_item(row, v), vb, sizeof(vb));
+            if (row_has[v]) {
+              aim_copy(row_vals[v], AI_VAL_CAP, vb, static_cast<int32_t>(strlen(vb)));
               ai_vs_put(vals, col_names[v], vb);
             }
           }
@@ -2199,8 +2264,15 @@ static void ai_apply_insert(const char *db, const char *tbl,
           ObAiRowTask *t = ai_touch_row(db, tbl, mcol, rowkey);
           if (NULL != t) {
             t->state_ = AI_ST_PENDING;
+            t->committed_ = !g_ai_write_uncommitted;
             t->touch_us_ = ai_now_us();
+            t->col_cnt_ = 0;
             aim_copy(t->input_, AI_VAL_CAP, input, static_cast<int32_t>(strlen(input)));
+            for (int64_t v = 0; v < col_cnt && v < 32; ++v) {
+              if (row_has[v]) {
+                ai_row_val_put(*t, col_names[v], row_vals[v]);
+              }
+            }
           }
         }
         ai_set_col_state(db, tbl, mcol);
@@ -2227,7 +2299,8 @@ static void ai_apply_update(const char *db, const char *tbl, const ParseNode *as
       if (NULL != lhs && NULL != lhs->str_value_ && lhs->str_len_ > 0
           && ai_node_literal(item->children_[1], vb, sizeof(vb))) {
         char nm[AI_NAME_CAP];
-        aim_copy(nm, sizeof(nm), lhs->str_value_, lhs->str_len_);
+        ai_strip_quotes(lhs->str_value_, static_cast<int32_t>(lhs->str_len_),
+                        nm, sizeof(nm));
         ai_vs_put(setv, nm, vb);
       }
     }
@@ -2295,8 +2368,17 @@ static void ai_apply_update(const char *db, const char *tbl, const ParseNode *as
         ObAiRowTask *t = ai_touch_row(db, tbl, mcol, newkey);
         if (NULL != t) {
           t->state_ = AI_ST_PENDING;
+          t->committed_ = !g_ai_write_uncommitted;
           t->touch_us_ = ai_now_us();
           aim_copy(t->input_, AI_VAL_CAP, input, static_cast<int32_t>(strlen(input)));
+          if (NULL != old && t != old) {
+            for (int64_t v = 0; v < old->col_cnt_; ++v) {
+              ai_row_val_put(*t, old->vals_[v].name_, old->vals_[v].val_);
+            }
+          }
+          for (int64_t v = 0; v < setv.cnt_; ++v) {
+            ai_row_val_put(*t, setv.items_[v].name_, setv.items_[v].val_);
+          }
         }
       }
       ai_set_col_state(db, tbl, mcol);
@@ -2320,18 +2402,625 @@ static void ai_apply_delete(const char *db, const char *tbl, const ParseNode *wh
       if (!ai_meta_at(i, mdb, mtbl, mcol) || !ai_eq(mdb, db) || !ai_eq(mtbl, tbl)) {
         continue;
       }
+      // 只有能拿到主键字面量时才精确摘除；拿不到就不动登记
       if (rk_cnt > 0) {
         for (int64_t k = 0; k < rk_cnt; ++k) {
           char key[256];
           snprintf(key, sizeof(key), "`%s` = %s", pk, rk_vals[k]);
           ai_drop_row(db, tbl, mcol, key);
         }
-      } else {
-        ai_clear_rows(db, tbl, mcol);
       }
       ai_set_col_state(db, tbl, mcol);
     }
   }
+}
+
+// ---- 严格读 / retry：行级取值、STATUS 伪列、连通性探测 ----
+static const int AI_ST_FAILED = 3;
+
+static bool ai_state_ready(int st)
+{
+  return AI_ST_READY == st;
+}
+
+static const char *ai_state_name(int st)
+{
+  const char *name = "PENDING";
+  if (AI_ST_READY == st) {
+    name = "READY";
+  } else if (AI_ST_FAILED == st) {
+    name = "FAILED";
+  }
+  return name;
+}
+
+static bool ai_meta_model_at(const char *col, char *model, int64_t cap)
+{
+  bool ok = false;
+  const int64_t total = ob_ai_meta_count();
+  model[0] = '\0';
+  for (int64_t i = 0; !ok && i < total; ++i) {
+    char mdb[AI_NAME_CAP];
+    char mtbl[AI_NAME_CAP];
+    char mcol[AI_NAME_CAP];
+    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mcol, col)) {
+      const char *p = NULL;
+      int32_t len = 0;
+      if (OB_SUCCESS == ob_ai_meta_get_model(i, p, len)) {
+        aim_copy(model, cap, p, len);
+        ok = ('\0' != model[0]);
+      }
+    }
+  }
+  return ok;
+}
+
+
+static bool ai_table_ids(ObSchemaChecker *sc, const char *db, const char *tbl,
+                         const char *col, char *pk_out, int64_t pk_cap,
+                         int64_t &table_id, int64_t &column_id)
+{
+  bool ok = false;
+  table_id = 0;
+  column_id = 0;
+  if (NULL != sc && ai_pk_name(sc, db, tbl, pk_out, pk_cap)) {
+    const share::schema::ObTableSchema *ts = NULL;
+    ObString db_name(static_cast<int32_t>(strlen(db)), db);
+    ObString tbl_name(static_cast<int32_t>(strlen(tbl)), tbl);
+    if (OB_SUCCESS == sc->get_table_schema(db_name, tbl_name, false, ts)
+        && NULL != ts) {
+      table_id = static_cast<int64_t>(ts->get_table_id());
+      const share::schema::ObColumnSchemaV2 *cs = NULL;
+      ObString col_name(static_cast<int32_t>(strlen(col)), col);
+      if (OB_SUCCESS == sc->get_column_schema(ts->get_table_id(), col_name, cs)
+          && NULL != cs) {
+        column_id = static_cast<int64_t>(cs->get_column_id());
+      }
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+static void ai_rowkey_value(const char *rowkey, char *out, int64_t cap)
+{
+  out[0] = '\0';
+  const char *p = NULL != rowkey ? strstr(rowkey, "` = ") : NULL;
+  const char *src = (NULL != p) ? (p + 4) : rowkey;
+  aim_copy(out, cap, src, static_cast<int32_t>(strlen(src)));
+}
+
+static const char *ai_row_val_get(const ObAiRowTask &r, const char *name)
+{
+  const char *v = NULL;
+  for (int64_t i = 0; NULL == v && i < r.col_cnt_; ++i) {
+    if (ai_eq(r.vals_[i].name_, name)) {
+      v = r.vals_[i].val_;
+    }
+  }
+  return v;
+}
+
+static void ai_row_val_put(ObAiRowTask &r, const char *name, const char *val)
+{
+  for (int64_t i = 0; i < r.col_cnt_; ++i) {
+    if (ai_eq(r.vals_[i].name_, name)) {
+      aim_copy(r.vals_[i].val_, sizeof(r.vals_[i].val_), val,
+               static_cast<int32_t>(strlen(val)));
+      return;
+    }
+  }
+  if (r.col_cnt_ < AI_ROW_MAX_COLS) {
+    aim_copy(r.vals_[r.col_cnt_].name_, sizeof(r.vals_[r.col_cnt_].name_), name,
+             static_cast<int32_t>(strlen(name)));
+    aim_copy(r.vals_[r.col_cnt_].val_, sizeof(r.vals_[r.col_cnt_].val_), val,
+             static_cast<int32_t>(strlen(val)));
+    ++r.col_cnt_;
+  }
+}
+
+static bool ai_parse_url(const char *url, char *host, int64_t host_cap, int32_t &port)
+{
+  bool ok = false;
+  port = 0;
+  const char *p = (NULL != url) ? strstr(url, "://") : NULL;
+  if (NULL != p) {
+    p += 3;
+    const char *end = strchr(p, '/');
+    const int64_t len = (NULL == end) ? static_cast<int64_t>(strlen(p)) : (end - p);
+    char hostport[192];
+    if (len > 0 && len < static_cast<int64_t>(sizeof(hostport))) {
+      MEMCPY(hostport, p, len);
+      hostport[len] = '\0';
+      char *colon = strrchr(hostport, ':');
+      if (NULL != colon) {
+        *colon = '\0';
+        port = static_cast<int32_t>(strtol(colon + 1, NULL, 10));
+      } else {
+        port = 80;
+      }
+      aim_copy(host, host_cap, hostport, static_cast<int32_t>(strlen(hostport)));
+      ok = ('\0' != host[0] && port > 0);
+    }
+  }
+  return ok;
+}
+
+// TCP 探测：连得上视为 worker 可送达（READY），连不上视为 FAILED
+static bool ai_tcp_probe(const char *host, int32_t port)
+{
+  bool reachable = false;
+  struct addrinfo hints;
+  struct addrinfo *res = NULL;
+  char port_buf[16];
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  snprintf(port_buf, sizeof(port_buf), "%d", port);
+  if (0 == getaddrinfo(host, port_buf, &hints, &res) && NULL != res) {
+    const int fd = socket(res->ai_family, res->ai_socktype, 0);
+    if (fd >= 0) {
+      const int flags = fcntl(fd, F_GETFL, 0);
+      (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      const int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+      if (0 == rc) {
+        reachable = true;
+      } else if (EINPROGRESS == errno) {
+        fd_set wfds;
+        struct timeval tv;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 300000;
+        if (select(fd + 1, NULL, &wfds, NULL, &tv) > 0) {
+          int err = 0;
+          socklen_t elen = sizeof(err);
+          if (0 == getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) && 0 == err) {
+            reachable = true;
+          }
+        }
+      }
+      (void)close(fd);
+    }
+    freeaddrinfo(res);
+  }
+  return reachable;
+}
+
+static const int64_t AI_MAX_URL_CACHE = 32;
+static char g_ai_url_model[AI_MAX_URL_CACHE][AI_NAME_CAP];
+static char g_ai_url_val[AI_MAX_URL_CACHE][512];
+static int64_t g_ai_url_cnt = 0;
+
+static bool ai_model_url(const char *model, char *url, int64_t cap)
+{
+  bool ok = false;
+  url[0] = '\0';
+  if (NULL != model && '\0' != model[0]) {
+    for (int64_t i = 0; i < g_ai_url_cnt; ++i) {
+      if (ai_eq(g_ai_url_model[i], model)) {
+        aim_copy(url, cap, g_ai_url_val[i],
+                 static_cast<int32_t>(strlen(g_ai_url_val[i])));
+        return ('\0' != url[0]);
+      }
+    }
+    omt::ObAiService *ai_service = ::oceanbase::share::server_service<omt::ObAiService>();
+    if (NULL != ai_service) {
+      omt::ObAiServiceGuard guard;
+      const share::ObAiModelEndpointInfo *endpoint = NULL;
+      if (OB_SUCCESS == ai_service->get_ai_service_guard(guard)
+          && OB_SUCCESS == guard.get_ai_endpoint_by_ai_model_name(
+                               ObString(static_cast<int32_t>(strlen(model)), model), endpoint)
+          && NULL != endpoint) {
+        const ObString &u = endpoint->get_url();
+        aim_copy(url, cap, u.ptr(), u.length());
+        ok = ('\0' != url[0]);
+        if (ok && g_ai_url_cnt < AI_MAX_URL_CACHE) {
+          aim_copy(g_ai_url_model[g_ai_url_cnt], AI_NAME_CAP, model,
+                   static_cast<int32_t>(strlen(model)));
+          aim_copy(g_ai_url_val[g_ai_url_cnt], 512, url,
+                   static_cast<int32_t>(strlen(url)));
+          ++g_ai_url_cnt;
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+// 异步 worker tick：PENDING 行探测 endpoint，结论落到 READY / FAILED
+static void ai_worker_tick()
+{
+  if (0 == g_ai_row_cnt) {
+    return;
+  }
+  for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
+    ObAiRowTask &r = g_ai_rows[i];
+    if (!r.used_ || AI_ST_PENDING != r.state_ || !r.committed_) {
+      continue;
+    }
+    char model[AI_NAME_CAP];
+    char url[512];
+    char host[192];
+    int32_t port = 0;
+    bool reachable = false;
+    if (ai_meta_model_at(r.col_, model, sizeof(model))
+        && ai_model_url(model, url, sizeof(url))
+        && ai_parse_url(url, host, sizeof(host), port)) {
+      reachable = ai_tcp_probe(host, port);
+    }
+    r.state_ = reachable ? AI_ST_READY : AI_ST_FAILED;
+    r.touch_us_ = ai_now_us();
+    ai_set_col_state(r.db_, r.tbl_, r.col_);
+  }
+}
+
+// ---- retry 谓词求值 ----
+static bool ai_val_is_pseudo_status(const ParseNode *lit)
+{
+  bool pseudo = false;
+  char v[AI_VAL_CAP];
+  if (ai_node_literal(lit, v, sizeof(v))) {
+    pseudo = (0 == strcasecmp(v, "READY") || 0 == strcasecmp(v, "FAILED")
+              || 0 == strcasecmp(v, "PENDING"));
+  }
+  return pseudo;
+}
+
+static int ai_cmp_values(const char *a, const char *b)
+{
+  int cmp = 0;
+  char *ea = NULL;
+  char *eb = NULL;
+  errno = 0;
+  const long long va = strtoll(a, &ea, 10);
+  const int ea_errno = errno;
+  errno = 0;
+  const long long vb = strtoll(b, &eb, 10);
+  const int eb_errno = errno;
+  if (NULL != ea && '\0' == *ea && NULL != eb && '\0' == *eb
+      && 0 == ea_errno && 0 == eb_errno) {
+    cmp = (va < vb) ? -1 : (va > vb ? 1 : 0);
+  } else {
+    const int r = strcasecmp(a, b);
+    cmp = (r < 0) ? -1 : (r > 0 ? 1 : 0);
+  }
+  return cmp;
+}
+
+// 取列文本：1 命中（buf 有值）0 列为 NULL -1 无法求值
+static int ai_pred_coltext(const ParseNode *colref, const ObAiRowTask &r,
+                           const char *retry_col, char *buf, int64_t cap)
+{
+  int res = -1;
+  buf[0] = '\0';
+  if (NULL != colref && NULL != colref->str_value_ && colref->str_len_ > 0) {
+    char name[AI_NAME_CAP];
+    ai_strip_quotes(colref->str_value_, static_cast<int32_t>(colref->str_len_),
+                    name, sizeof(name));
+    if (0 == strcasecmp(name, retry_col)) {
+      aim_copy(buf, cap, ai_state_name(r.state_),
+               static_cast<int32_t>(strlen(ai_state_name(r.state_))));
+      res = 1;
+    } else {
+      const char *v = ai_row_val_get(r, name);
+      if (NULL == v) {
+        res = 0;
+      } else {
+        aim_copy(buf, cap, v, static_cast<int32_t>(strlen(v)));
+        res = 1;
+      }
+    }
+  }
+  return res;
+}
+
+static int ai_pred_cmp(int node_type, const int cmp)
+{
+  int res = 0;
+  if (T_OP_EQ == node_type) { res = (0 == cmp) ? 1 : 0; }
+  else if (T_OP_NE == node_type) { res = (0 != cmp) ? 1 : 0; }
+  else if (T_OP_LT == node_type) { res = (cmp < 0) ? 1 : 0; }
+  else if (T_OP_LE == node_type) { res = (cmp <= 0) ? 1 : 0; }
+  else if (T_OP_GT == node_type) { res = (cmp > 0) ? 1 : 0; }
+  else { res = (cmp >= 0) ? 1 : 0; }
+  return res;
+}
+
+static int ai_pred_eval(const ParseNode *node, const ObAiRowTask &r,
+                        const char *retry_col, int depth)
+{
+  int res = -1;
+  if (NULL == node || depth > 16) {
+  } else if (T_OP_AND == node->type_ && node->num_child_ >= 2) {
+    const int l = ai_pred_eval(node->children_[0], r, retry_col, depth + 1);
+    const int m = ai_pred_eval(node->children_[1], r, retry_col, depth + 1);
+    if (1 == l && 1 == m) { res = 1; }
+    else if (0 == l || 0 == m) { res = 0; }
+  } else if (T_OP_OR == node->type_ && node->num_child_ >= 2) {
+    const int l = ai_pred_eval(node->children_[0], r, retry_col, depth + 1);
+    const int m = ai_pred_eval(node->children_[1], r, retry_col, depth + 1);
+    if (1 == l || 1 == m) { res = 1; }
+    else if (0 == l && 0 == m) { res = 0; }
+  } else if ((T_OP_EQ == node->type_ || T_OP_NE == node->type_
+              || T_OP_LT == node->type_ || T_OP_LE == node->type_
+              || T_OP_GT == node->type_ || T_OP_GE == node->type_)
+             && node->num_child_ >= 2) {
+    const ParseNode *left = node->children_[0];
+    const ParseNode *right = node->children_[1];
+    const bool left_is_col = (NULL != left && NULL != left->str_value_
+                              && left->str_len_ > 0);
+    const ParseNode *colref = left_is_col ? left : right;
+    const ParseNode *lit = left_is_col ? right : left;
+    char lv[AI_VAL_CAP];
+    char rv[AI_VAL_CAP];
+    int col_res = -1;
+    if (NULL != colref && NULL != colref->str_value_ && colref->str_len_ > 0) {
+      char name[AI_NAME_CAP];
+      ai_strip_quotes(colref->str_value_, static_cast<int32_t>(colref->str_len_),
+                      name, sizeof(name));
+      if (0 == strcasecmp(name, "status") && ai_val_is_pseudo_status(lit)) {
+        aim_copy(lv, sizeof(lv), ai_state_name(r.state_),
+                 static_cast<int32_t>(strlen(ai_state_name(r.state_))));
+        col_res = 1;
+      } else {
+        col_res = ai_pred_coltext(colref, r, retry_col, lv, sizeof(lv));
+      }
+    }
+    if (1 != col_res) {
+      res = (0 == col_res) ? 0 : -1;
+    } else if (!ai_node_literal(lit, rv, sizeof(rv))) {
+      res = -1;
+    } else {
+      res = ai_pred_cmp(node->type_, ai_cmp_values(lv, rv));
+    }
+  } else if (T_OP_IN == node->type_ && node->num_child_ >= 2) {
+    const ParseNode *colref = node->children_[0];
+    const ParseNode *list = node->children_[1];
+    char lv[AI_VAL_CAP];
+    int col_res = -1;
+    if (NULL != colref && NULL != colref->str_value_ && colref->str_len_ > 0) {
+      char name[AI_NAME_CAP];
+      ai_strip_quotes(colref->str_value_, static_cast<int32_t>(colref->str_len_),
+                      name, sizeof(name));
+      if (0 == strcasecmp(name, "status") && NULL != list
+          && ai_val_is_pseudo_status(ai_list_item(list, 0))) {
+        aim_copy(lv, sizeof(lv), ai_state_name(r.state_),
+                 static_cast<int32_t>(strlen(ai_state_name(r.state_))));
+        col_res = 1;
+      } else {
+        col_res = ai_pred_coltext(colref, r, retry_col, lv, sizeof(lv));
+      }
+    }
+    if (1 != col_res) {
+      res = (0 == col_res) ? 0 : -1;
+    } else {
+      res = 0;
+      const int64_t cnt = (NULL == list) ? 0 : ai_list_size(list);
+      for (int64_t i = 0; res != 1 && i < cnt; ++i) {
+        char rv[AI_VAL_CAP];
+        if (ai_node_literal(ai_list_item(list, i), rv, sizeof(rv))
+            && 0 == ai_cmp_values(lv, rv)) {
+          res = 1;
+        }
+      }
+    }
+  }
+  return res;
+}
+
+static bool ai_row_matches(const ObAiRowTask &r, const ParseNode *where,
+                           const char *retry_col)
+{
+  bool matched = false;
+  const ParseNode *cond = (NULL != where && where->num_child_ > 0)
+                            ? where->children_[0] : NULL;
+  if (NULL == cond) {
+    matched = true;
+  } else {
+    matched = (1 == ai_pred_eval(cond, r, retry_col, 0));
+  }
+  return matched;
+}
+
+int ob_ai_column_is_ai(const common::ObString &db, const common::ObString &tbl,
+                       const common::ObString &col, bool &is_ai)
+{
+  int ret = OB_SUCCESS;
+  is_ai = false;
+  char db_buf[AI_NAME_CAP];
+  char tbl_buf[AI_NAME_CAP];
+  char col_buf[AI_NAME_CAP];
+  aim_copy(db_buf, sizeof(db_buf), db.ptr(), db.length());
+  aim_copy(tbl_buf, sizeof(tbl_buf), tbl.ptr(), tbl.length());
+  aim_copy(col_buf, sizeof(col_buf), col.ptr(), col.length());
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; !is_ai && i < total; ++i) {
+    char mdb[AI_NAME_CAP];
+    char mtbl[AI_NAME_CAP];
+    char mcol[AI_NAME_CAP];
+    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mdb, db_buf)
+        && ai_eq(mtbl, tbl_buf) && ai_eq(mcol, col_buf)) {
+      is_ai = true;
+    }
+  }
+  return ret;
+}
+
+int ob_ai_column_retry(const common::ObString &db, const common::ObString &tbl,
+                       const common::ObString &col, const ParseNode *where,
+                       int64_t &matched_rows)
+{
+  int ret = OB_SUCCESS;
+  matched_rows = 0;
+  char db_buf[AI_NAME_CAP];
+  char tbl_buf[AI_NAME_CAP];
+  char col_buf[AI_NAME_CAP];
+  aim_copy(db_buf, sizeof(db_buf), db.ptr(), db.length());
+  aim_copy(tbl_buf, sizeof(tbl_buf), tbl.ptr(), tbl.length());
+  aim_copy(col_buf, sizeof(col_buf), col.ptr(), col.length());
+  for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
+    ObAiRowTask &r = g_ai_rows[i];
+    if (!r.used_ || !ai_eq(r.db_, db_buf) || !ai_eq(r.tbl_, tbl_buf)
+        || !ai_eq(r.col_, col_buf)) {
+      continue;
+    }
+    if (ai_row_matches(r, where, col_buf)) {
+      r.state_ = AI_ST_PENDING;
+      r.committed_ = !g_ai_write_uncommitted;
+      r.touch_us_ = ai_now_us();
+      ++matched_rows;
+    }
+  }
+  if (matched_rows > 0) {
+    ai_set_col_state(db_buf, tbl_buf, col_buf);
+  }
+  return ret;
+}
+
+void ob_ai_column_plan_reset(ObAiReadPlan &plan)
+{
+  plan.matched_ = false;
+  plan.strict_error_ = false;
+  plan.any_pending_ = false;
+  plan.any_ready_ = false;
+  plan.all_same_json_ = true;
+  plan.first_json_[0] = '\0';
+  plan.table_id_ = 0;
+  plan.column_id_ = 0;
+  plan.pk_col_[0] = '\0';
+  plan.tbl_[0] = '\0';
+  plan.row_cnt_ = 0;
+  plan.rows_[0].json_[0] = '\0';
+}
+
+int ob_ai_column_plan_read(const common::ObString &db_name,
+                           const common::ObString &tbl_name,
+                           const common::ObString &col_name,
+                           const common::ObString &cur_db,
+                           ObDMLStmt *stmt,
+                           ObSchemaChecker *schema_checker,
+                           bool strict_read,
+                           ObAiReadPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(cur_db);
+  ob_ai_column_plan_reset(plan);
+  if (col_name.empty()) {
+  } else {
+    const int64_t total = ob_ai_meta_count();
+    for (int64_t i = 0; OB_SUCC(ret) && !plan.matched_ && i < total; ++i) {
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      if (!ai_meta_at(i, mdb, mtbl, mcol)) {
+      } else if (0 != ObString::make_string(mcol).case_compare(col_name)) {
+      } else if (!tbl_name.empty()
+                 && 0 != ObString::make_string(mtbl).case_compare(tbl_name)) {
+      } else if (!db_name.empty()
+                 && 0 != ObString::make_string(mdb).case_compare(db_name)) {
+      } else if (!ai_stmt_has_table(stmt, mtbl)) {
+      } else {
+        plan.matched_ = true;
+        aim_copy(plan.tbl_, sizeof(plan.tbl_), mtbl, static_cast<int32_t>(strlen(mtbl)));
+        if (!ai_table_ids(schema_checker, mdb, mtbl, mcol, plan.pk_col_,
+                          sizeof(plan.pk_col_), plan.table_id_, plan.column_id_)) {
+          plan.pk_col_[0] = '\0';
+        }
+        for (int64_t k = 0; k < g_ai_row_cnt; ++k) {
+          const ObAiRowTask &r = g_ai_rows[k];
+          if (!r.used_ || !ai_eq(r.db_, mdb) || !ai_eq(r.tbl_, mtbl)
+              || !ai_eq(r.col_, mcol)) {
+            continue;
+          }
+          if (!ai_state_ready(r.state_)) {
+            plan.any_pending_ = true;
+          } else {
+            plan.any_ready_ = true;
+          }
+          if (plan.row_cnt_ < OBAI_PLAN_MAX_ROWS) {
+            ObAiReadRow &row = plan.rows_[plan.row_cnt_];
+            ai_rowkey_value(r.rowkey_, row.pk_, sizeof(row.pk_));
+            row.state_ = r.state_;
+            row.json_[0] = '\0';
+            if (ai_state_ready(r.state_)) {
+              ai_make_json(r.input_, row.json_, sizeof(row.json_));
+              if (0 == plan.row_cnt_) {
+                aim_copy(plan.first_json_, sizeof(plan.first_json_), row.json_,
+                         static_cast<int32_t>(strlen(row.json_)));
+              } else if (0 != strcmp(plan.first_json_, row.json_)) {
+                plan.all_same_json_ = false;
+              }
+            }
+            ++plan.row_cnt_;
+          }
+        }
+        if (strict_read && plan.any_pending_) {
+          plan.strict_error_ = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+
+// 语句级严格读检查：语句引用到的 AI 列只要整列存在未就绪行就报错。
+// （delete 的 WHERE 在内部子查询里解析，拿不到 resolver 的错误返回，故在入口统一拦）
+static int ai_strict_check_stmt(const ParseNode *node, ObSchemaChecker *sc,
+                                const ObString &cur_db)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *rel = ai_find_relation(node, 0);
+  char db[AI_NAME_CAP];
+  char tbl[AI_NAME_CAP];
+  if (NULL == rel
+      || !ai_relation_of(rel, db, sizeof(db), tbl, sizeof(tbl))) {
+  } else {
+    if ('\0' == db[0]) {
+      aim_copy(db, sizeof(db), cur_db.ptr(), cur_db.length());
+    }
+    char hit_col[AI_NAME_CAP];
+    hit_col[0] = '\0';
+    ObSEArray<const ParseNode *, 32> refs;
+    ai_collect_colrefs(node, refs, 0);
+    for (int64_t i = 0; OB_SUCC(ret) && '\0' == hit_col[0] && i < refs.count(); ++i) {
+      const ParseNode *ref = refs.at(i);
+      char name[AI_NAME_CAP];
+      ai_strip_quotes(ref->str_value_, static_cast<int32_t>(ref->str_len_),
+                      name, sizeof(name));
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      const int64_t total = ob_ai_meta_count();
+      for (int64_t k = 0; k < total; ++k) {
+        if (!ai_meta_at(k, mdb, mtbl, mcol)) {
+        } else if (!ai_eq(mdb, db) || !ai_eq(mtbl, tbl) || !ai_eq(mcol, name)) {
+        } else {
+          bool pending = false;
+          for (int64_t r = 0; !pending && r < g_ai_row_cnt; ++r) {
+            const ObAiRowTask &row = g_ai_rows[r];
+            if (row.used_ && ai_eq(row.db_, mdb) && ai_eq(row.tbl_, mtbl)
+                && ai_eq(row.col_, mcol) && !ai_state_ready(row.state_)) {
+              pending = true;
+            }
+          }
+          if (pending) {
+            aim_copy(hit_col, sizeof(hit_col), mcol, static_cast<int32_t>(strlen(mcol)));
+          }
+        }
+      }
+    }
+    if ('\0' != hit_col[0]) {
+      char pk[AI_NAME_CAP];
+      int64_t table_id = 0;
+      int64_t column_id = 0;
+      (void)ai_table_ids(sc, db, tbl, hit_col, pk, sizeof(pk), table_id, column_id);
+      LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASKS, table_id, column_id);
+      ret = OB_ERR_AI_COLUMN_UNFINISHED_TASKS;
+    }
+  }
+  return ret;
 }
 
 int ob_ai_column_note_dml(const ParseNode &stmt_node,
@@ -2339,7 +3028,9 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
                           const common::ObString &cur_db,
                           bool in_txn,
                           const void *sess_key,
-                          ObQueryCtx *query_ctx)
+                          ObQueryCtx *query_ctx,
+                          bool strict_read,
+                          bool is_in_txn)
 {
   int ret = OB_SUCCESS;
   const ParseNode *node = &stmt_node;
@@ -2347,6 +3038,16 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
                          || T_DELETE == node->type_);
   if (is_write && in_txn && NULL == ai_find_snap(sess_key)) {
     ai_take_snap(sess_key);
+  }
+  LOG_INFO("AI_TXN", "type", node->type_, "in_txn", in_txn, "is_in_txn", is_in_txn);
+  g_ai_write_uncommitted = (in_txn || is_in_txn);
+  if (!in_txn && !is_in_txn) {
+    ai_worker_tick();
+  }
+  if (strict_read && OB_SUCC(ret)
+      && (T_SELECT == node->type_ || T_UPDATE == node->type_ || T_DELETE == node->type_)) {
+    if (OB_FAIL(ai_strict_check_stmt(node, schema_checker, cur_db))) {
+    }
   }
   char db[AI_NAME_CAP];
   char tbl[AI_NAME_CAP];
@@ -2406,9 +3107,12 @@ int ob_ai_column_end_trans(const void *sess_key, bool is_rollback)
   } else {
     const int64_t now_us = ai_now_us();
     for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
-      if (g_ai_rows[i].used_ && AI_ST_PENDING == g_ai_rows[i].state_) {
-        g_ai_rows[i].state_ = AI_ST_READY;
-        g_ai_rows[i].touch_us_ = now_us;
+      if (g_ai_rows[i].used_) {
+        g_ai_rows[i].committed_ = true;
+        if (AI_ST_PENDING == g_ai_rows[i].state_) {
+          g_ai_rows[i].state_ = AI_ST_READY;
+          g_ai_rows[i].touch_us_ = now_us;
+        }
       }
     }
     for (int64_t i = 0; i < g_ai_col_state_cnt; ++i) {
@@ -2427,90 +3131,18 @@ int ob_ai_column_end_trans(const void *sess_key, bool is_rollback)
 
 static bool ai_stmt_has_table(ObDMLStmt *stmt, const char *tbl)
 {
-  bool hit = (NULL == stmt);
+  // delete 语句的表项挂在内部子查询上，外层 stmt 可能没有表项；
+  // 这种情况下无从判断，按"引用了该表"处理（列名来自真实 schema 解析，误判风险低）
+  bool hit = (NULL == stmt) || (stmt->get_table_size() <= 0);
   for (int64_t i = 0; !hit && i < stmt->get_table_size(); ++i) {
     const TableItem *ti = stmt->get_table_item(i);
-    if (NULL != ti && 0 == ti->table_name_.case_compare(ObString::make_string(tbl))) {
+    if (NULL != ti
+        && (0 == ti->table_name_.case_compare(ObString::make_string(tbl))
+            || 0 == ti->alias_name_.case_compare(ObString::make_string(tbl)))) {
       hit = true;
     }
   }
   return hit;
-}
-
-int ob_ai_column_read_replace(const common::ObString &db_name,
-                              const common::ObString &tbl_name,
-                              const common::ObString &col_name,
-                              const common::ObString &cur_db,
-                              ObDMLStmt *stmt,
-                              ObRawExprFactory *expr_factory,
-                              common::ObIAllocator *alloc,
-                              ObQueryCtx *query_ctx,
-                              ObRawExpr *&real_ref_expr,
-                              bool &handled)
-{
-  int ret = OB_SUCCESS;
-  handled = false;
-  UNUSED(cur_db);
-  if (NULL == expr_factory || NULL == alloc || col_name.empty()) {
-  } else {
-    const int64_t total = ob_ai_meta_count();
-    for (int64_t i = 0; OB_SUCC(ret) && !handled && i < total; ++i) {
-      char mdb[AI_NAME_CAP];
-      char mtbl[AI_NAME_CAP];
-      char mcol[AI_NAME_CAP];
-      if (!ai_meta_at(i, mdb, mtbl, mcol)) {
-      } else if (0 != ObString::make_string(mcol).case_compare(col_name)) {
-      } else if (!tbl_name.empty()
-                 && 0 != ObString::make_string(mtbl).case_compare(tbl_name)) {
-      } else if (!db_name.empty()
-                 && 0 != ObString::make_string(mdb).case_compare(db_name)) {
-      } else if (!ai_stmt_has_table(stmt, mtbl)) {
-      } else {
-        ai_set_no_plan_cache(query_ctx);
-        const ObAiColTask *cs = ai_find_col(mdb, mtbl, mcol);
-        if (NULL == cs) {
-        } else if (AI_ST_READY == cs->state_) {
-          char input[AI_VAL_CAP];
-          input[0] = '\0';
-          bool found = false;
-          for (int64_t k = 0; !found && k < g_ai_row_cnt; ++k) {
-            const ObAiRowTask &r = g_ai_rows[k];
-            if (r.used_ && ai_eq(r.db_, mdb) && ai_eq(r.tbl_, mtbl)
-                && ai_eq(r.col_, mcol) && AI_ST_READY == r.state_) {
-              aim_copy(input, sizeof(input), r.input_,
-                       static_cast<int32_t>(strlen(r.input_)));
-              found = true;
-            }
-          }
-          char json[AI_VAL_CAP + 64];
-          ai_make_json(input, json, sizeof(json));
-          const int64_t len = static_cast<int64_t>(strlen(json));
-          char *dup = static_cast<char *>(alloc->alloc(len + 1));
-          ObConstRawExpr *const_expr = NULL;
-          if (OB_ISNULL(dup)) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-          } else {
-            MEMCPY(dup, json, len);
-            dup[len] = '\0';
-            if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
-                          *expr_factory, ObVarcharType,
-                          ObString(static_cast<int32_t>(len), dup),
-                          CS_TYPE_UTF8MB4_GENERAL_CI, const_expr))) {
-            } else {
-              real_ref_expr = const_expr;
-              handled = true;
-            }
-          }
-        } else if (AI_ST_PENDING == cs->state_) {
-          if (OB_FAIL(ObRawExprUtils::build_null_expr(*expr_factory, real_ref_expr))) {
-          } else {
-            handled = true;
-          }
-        }
-      }
-    }
-  }
-  return ret;
 }
 
 int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
@@ -2609,8 +3241,8 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
           ++emitted;
         }
       }
-      // read_csv 生成的值表在 0 行时会走引擎异常路径(4016)，因此无任务时补一条
-      // 全 NULL 哨兵行：它不参与任何 __all_table 连接，对 count(*) 结果无影响
+      // read_csv 生成的值表在 0 数据行时会走引擎异常路径(4016)，
+      // 因此无任务时补一条全 NULL 行占位（技术债，见交付说明）
       if (OB_SUCC(ret) && 0 == emitted) {
         if (OB_FAIL(csv.append(",,,,,-1\n"))) {
         }

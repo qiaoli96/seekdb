@@ -1803,6 +1803,7 @@ struct ObAiColumnMeta {
   int64_t column_id_;
   int64_t hidden_ids_[3];
   char tmpl_[512];
+  char model_[130];
 };
 static ObAiColumnMeta g_ai_cols[64];
 static int64_t g_ai_col_cnt = 0;
@@ -1996,6 +1997,19 @@ static void ai_ser_tmpl(const ParseNode *node, char *buf, int64_t cap,
   }
 }
 
+static void ai_build_model(const ParseNode *call, char *buf, int64_t cap)
+{
+  buf[0] = '\0';
+  if (NULL != call && call->num_child_ >= 2) {
+    const ParseNode *arg0 = ai_ser_list_item(call->children_[1], 0);
+    if (NULL != arg0 && NULL != arg0->str_value_ && arg0->str_len_ > 0) {
+      int64_t n = arg0->str_len_ < cap - 1 ? arg0->str_len_ : cap - 1;
+      MEMCPY(buf, arg0->str_value_, n);
+      buf[n] = '\0';
+    }
+  }
+}
+
 static void ai_build_template(const ParseNode *call, char *buf, int64_t cap)
 {
   int64_t pos = 0;
@@ -2098,6 +2112,8 @@ static int ai_register(const char *db, int32_t db_len,
         }
         m.tmpl_[0] = '\0';
         ai_build_template(call, m.tmpl_, sizeof(m.tmpl_));
+        m.model_[0] = '\0';
+        ai_build_model(call, m.model_, sizeof(m.model_));
         SQL_RESV_LOG(INFO, "ai column registered", K(db_buf), K(tbl_buf), K(col_buf),
                      K(max_retries), K(is_json), K(vector_dim));
       }
@@ -8526,6 +8542,18 @@ int ob_ai_meta_get(int64_t idx,
     expr_len = static_cast<int32_t>(strlen(m.normalized_expr_));
     max_retries = m.max_retries_;
     is_json = m.is_json_;
+  }
+  return ret;
+}
+
+int ob_ai_meta_get_model(int64_t idx, const char *&model, int32_t &len)
+{
+  int ret = OB_SUCCESS;
+  if (idx < 0 || idx >= g_ai_col_cnt) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    model = g_ai_cols[idx].model_;
+    len = static_cast<int32_t>(strlen(g_ai_cols[idx].model_));
   }
   return ret;
 }

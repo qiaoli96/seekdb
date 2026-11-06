@@ -3214,17 +3214,6 @@ int ObSelectResolver::resolve_column_ref_in_all_namespace(
   return ret;
 }
 
-int ob_ai_column_read_replace(const common::ObString &db_name,
-                              const common::ObString &tbl_name,
-                              const common::ObString &col_name,
-                              const common::ObString &cur_db,
-                              ObDMLStmt *stmt,
-                              ObRawExprFactory *expr_factory,
-                              common::ObIAllocator *alloc,
-                              ObQueryCtx *query_ctx,
-                              ObRawExpr *&real_ref_expr,
-                              bool &handled);
-
 int ObSelectResolver::resolve_column_ref_expr(
   const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr)
 {
@@ -3241,16 +3230,8 @@ int ObSelectResolver::resolve_column_ref_expr(
     const_cast<ObQualifiedName&>(q_name).parent_aggr_level_ = parent_aggr_level_;
   }
   bool ai_handled = false;
-  if (OB_SUCC(ret) && OB_FAIL(ob_ai_column_read_replace(q_name.database_name_,
-                                                        q_name.tbl_name_,
-                                                        q_name.col_name_,
-                                                        common::ObString(),
-                                                        get_stmt(),
-                                                        params_.expr_factory_,
-                                                        allocator_,
-                                                        params_.query_ctx_,
-                                                        real_ref_expr,
-                                                        ai_handled))) {
+  if (OB_SUCC(ret) && OB_FAIL(resolve_ai_column_expr(q_name, real_ref_expr,
+                                                     ai_handled))) {
   }
   if (OB_SUCC(ret) && !ai_handled
       && OB_FAIL(resolve_column_ref_in_all_namespace(q_name, real_ref_expr))) {

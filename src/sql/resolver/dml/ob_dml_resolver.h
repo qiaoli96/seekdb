@@ -82,6 +82,44 @@ struct ObDmlJtColDef
   TO_STRING_KV(K_(col_base_info));
 };
 
+
+static const int64_t OBAI_ROW_PENDING = 1;
+static const int64_t OBAI_ROW_READY = 2;
+static const int64_t OBAI_ROW_FAILED = 3;
+static const int64_t OBAI_PLAN_MAX_ROWS = 16;
+
+struct ObAiReadRow {
+  char pk_[64];
+  int64_t state_;
+  char json_[576];
+};
+
+struct ObAiReadPlan {
+  bool matched_;
+  bool strict_error_;
+  bool any_pending_;
+  bool any_ready_;
+  bool all_same_json_;
+  int64_t table_id_;
+  int64_t column_id_;
+  char pk_col_[130];
+  char tbl_[130];
+  char first_json_[576];
+  int64_t row_cnt_;
+  ObAiReadRow rows_[OBAI_PLAN_MAX_ROWS];
+};
+
+void ob_ai_column_plan_reset(ObAiReadPlan &plan);
+
+int ob_ai_column_plan_read(const common::ObString &db_name,
+                           const common::ObString &tbl_name,
+                           const common::ObString &col_name,
+                           const common::ObString &cur_db,
+                           ObDMLStmt *stmt,
+                           ObSchemaChecker *schema_checker,
+                           bool strict_read,
+                           ObAiReadPlan &plan);
+
 class ObDMLResolver : public ObStmtResolver
 {
   class ObCteResolverCtx
@@ -294,6 +332,8 @@ public:
                                             const ObTableSchema &parent_table_schema,
                                             const ObForeignKeyInfo *fk_info);
   virtual int resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr);
+  int resolve_ai_column_expr(const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr,
+                             bool &handled);
   int resolve_sql_expr(const ParseNode &node, ObRawExpr *&expr,
                        ObArray<ObQualifiedName> *input_columns = NULL);
   int resolve_partition_expr(const TableItem &table_item,

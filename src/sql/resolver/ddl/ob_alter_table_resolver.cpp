@@ -344,9 +344,67 @@ int ObAlterTableResolver::check_alter_column_schemas_valid(ObAlterTableStmt &stm
   return ret;
 }
 
+int ob_ai_column_is_ai(const common::ObString &db, const common::ObString &tbl,
+                       const common::ObString &col, bool &is_ai);
+int ob_ai_column_retry(const common::ObString &db, const common::ObString &tbl,
+                       const common::ObString &col, const ParseNode *where,
+                       int64_t &matched_rows);
+
+int ObAlterTableResolver::resolve_ai_column_retry_action(const ParseNode &action_list,
+                                                         const ParseNode &retry_node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (action_list.num_child_ != 1) {
+    /* RETRY 只能单独出现，不能与其它 ALTER 动作混用 */
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_ISNULL(alter_table_stmt) || retry_node.num_child_ < 1
+             || OB_ISNULL(retry_node.children_[0])
+             || OB_ISNULL(retry_node.children_[0]->str_value_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid ai column retry node", K(ret), K(retry_node.num_child_));
+  } else {
+    const ParseNode *col_node = retry_node.children_[0];
+    const ParseNode *where_node = (retry_node.num_child_ > 1) ? retry_node.children_[1] : NULL;
+    ObString col_name(static_cast<int32_t>(col_node->str_len_), col_node->str_value_);
+    ObString table_name = alter_table_stmt->get_org_table_name();
+    ObString db_name = alter_table_stmt->get_database_name();
+    if (db_name.empty() && NULL != table_schema_ && NULL != schema_checker_) {
+      const share::schema::ObDatabaseSchema *db_schema = NULL;
+      if (OB_SUCCESS == schema_checker_->get_database_schema(
+                           table_schema_->get_database_id(), db_schema)
+          && NULL != db_schema) {
+        db_name = db_schema->get_database_name_str();
+      }
+    }
+    bool is_ai = false;
+    int64_t matched_rows = 0;
+    if (OB_FAIL(ob_ai_column_is_ai(db_name, table_name, col_name, is_ai))) {
+    } else if (!is_ai) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+      ret = OB_NOT_SUPPORTED;
+    } else if (OB_FAIL(ob_ai_column_retry(db_name, table_name, col_name,
+                                          where_node, matched_rows))) {
+    }
+    SQL_RESV_LOG(INFO, "ai column retry", K(ret), K(db_name), K(table_name),
+                 K(col_name), K(matched_rows));
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
+  const ParseNode *retry_node = NULL;
+  for (int64_t i = 0; NULL == retry_node && i < node.num_child_; ++i) {
+    if (NULL != node.children_[i] && T_AI_COLUMN_RETRY == node.children_[i]->type_) {
+      retry_node = node.children_[i];
+    }
+  }
+  if (NULL != retry_node) {
+    return resolve_ai_column_retry_action(node, *retry_node);
+  }
   ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
   if (OB_UNLIKELY(node.num_child_ <= 0) || OB_ISNULL(node.children_)) {
     ret = OB_ERR_UNEXPECTED;

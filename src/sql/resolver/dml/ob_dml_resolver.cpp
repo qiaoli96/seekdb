@@ -2257,14 +2257,156 @@ int ObDMLResolver::resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawE
 {
   int ret = OB_SUCCESS;
   bool ai_handled = false;
-  if (OB_FAIL(ob_ai_column_read_replace(q_name.database_name_, q_name.tbl_name_,
-                                        q_name.col_name_, common::ObString(),
-                                        get_stmt(), params_.expr_factory_, allocator_,
-                                        params_.query_ctx_, real_ref_expr, ai_handled))) {
+  if (OB_FAIL(resolve_ai_column_expr(q_name, real_ref_expr, ai_handled))) {
   } else if (ai_handled) {
-    /* AI 列读侧替换为常量，不再解析真实列 */
+    /* AI 列读侧按行替换为常量，不再解析真实列 */
   } else if (OB_FAIL(resolve_table_column_expr(q_name, real_ref_expr))) {
     LOG_WARN_IGNORE_COL_NOTFOUND(ret, "resolve table column failed", K(q_name), K(ret));
+  }
+  return ret;
+}
+
+static int build_ai_pk_const(ObRawExprFactory &factory, const char *text,
+                             ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  char *end = NULL;
+  errno = 0;
+  const long long v = strtoll(text, &end, 10);
+  const int err = errno;
+  ObConstRawExpr *c_expr = NULL;
+  if (NULL != end && '\0' == *end && 0 == err && '\0' != text[0]) {
+    if (OB_FAIL(ObRawExprUtils::build_const_int_expr(factory, ObIntType,
+                                                     static_cast<int64_t>(v), c_expr))) {
+    } else {
+      expr = c_expr;
+    }
+  } else {
+    const int64_t len = static_cast<int64_t>(strlen(text));
+    char *buf = static_cast<char *>(factory.get_allocator().alloc(len + 1));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, text, len);
+      buf[len] = '\0';
+      if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+                    factory, ObVarcharType, ObString(static_cast<int32_t>(len), buf),
+                    CS_TYPE_UTF8MB4_GENERAL_CI, c_expr))) {
+      } else {
+        expr = c_expr;
+      }
+    }
+  }
+  return ret;
+}
+
+static int build_ai_json_const(ObRawExprFactory &factory, common::ObIAllocator *alloc,
+                               const char *json, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  const int64_t len = static_cast<int64_t>(strlen(json));
+  char *buf = static_cast<char *>(alloc->alloc(len + 1));
+  ObConstRawExpr *c_expr = NULL;
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    MEMCPY(buf, json, len);
+    buf[len] = '\0';
+    if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+                  factory, ObVarcharType, ObString(static_cast<int32_t>(len), buf),
+                  CS_TYPE_UTF8MB4_GENERAL_CI, c_expr))) {
+    } else {
+      expr = c_expr;
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_ai_column_expr(const ObQualifiedName &q_name,
+                                          ObRawExpr *&real_ref_expr,
+                                          bool &handled)
+{
+  int ret = OB_SUCCESS;
+  handled = false;
+  bool strict_read = false;
+  ObObj var_obj;
+  ObString var_name("ai_column_strict_read");
+  ObAiReadPlan plan;
+  if (OB_ISNULL(session_info_) || OB_ISNULL(params_.expr_factory_)
+      || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(session_info_->get_sys_variable_by_name(var_name, var_obj))) {
+  } else if (FALSE_IT(strict_read = var_obj.get_bool())) {
+  } else if (OB_FAIL(ob_ai_column_plan_read(q_name.database_name_, q_name.tbl_name_,
+                                            q_name.col_name_, common::ObString(),
+                                            get_stmt(), schema_checker_,
+                                            strict_read, plan))) {
+  }
+  if (OB_FAIL(ret)) {
+  } else if (plan.strict_error_) {
+    LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASKS, plan.table_id_, plan.column_id_);
+    ret = OB_ERR_AI_COLUMN_UNFINISHED_TASKS;
+  } else if (!plan.matched_ || 0 == plan.row_cnt_) {
+  } else if (!plan.any_ready_) {
+    if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, real_ref_expr))) {
+    } else {
+      handled = true;
+    }
+  } else if (!plan.any_pending_ && plan.all_same_json_) {
+    if (OB_FAIL(build_ai_json_const(*params_.expr_factory_, allocator_,
+                                    plan.first_json_, real_ref_expr))) {
+    } else {
+      handled = true;
+    }
+  } else if ('\0' == plan.pk_col_[0]) {
+    if (OB_FAIL(build_ai_json_const(*params_.expr_factory_, allocator_,
+                                    plan.first_json_, real_ref_expr))) {
+    } else {
+      handled = true;
+    }
+  } else {
+    ObQualifiedName pk_q;
+    if (OB_FAIL(pk_q.assign(q_name))) {
+    } else {
+      pk_q.col_name_ = ObString::make_string(plan.pk_col_);
+      if (pk_q.tbl_name_.empty()) {
+        pk_q.tbl_name_ = ObString::make_string(plan.tbl_);
+      }
+    }
+    ObRawExpr *pk_ref = NULL;
+    ObCaseOpRawExpr *case_expr = NULL;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(resolve_table_column_expr(pk_q, pk_ref))) {
+    } else if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_OP_CASE, case_expr))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < plan.row_cnt_; ++i) {
+        ObRawExpr *pk_const = NULL;
+        ObRawExpr *when_expr = NULL;
+        ObRawExpr *then_expr = NULL;
+        if (OB_FAIL(build_ai_pk_const(*params_.expr_factory_, plan.rows_[i].pk_, pk_const))) {
+        } else if (OB_FAIL(ObRawExprUtils::create_double_op_expr(
+                     *params_.expr_factory_, session_info_, T_OP_EQ, when_expr,
+                     pk_ref, pk_const))) {
+        } else if (OBAI_ROW_READY == plan.rows_[i].state_) {
+          if (OB_FAIL(build_ai_json_const(*params_.expr_factory_, allocator_,
+                                          plan.rows_[i].json_, then_expr))) {
+          }
+        } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, then_expr))) {
+        }
+        if (OB_SUCC(ret) && OB_FAIL(case_expr->add_when_param_expr(when_expr))) {
+        } else if (OB_SUCC(ret) && OB_FAIL(case_expr->add_then_param_expr(then_expr))) {
+        }
+      }
+      ObRawExpr *def_expr = NULL;
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, def_expr))) {
+      } else if (FALSE_IT(case_expr->set_default_param_expr(def_expr))) {
+      } else if (OB_FAIL(case_expr->formalize(session_info_))) {
+      } else {
+        real_ref_expr = case_expr;
+        handled = true;
+      }
+    }
   }
   return ret;
 }
