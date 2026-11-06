@@ -1573,6 +1573,7 @@ static void aim_copy(char *dst, int64_t cap, const char *src, int32_t len)
 // ---------- 赛题三 P2：AI 列逐行状态机（内存，模拟异步 worker） ----------
 int ob_ai_meta_get_tmpl(int64_t idx, const char *&tmpl, int32_t &len);
 int ob_ai_meta_get_model(int64_t idx, const char *&model, int32_t &len);
+int ob_ai_meta_get_vector(int64_t idx, int64_t &vector_dim);
 
 static const int32_t AI_NAME_CAP = 130;
 static const int32_t AI_VAL_CAP = 512;
@@ -3151,6 +3152,7 @@ void ob_ai_column_plan_reset(ObAiReadPlan &plan)
   plan.any_pending_ = false;
   plan.any_ready_ = false;
   plan.all_same_json_ = true;
+  plan.vector_ = false;
   plan.first_json_[0] = '\0';
   plan.table_id_ = 0;
   plan.column_id_ = 0;
@@ -3188,6 +3190,10 @@ int ob_ai_column_plan_read(const common::ObString &db_name,
       } else if (!ai_stmt_table_db_matches(stmt, mtbl, cur_db, mdb)) {
       } else {
         plan.matched_ = true;
+        int64_t vector_dim = 0;
+        if (OB_SUCCESS == ob_ai_meta_get_vector(i, vector_dim) && vector_dim > 0) {
+          plan.vector_ = true;
+        }
         aim_copy(plan.tbl_, sizeof(plan.tbl_), mtbl, static_cast<int32_t>(strlen(mtbl)));
         if (!ai_table_ids(schema_checker, mdb, mtbl, mcol, plan.pk_col_,
                           sizeof(plan.pk_col_), plan.table_id_, plan.column_id_)) {
@@ -3234,6 +3240,152 @@ int ob_ai_column_plan_read(const common::ObString &db_name,
 
 // 语句级严格读检查：语句引用到的 AI 列只要整列存在未就绪行就报错。
 // （delete 的 WHERE 在内部子查询里解析，拿不到 resolver 的错误返回，故在入口统一拦）
+// ---- vector AI 列：UPDATE 置 NULL 改写（走语句改写以拿到 stock 的 rollback/索引语义） ----
+static ParseNode *ai_new_bare_node(ObIAllocator *alloc)
+{
+  ParseNode *n = static_cast<ParseNode *>(alloc->alloc(sizeof(ParseNode)));
+  if (NULL != n) {
+    memset(n, 0, sizeof(ParseNode));
+  }
+  return n;
+}
+
+static ParseNode *ai_new_ident_node(ObIAllocator *alloc, const char *name)
+{
+  ParseNode *n = NULL;
+  const int64_t len = static_cast<int64_t>(strlen(name));
+  char *buf = static_cast<char *>(alloc->alloc(len + 1));
+  if (NULL != buf) {
+    MEMCPY(buf, name, len);
+    buf[len] = '\0';
+    n = ai_new_bare_node(alloc);
+    if (NULL != n) {
+      n->type_ = T_IDENT;
+      n->str_value_ = buf;
+      n->str_len_ = static_cast<int32_t>(len);
+    }
+  }
+  return n;
+}
+
+static ParseNode *ai_new_null_assign(ObIAllocator *alloc, const char *col)
+{
+  ParseNode *item = NULL;
+  ParseNode **kids = static_cast<ParseNode **>(alloc->alloc(2 * sizeof(ParseNode *)));
+  ParseNode **col_kids = static_cast<ParseNode **>(alloc->alloc(3 * sizeof(ParseNode *)));
+  ParseNode *colref = ai_new_bare_node(alloc);
+  ParseNode *name = ai_new_ident_node(alloc, col);
+  ParseNode *null_node = ai_new_bare_node(alloc);
+  if (NULL != kids && NULL != col_kids && NULL != colref && NULL != name
+      && NULL != null_node) {
+    col_kids[0] = NULL;
+    col_kids[1] = NULL;
+    col_kids[2] = name;
+    colref->type_ = T_COLUMN_REF;
+    colref->num_child_ = 3;
+    colref->children_ = col_kids;
+    colref->str_value_ = name->str_value_;
+    colref->str_len_ = name->str_len_;
+    null_node->type_ = T_NULL;
+    kids[0] = colref;
+    kids[1] = null_node;
+    item = ai_new_bare_node(alloc);
+    if (NULL != item) {
+      item->type_ = T_ASSIGN_ITEM;
+      item->num_child_ = 2;
+      item->children_ = kids;
+    }
+  }
+  return item;
+}
+
+// SET 命中某向量 AI 列模板引用的源列时，追加 "<ai_col> = NULL"
+static void ai_update_null_rewrite(ParseNode *update_node, ObIAllocator *alloc,
+                                   const common::ObString &cur_db)
+{
+  if (NULL == update_node || NULL == alloc || T_UPDATE != update_node->type_
+      || update_node->num_child_ < 3) {
+    return;
+  }
+  ParseNode *assign = update_node->children_[2];
+  if (NULL == assign) {
+    return;
+  }
+  char db[AI_NAME_CAP];
+  char tbl[AI_NAME_CAP];
+  if (!ai_relation_of(ai_find_relation(update_node->children_[1], 0),
+                      db, sizeof(db), tbl, sizeof(tbl))) {
+    return;
+  }
+  if ('\0' == db[0]) {
+    aim_copy(db, sizeof(db), cur_db.ptr(), cur_db.length());
+  }
+  ObAiNameValSet setv;
+  ai_vs_reset(setv);
+  const int64_t old_cnt = ai_list_size(assign);
+  for (int64_t i = 0; i < old_cnt; ++i) {
+    const ParseNode *item = ai_list_item(assign, i);
+    if (NULL != item && item->num_child_ >= 2 && NULL != item->children_[0]
+        && NULL != item->children_[0]->str_value_) {
+      char nm[AI_NAME_CAP];
+      ai_strip_quotes(item->children_[0]->str_value_,
+                      static_cast<int32_t>(item->children_[0]->str_len_),
+                      nm, sizeof(nm));
+      ai_vs_put(setv, nm, "1");
+    }
+  }
+  char null_cols[8][AI_NAME_CAP];
+  int64_t null_cnt = 0;
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; i < total && null_cnt < 8; ++i) {
+    char mdb[AI_NAME_CAP];
+    char mtbl[AI_NAME_CAP];
+    char mcol[AI_NAME_CAP];
+    char tmpl[AI_VAL_CAP];
+    int64_t vector_dim = 0;
+    if (!ai_meta_at(i, mdb, mtbl, mcol) || !ai_eq(mdb, db) || !ai_eq(mtbl, tbl)) {
+      continue;
+    }
+    if (OB_SUCCESS != ob_ai_meta_get_vector(i, vector_dim) || vector_dim <= 0) {
+      continue;
+    }
+    if (!ai_tmpl_at(i, tmpl, sizeof(tmpl))) {
+      continue;
+    }
+    if (ai_tmpl_uses(tmpl, setv)) {
+      aim_copy(null_cols[null_cnt], AI_NAME_CAP, mcol,
+               static_cast<int32_t>(strlen(mcol)));
+      ++null_cnt;
+    }
+  }
+  if (0 == null_cnt) {
+    return;
+  }
+  ParseNode **kids = static_cast<ParseNode **>(
+      alloc->alloc((old_cnt + null_cnt) * sizeof(ParseNode *)));
+  if (NULL == kids) {
+    return;
+  }
+  int64_t cnt = 0;
+  for (int64_t i = 0; i < old_cnt; ++i) {
+    kids[cnt++] = const_cast<ParseNode *>(ai_list_item(assign, i));
+  }
+  for (int64_t i = 0; i < null_cnt; ++i) {
+    ParseNode *item = ai_new_null_assign(alloc, null_cols[i]);
+    if (NULL != item) {
+      kids[cnt++] = item;
+    }
+  }
+  ParseNode *new_list = ai_new_bare_node(alloc);
+  if (NULL == new_list) {
+    return;
+  }
+  new_list->type_ = T_ASSIGN_LIST;
+  new_list->num_child_ = static_cast<int32_t>(cnt);
+  new_list->children_ = kids;
+  update_node->children_[2] = new_list;
+}
+
 static int ai_strict_check_stmt(const ParseNode *node, ObSchemaChecker *sc,
                                 const ObString &cur_db)
 {
@@ -3297,7 +3449,8 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
                           const void *sess_key,
                           ObQueryCtx *query_ctx,
                           bool strict_read,
-                          bool is_in_txn)
+                          bool is_in_txn,
+                          common::ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
   const ParseNode *node = &stmt_node;
@@ -3335,6 +3488,7 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
       ai_apply_insert(db, tbl, into, values, schema_checker);
     }
   } else if (T_UPDATE == node->type_ && node->num_child_ > 3) {
+    ai_update_null_rewrite(const_cast<ParseNode *>(node), alloc, cur_db);
     if (ai_relation_of(ai_find_relation(node->children_[1], 0),
                        db, sizeof(db), tbl, sizeof(tbl))) {
       if ('\0' == db[0]) {

@@ -1804,6 +1804,7 @@ struct ObAiColumnMeta {
   int64_t hidden_ids_[3];
   char tmpl_[512];
   char model_[130];
+  int64_t vector_dim_;
 };
 static ObAiColumnMeta g_ai_cols[64];
 static int64_t g_ai_col_cnt = 0;
@@ -2118,6 +2119,7 @@ static int ai_register(const char *db, int32_t db_len,
         ai_build_template(call, m.tmpl_, sizeof(m.tmpl_));
         m.model_[0] = '\0';
         ai_build_model(call, m.model_, sizeof(m.model_));
+        m.vector_dim_ = (vector_dim > 0) ? vector_dim : 0;
         SQL_RESV_LOG(INFO, "ai column registered", K(db_buf), K(tbl_buf), K(col_buf),
                      K(max_retries), K(is_json), K(vector_dim));
       }
@@ -8547,6 +8549,17 @@ int ob_ai_meta_get(int64_t idx,
     expr_len = static_cast<int32_t>(strlen(m.normalized_expr_));
     max_retries = m.max_retries_;
     is_json = m.is_json_;
+  }
+  return ret;
+}
+
+int ob_ai_meta_get_vector(int64_t idx, int64_t &vector_dim)
+{
+  int ret = OB_SUCCESS;
+  if (idx < 0 || idx >= g_ai_col_cnt) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    vector_dim = g_ai_cols[idx].vector_dim_;
   }
   return ret;
 }

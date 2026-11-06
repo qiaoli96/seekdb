@@ -2348,6 +2348,9 @@ int ObDMLResolver::resolve_ai_column_expr(const ObQualifiedName &q_name,
     LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASKS, plan.table_id_, plan.column_id_);
     ret = OB_ERR_AI_COLUMN_UNFINISHED_TASKS;
   } else if (!plan.matched_ || 0 == plan.row_cnt_) {
+  } else if (plan.vector_) {
+    /* 向量列必须返回真实列引用，否则 l2_distance() 拿不到 vector 排序表达式，
+       也走不到 VECTOR INDEX SCAN；可见性由列本身（NULL/真值）承担 */
   } else if (!plan.any_ready_) {
     if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, real_ref_expr))) {
     } else {

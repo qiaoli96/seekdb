@@ -144,7 +144,8 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
                           const void *sess_key,
                           ObQueryCtx *query_ctx,
                           bool strict_read,
-                          bool is_in_txn);
+                          bool is_in_txn,
+                          common::ObIAllocator *alloc);
 
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
@@ -190,7 +191,8 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
     if (OB_FAIL(ob_ai_column_note_dml(*real_parse_tree, params_.schema_checker_, ai_cur_db,
                                       ai_in_txn,
                                       static_cast<const void *>(params_.session_info_),
-                                      params_.query_ctx_, ai_strict, ai_is_in_txn))) {
+                                      params_.query_ctx_, ai_strict, ai_is_in_txn,
+                                      params_.allocator_))) {
     }
   }
 

@@ -100,6 +100,7 @@ struct ObAiReadPlan {
   bool any_pending_;
   bool any_ready_;
   bool all_same_json_;
+  bool vector_;
   int64_t table_id_;
   int64_t column_id_;
   char pk_col_[130];
