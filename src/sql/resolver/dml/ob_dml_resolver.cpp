@@ -2328,6 +2328,10 @@ int ObDMLResolver::resolve_ai_column_expr(const ObQualifiedName &q_name,
 {
   int ret = OB_SUCCESS;
   handled = false;
+  // 内部 session（后台线程写回）绕开 AI 列读侧替换
+  if (NULL != session_info_ && session_info_->is_inner()) {
+    return OB_SUCCESS;
+  }
   bool strict_read = false;
   ObObj var_obj;
   ObString var_name("ai_column_strict_read");

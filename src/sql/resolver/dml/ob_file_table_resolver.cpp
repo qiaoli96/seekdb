@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include "observer/omt/ob_ai_service.h"
+#include "observer/ob_inner_sql_connection.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func.h"
 #include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
@@ -1601,6 +1602,7 @@ struct ObAiRowTask {
   char value_[AI_VAL_CAP];
   int state_;
   bool committed_;
+  bool dispatched_;
   int64_t retry_count_;
   int64_t request_id_;
   int64_t touch_us_;
@@ -2882,9 +2884,287 @@ static bool ai_send_completion(const ObAiEndpointCache &ep, const char *system_p
   return ok;
 }
 
+
+// ---------- 向量 AI 列：embedding 真请求 + 后台线程内部 SQL 写回 ----------
+// 设计要点：
+//  * resolver 线程只做「派发」（入环形队列）与「应用结果」，绝不跑内部 SQL（重入会破坏解析态）；
+//  * 后台 pthread 负责 HTTP embedding + update 内部 SQL（update db.tbl set col = '[..]' where rowkey），
+//    后者走内建 owned-session 连接（is_inner），因此 DAS 会照常维护 HNSW 索引；
+//  * 后台线程永不抛异常，失败只写回结果槽（ok_=false），由状态机决定重试/终态。
+struct AiVecJob {
+  bool used_;
+  char db_[AI_NAME_CAP];
+  char tbl_[AI_NAME_CAP];
+  char col_[AI_NAME_CAP];
+  char rowkey_[256];
+  char input_[AI_VAL_CAP];
+  char model_[AI_NAME_CAP];
+};
+
+struct AiVecResult {
+  bool used_;
+  bool ok_;
+  char value_[AI_VAL_CAP];
+  char db_[AI_NAME_CAP];
+  char tbl_[AI_NAME_CAP];
+  char col_[AI_NAME_CAP];
+  char rowkey_[256];
+};
+
+static const int64_t AI_VEC_QUEUE = 64;
+static AiVecJob g_ai_vec_jobs[AI_VEC_QUEUE];
+static AiVecResult g_ai_vec_results[AI_VEC_QUEUE];
+static pthread_mutex_t g_ai_vec_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ai_vec_cond = PTHREAD_COND_INITIALIZER;
+static bool g_ai_vec_thread_started = false;
+static bool g_ai_vec_stop = false;
+
+// 列名 -> 向量维度（>0 表示该 AI 列走 embedding 写回路径）
+static int64_t ai_col_vector_dim(const char *db, const char *tbl, const char *col)
+{
+  int64_t dim = 0;
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; 0 == dim && i < total; ++i) {
+    char mdb[AI_NAME_CAP];
+    char mtbl[AI_NAME_CAP];
+    char mcol[AI_NAME_CAP];
+    int64_t d = 0;
+    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mdb, db) && ai_eq(mtbl, tbl)
+        && ai_eq(mcol, col) && OB_SUCCESS == ob_ai_meta_get_vector(i, d)) {
+      dim = (d > 0) ? d : 0;
+    }
+  }
+  return dim;
+}
+
+// 发一次 embedding 请求，成功时把向量字面量（[0.0,0.0,0.0,0.0]）放进 out
+static bool ai_send_embedding(const ObAiEndpointCache &ep, const char *input,
+                              char *out, int64_t cap)
+{
+  bool ok = false;
+  out[0] = '\0';
+  ObArenaAllocator arena("ai_vec_embed");
+  ObAIFuncIEmbed *provider = NULL;
+  ObString provider_name(static_cast<int32_t>(strlen(ep.provider_)), ep.provider_);
+  ObString req_model(static_cast<int32_t>(strlen(ep.request_model_)), ep.request_model_);
+  if (OB_SUCCESS != ObAIFuncUtils::get_embed_provider(arena, provider_name, provider)
+      || NULL == provider) {
+  } else {
+    ObString api_key(static_cast<int32_t>(strlen(ep.key_)), ep.key_);
+    ObArray<ObString> headers;
+    ObArray<ObString> contents;
+    ObJsonObject *body = NULL;
+    ObJsonObject *response = NULL;
+    ObString in_str(static_cast<int32_t>(strlen(input)), input);
+    if (OB_SUCCESS == contents.push_back(in_str)
+        && OB_SUCCESS == provider->get_header(arena, api_key, headers)
+        && OB_SUCCESS == provider->get_body(arena, req_model, contents, NULL, body)) {
+      ObAIFuncClient client;
+      client.set_timeout_sec(3);
+      if (OB_SUCCESS == client.send_post(arena,
+                                         ObString(static_cast<int32_t>(strlen(ep.url_)), ep.url_),
+                                         headers, body, response)) {
+        ObIJsonBase *result_base = NULL;
+        if (OB_SUCCESS == provider->parse_output(arena, response, result_base)
+            && NULL != result_base) {
+          ObJsonArray *result_array = static_cast<ObJsonArray *>(result_base);
+          ObIJsonBase *first = (result_array->element_count() > 0)
+                                 ? result_array->get_value(0) : NULL;
+          ObString vec_str;
+          if (NULL != first
+              && OB_SUCCESS == ObAIFuncJsonUtils::print_json_to_str(arena, first, vec_str)) {
+            aim_copy(out, cap, vec_str.ptr(), vec_str.length());
+            ok = ('[' == out[0]);
+          }
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+// 内部 SQL：后台线程唯一允许的写回通路（owned session，is_inner 绕过 AI 列钩子）
+static bool ai_vec_inner_update(const char *db, const char *tbl, const char *col,
+                                const char *rowkey, const char *value)
+{
+  bool ok = false;
+  int ret = OB_SUCCESS;
+  char sql[1024];
+  const int64_t n = snprintf(sql, sizeof(sql), "update `%s`.`%s` set `%s` = '%s' where %s",
+                             db, tbl, col, value, rowkey);
+  if (n > 0 && n < static_cast<int64_t>(sizeof(sql))) {
+    common::sqlclient::ObISQLConnectionGuard guard;
+    if (OB_SUCCESS == observer::ObInnerSQLConnection::create_connection_with_owned_session(
+                          false, 0, guard)) {
+      observer::ObInnerSQLConnection *conn =
+          static_cast<observer::ObInnerSQLConnection *>(guard.get_ptr());
+      if (NULL != conn) {
+        int64_t affected = 0;
+        if (OB_SUCCESS == conn->execute_write(ObString(static_cast<int32_t>(n), sql), affected)
+            && affected > 0) {
+          ok = true;
+        } else {
+          LOG_WARN("ai vec writeback failed", K(n), K(affected), KCSTRING(sql));
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+static void ai_vec_publish(const AiVecJob &job, bool ok, const char *value)
+{
+  int64_t slot = -1;
+  for (int64_t i = 0; -1 == slot && i < AI_VEC_QUEUE; ++i) {
+    if (!g_ai_vec_results[i].used_) {
+      slot = i;
+    }
+  }
+  if (slot >= 0) {
+    AiVecResult &res = g_ai_vec_results[slot];
+    memset(&res, 0, sizeof(res));
+    res.used_ = true;
+    res.ok_ = ok;
+    aim_copy(res.value_, sizeof(res.value_), value,
+             static_cast<int32_t>((NULL != value) ? strlen(value) : 0));
+    aim_copy(res.db_, sizeof(res.db_), job.db_, static_cast<int32_t>(strlen(job.db_)));
+    aim_copy(res.tbl_, sizeof(res.tbl_), job.tbl_, static_cast<int32_t>(strlen(job.tbl_)));
+    aim_copy(res.col_, sizeof(res.col_), job.col_, static_cast<int32_t>(strlen(job.col_)));
+    aim_copy(res.rowkey_, sizeof(res.rowkey_), job.rowkey_,
+             static_cast<int32_t>(strlen(job.rowkey_)));
+  }
+}
+
+static void *ai_vec_thread_main(void *arg)
+{
+  UNUSED(arg);
+  while (true) {
+    AiVecJob job;
+    bool has = false;
+    memset(&job, 0, sizeof(job));
+    pthread_mutex_lock(&g_ai_vec_mutex);
+    for (int64_t i = 0; !has && i < AI_VEC_QUEUE; ++i) {
+      if (g_ai_vec_jobs[i].used_) {
+        job = g_ai_vec_jobs[i];
+        g_ai_vec_jobs[i].used_ = false;
+        has = true;
+      }
+    }
+    while (!has && !g_ai_vec_stop) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += 1;
+      (void)pthread_cond_timedwait(&g_ai_vec_cond, &g_ai_vec_mutex, &ts);
+      for (int64_t i = 0; !has && i < AI_VEC_QUEUE; ++i) {
+        if (g_ai_vec_jobs[i].used_) {
+          job = g_ai_vec_jobs[i];
+          g_ai_vec_jobs[i].used_ = false;
+          has = true;
+        }
+      }
+    }
+    const bool stop = g_ai_vec_stop;
+    pthread_mutex_unlock(&g_ai_vec_mutex);
+    if (!has) {
+      if (stop) {
+        break;
+      }
+      continue;
+    }
+    char value[AI_VAL_CAP];
+    bool ok = false;
+    ObAiEndpointCache ep;
+    value[0] = '\0';
+    if (ai_endpoint_get(job.model_, ep)
+        && ai_send_embedding(ep, job.input_, value, sizeof(value))) {
+      ok = ai_vec_inner_update(job.db_, job.tbl_, job.col_, job.rowkey_, value);
+    }
+    pthread_mutex_lock(&g_ai_vec_mutex);
+    ai_vec_publish(job, ok, value);
+    pthread_mutex_unlock(&g_ai_vec_mutex);
+  }
+  return NULL;
+}
+
+// resolver 线程派发：只入队，不阻塞、不发请求
+static bool ai_vec_enqueue(const ObAiRowTask &r)
+{
+  bool placed = false;
+  pthread_mutex_lock(&g_ai_vec_mutex);
+  if (!g_ai_vec_thread_started) {
+    pthread_t tid;
+    g_ai_vec_stop = false;
+    if (0 == pthread_create(&tid, NULL, ai_vec_thread_main, NULL)) {
+      (void)pthread_detach(tid);
+      g_ai_vec_thread_started = true;
+    }
+  }
+  if (!g_ai_vec_thread_started) {
+  } else {
+    for (int64_t i = 0; !placed && i < AI_VEC_QUEUE; ++i) {
+      if (!g_ai_vec_jobs[i].used_) {
+        AiVecJob &job = g_ai_vec_jobs[i];
+        char model[AI_NAME_CAP];
+        memset(&job, 0, sizeof(job));
+        job.used_ = true;
+        model[0] = '\0';
+        if (ai_meta_model_at(r.db_, r.tbl_, r.col_, model, sizeof(model))) {
+          aim_copy(job.model_, sizeof(job.model_), model,
+                   static_cast<int32_t>(strlen(model)));
+        }
+        aim_copy(job.db_, sizeof(job.db_), r.db_, static_cast<int32_t>(strlen(r.db_)));
+        aim_copy(job.tbl_, sizeof(job.tbl_), r.tbl_, static_cast<int32_t>(strlen(r.tbl_)));
+        aim_copy(job.col_, sizeof(job.col_), r.col_, static_cast<int32_t>(strlen(r.col_)));
+        aim_copy(job.rowkey_, sizeof(job.rowkey_), r.rowkey_,
+                 static_cast<int32_t>(strlen(r.rowkey_)));
+        aim_copy(job.input_, sizeof(job.input_), r.input_,
+                 static_cast<int32_t>(strlen(r.input_)));
+        placed = true;
+      }
+    }
+    if (placed) {
+      (void)pthread_cond_signal(&g_ai_vec_cond);
+    }
+  }
+  pthread_mutex_unlock(&g_ai_vec_mutex);
+  return placed;
+}
+
+// resolver 线程应用结果：成功转 READY 并摘任务行，失败进重试/终态
+static void ai_vec_drain_results()
+{
+  pthread_mutex_lock(&g_ai_vec_mutex);
+  for (int64_t i = 0; i < AI_VEC_QUEUE; ++i) {
+    AiVecResult &res = g_ai_vec_results[i];
+    if (!res.used_) {
+      continue;
+    }
+    res.used_ = false;
+    ObAiRowTask *t = ai_find_row(res.db_, res.tbl_, res.col_, res.rowkey_);
+    if (NULL != t) {
+      int64_t max_retries = 0;
+      t->dispatched_ = false;
+      t->touch_us_ = ai_now_us();
+      if (res.ok_) {
+        t->state_ = AI_ST_READY;
+        t->retry_count_ = 0;
+        aim_copy(t->value_, sizeof(t->value_), res.value_,
+                 static_cast<int32_t>(strlen(res.value_)));
+      } else {
+        ++t->retry_count_;
+        (void)ai_meta_max_retries_at(t->db_, t->tbl_, t->col_, max_retries);
+        t->state_ = (t->retry_count_ > max_retries) ? AI_ST_FAILED : AI_ST_RETRYING;
+      }
+    }
+    ai_set_col_state(res.db_, res.tbl_, res.col_);
+  }
+  pthread_mutex_unlock(&g_ai_vec_mutex);
+}
+
 // 异步 worker tick：对已提交的 PENDING 行发一次真实请求（每条语句一次尝试）
 static void ai_worker_tick()
 {
+  ai_vec_drain_results();
   if (0 == g_ai_row_cnt) {
     return;
   }
@@ -2900,6 +3180,13 @@ static void ai_worker_tick()
     int64_t max_retries = 0;
     value[0] = '\0';
     bool ok = false;
+    if (ai_col_vector_dim(r.db_, r.tbl_, r.col_) > 0) {
+      // 向量列：派发给后台线程（HTTP + 内部 SQL 写回），此处立即返回
+      if (!r.dispatched_) {
+        r.dispatched_ = ai_vec_enqueue(r);
+      }
+      continue;
+    }
     if (!ai_meta_model_at(r.db_, r.tbl_, r.col_, model, sizeof(model))
         || !ai_meta_sysprompt_at(r.db_, r.tbl_, r.col_, sys_prompt, sizeof(sys_prompt))) {
       r.state_ = AI_ST_FAILED;
@@ -3454,6 +3741,11 @@ int ob_ai_column_note_dml(const ParseNode &stmt_node,
 {
   int ret = OB_SUCCESS;
   const ParseNode *node = &stmt_node;
+  // 内部 session（后台线程写回）绕开 AI 列钩子
+  const ObSQLSessionInfo *ai_sess = static_cast<const ObSQLSessionInfo *>(sess_key);
+  if (NULL != ai_sess && ai_sess->is_inner()) {
+    return OB_SUCCESS;
+  }
   const bool is_write = (T_INSERT == node->type_ || T_UPDATE == node->type_
                          || T_DELETE == node->type_);
   if (is_write && in_txn && NULL == ai_find_snap(sess_key)) {
@@ -3648,6 +3940,8 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
   } else {
     ObSqlString csv;
     if (is_task_tbl) {
+      // 计划缓存可能让本语句跳过 note_dml：这里补一次结果应用，保证任务表实时
+      ai_vec_drain_results();
       if (OB_FAIL(csv.append("table_id,column_id,eligible_ts,state,rowkey_predicate,retry_count,request_id\n"))) {
       }
       int64_t emitted = 0;

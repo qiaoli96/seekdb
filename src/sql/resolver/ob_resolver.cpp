@@ -173,7 +173,9 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
     real_parse_tree = &parse_tree;
   }
 
-  if (OB_SUCC(ret) && NULL != real_parse_tree) {
+  // 后台线程的内部 SQL（AI 列向量写回）必须绕开 AI 列钩子，否则自激
+  if (OB_SUCC(ret) && NULL != real_parse_tree
+      && (NULL == params_.session_info_ || !params_.session_info_->is_inner())) {
     common::ObString ai_cur_db;
     bool ai_in_txn = false;
     bool ai_is_in_txn = false;
