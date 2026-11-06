@@ -1802,6 +1802,7 @@ struct ObAiColumnMeta {
   int64_t table_id_;
   int64_t column_id_;
   int64_t hidden_ids_[3];
+  char tmpl_[512];
 };
 static ObAiColumnMeta g_ai_cols[64];
 static int64_t g_ai_col_cnt = 0;
@@ -1896,6 +1897,118 @@ static int64_t ai_option_int(const ParseNode *node, const char *key, int64_t dfl
   return val;
 }
 
+static bool ai_ser_is_name(const ParseNode *node)
+{
+  return NULL != node && 0 == node->num_child_ && NULL != node->str_value_
+         && (T_IDENT == node->type_ || T_FUN_SYS == node->type_);
+}
+
+static int64_t ai_ser_list_size(const ParseNode *n)
+{
+  int64_t sz = 0;
+  if (NULL != n) {
+    if (T_LINK_NODE == n->type_) {
+      const ParseNode *p = n;
+      while (NULL != p) {
+        if (T_LINK_NODE == p->type_ && p->num_child_ >= 2) {
+          ++sz;
+          p = p->children_[1];
+        } else {
+          ++sz;
+          p = NULL;
+        }
+      }
+    } else {
+      sz = n->num_child_;
+    }
+  }
+  return sz;
+}
+
+static const ParseNode *ai_ser_list_item(const ParseNode *n, int64_t idx)
+{
+  const ParseNode *item = NULL;
+  if (NULL != n && idx >= 0) {
+    if (T_LINK_NODE == n->type_) {
+      const ParseNode *p = n;
+      int64_t k = 0;
+      while (NULL != p && NULL == item) {
+        if (T_LINK_NODE == p->type_ && p->num_child_ >= 2) {
+          if (k == idx) { item = p->children_[0]; }
+          ++k;
+          p = p->children_[1];
+        } else {
+          if (k == idx) { item = p; }
+          p = NULL;
+        }
+      }
+    } else if (idx < n->num_child_) {
+      item = n->children_[idx];
+    }
+  }
+  return item;
+}
+
+// AI 列表达式 -> 模板：字符串字面量原样保留，列引用写成 %COL:colname%
+static void ai_ser_tmpl(const ParseNode *node, char *buf, int64_t cap,
+                        int64_t &pos, int depth)
+{
+  if (NULL == node || depth > 12 || pos >= cap - 1) {
+  } else if (T_COLUMN_REF == node->type_) {
+    const char *nm = node->str_value_;
+    int32_t nl = static_cast<int32_t>(node->str_len_);
+    if (NULL == nm && node->num_child_ >= 3 && NULL != node->children_[2]) {
+      nm = node->children_[2]->str_value_;
+      nl = static_cast<int32_t>(node->children_[2]->str_len_);
+    }
+    if (NULL != nm && nl > 0 && pos + nl + 8 < cap) {
+      MEMCPY(buf + pos, "%COL:", 5);
+      pos += 5;
+      MEMCPY(buf + pos, nm, nl);
+      pos += nl;
+      buf[pos++] = '%';
+      buf[pos] = '\0';
+    }
+  } else if (T_VARCHAR == node->type_ || T_CHAR == node->type_
+             || T_NCHAR == node->type_ || T_NVARCHAR2 == node->type_
+             || T_INT == node->type_) {
+    if (NULL != node->str_value_ && node->str_len_ > 0) {
+      int64_t n = node->str_len_;
+      if (pos + n > cap - 1) { n = cap - 1 - pos; }
+      if (n > 0) {
+        MEMCPY(buf + pos, node->str_value_, n);
+        pos += n;
+        buf[pos] = '\0';
+      }
+    } else if (T_INT == node->type_) {
+      const int64_t n = snprintf(buf + pos, cap - pos, "%ld",
+                                 static_cast<long>(node->value_));
+      if (n > 0 && pos + n < cap) { pos += n; }
+    }
+  } else {
+    int64_t from = 0;
+    if (node->num_child_ > 0 && ai_ser_is_name(node->children_[0])) {
+      from = 1;
+    }
+    for (int64_t i = from; i < node->num_child_; ++i) {
+      ai_ser_tmpl(node->children_[i], buf, cap, pos, depth + 1);
+    }
+  }
+}
+
+static void ai_build_template(const ParseNode *call, char *buf, int64_t cap)
+{
+  int64_t pos = 0;
+  buf[0] = '\0';
+  if (NULL != call && call->num_child_ >= 2) {
+    const ParseNode *args = call->children_[1];
+    const int64_t argc = ai_ser_list_size(args);
+    for (int64_t i = 1; i < argc && pos < cap - 1; ++i) {
+      ai_ser_tmpl(ai_ser_list_item(args, i), buf, cap, pos, 0);
+    }
+  }
+}
+
 static int ai_register(const char *db, int32_t db_len,
                        const char *tbl, int32_t tbl_len,
                        const char *col, int32_t col_len,
@@ -1983,6 +2096,8 @@ static int ai_register(const char *db, int32_t db_len,
         } else {
           snprintf(m.normalized_expr_, sizeof(m.normalized_expr_), "ai column %s", col_buf);
         }
+        m.tmpl_[0] = '\0';
+        ai_build_template(call, m.tmpl_, sizeof(m.tmpl_));
         SQL_RESV_LOG(INFO, "ai column registered", K(db_buf), K(tbl_buf), K(col_buf),
                      K(max_retries), K(is_json), K(vector_dim));
       }
@@ -8411,6 +8526,18 @@ int ob_ai_meta_get(int64_t idx,
     expr_len = static_cast<int32_t>(strlen(m.normalized_expr_));
     max_retries = m.max_retries_;
     is_json = m.is_json_;
+  }
+  return ret;
+}
+
+int ob_ai_meta_get_tmpl(int64_t idx, const char *&tmpl, int32_t &len)
+{
+  int ret = OB_SUCCESS;
+  if (idx < 0 || idx >= g_ai_col_cnt) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    tmpl = g_ai_cols[idx].tmpl_;
+    len = static_cast<int32_t>(strlen(g_ai_cols[idx].tmpl_));
   }
   return ret;
 }

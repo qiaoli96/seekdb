@@ -1558,6 +1558,961 @@ static void aim_copy(char *dst, int64_t cap, const char *src, int32_t len)
   dst[n] = '\0';
 }
 
+
+// ---------- 赛题三 P2：AI 列逐行状态机（内存，模拟异步 worker） ----------
+int ob_ai_meta_get_tmpl(int64_t idx, const char *&tmpl, int32_t &len);
+
+static const int32_t AI_NAME_CAP = 130;
+static const int32_t AI_VAL_CAP = 512;
+static const int64_t AI_MAX_ROW_TASK = 512;
+static const int64_t AI_MAX_COL_TASK = 128;
+static const int64_t AI_MAX_SNAP = 8;
+static const int AI_ST_NONE = 0;
+static const int AI_ST_PENDING = 1;
+static const int AI_ST_READY = 2;
+
+struct ObAiRowTask {
+  bool used_;
+  char db_[AI_NAME_CAP];
+  char tbl_[AI_NAME_CAP];
+  char col_[AI_NAME_CAP];
+  char rowkey_[256];
+  char input_[AI_VAL_CAP];
+  int state_;
+  int64_t touch_us_;
+};
+
+struct ObAiColTask {
+  bool used_;
+  char db_[AI_NAME_CAP];
+  char tbl_[AI_NAME_CAP];
+  char col_[AI_NAME_CAP];
+  int state_;
+  int64_t touch_us_;
+};
+
+struct ObAiNameVal {
+  char name_[AI_NAME_CAP];
+  char val_[AI_VAL_CAP];
+};
+
+struct ObAiNameValSet {
+  ObAiNameVal items_[32];
+  int64_t cnt_;
+};
+
+struct ObAiEndTransSnap {
+  bool used_;
+  const void *key_;
+  ObAiRowTask rows_[AI_MAX_ROW_TASK];
+  int64_t row_cnt_;
+  ObAiColTask cols_[AI_MAX_COL_TASK];
+  int64_t col_cnt_;
+};
+
+static ObAiRowTask g_ai_rows[AI_MAX_ROW_TASK];
+static int64_t g_ai_row_cnt = 0;
+static ObAiColTask g_ai_cols_state[AI_MAX_COL_TASK];
+static int64_t g_ai_col_state_cnt = 0;
+static ObAiEndTransSnap g_ai_snaps[AI_MAX_SNAP];
+
+static int64_t ai_now_us()
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return static_cast<int64_t>(tv.tv_sec) * 1000000 + static_cast<int64_t>(tv.tv_usec);
+}
+
+static void ai_fmt_datetime(int64_t us, char *buf, int64_t cap)
+{
+  const time_t sec = static_cast<time_t>(us / 1000000);
+  struct tm tmv;
+  localtime_r(&sec, &tmv);
+  snprintf(buf, cap, "%04d-%02d-%02d %02d:%02d:%02d.%06ld",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+           static_cast<long>(us % 1000000));
+}
+
+static bool ai_eq(const char *a, const char *b)
+{
+  return NULL != a && NULL != b && 0 == strcasecmp(a, b);
+}
+
+static bool ai_len_eq(const char *p, int32_t len, const char *name)
+{
+  bool eq = (NULL != p && NULL != name && len > 0
+             && static_cast<int32_t>(strlen(name)) == len);
+  for (int32_t i = 0; eq && i < len; ++i) {
+    char a = p[i];
+    char b = name[i];
+    if (a >= 'A' && a <= 'Z') { a = static_cast<char>(a - 'A' + 'a'); }
+    if (b >= 'A' && b <= 'Z') { b = static_cast<char>(b - 'A' + 'a'); }
+    if (a != b) { eq = false; }
+  }
+  return eq;
+}
+
+static ObAiEndTransSnap *ai_find_snap(const void *key)
+{
+  ObAiEndTransSnap *hit = NULL;
+  for (int64_t i = 0; NULL == hit && i < AI_MAX_SNAP; ++i) {
+    if (g_ai_snaps[i].used_ && g_ai_snaps[i].key_ == key) {
+      hit = &g_ai_snaps[i];
+    }
+  }
+  return hit;
+}
+
+static void ai_take_snap(const void *key)
+{
+  ObAiEndTransSnap *s = ai_find_snap(key);
+  if (NULL == s) {
+    for (int64_t i = 0; NULL == s && i < AI_MAX_SNAP; ++i) {
+      if (!g_ai_snaps[i].used_) { s = &g_ai_snaps[i]; }
+    }
+  }
+  if (NULL != s) {
+    s->used_ = true;
+    s->key_ = key;
+    MEMCPY(s->rows_, g_ai_rows, sizeof(g_ai_rows));
+    s->row_cnt_ = g_ai_row_cnt;
+    MEMCPY(s->cols_, g_ai_cols_state, sizeof(g_ai_cols_state));
+    s->col_cnt_ = g_ai_col_state_cnt;
+  }
+}
+
+static ObAiRowTask *ai_find_row(const char *db, const char *tbl, const char *col,
+                                const char *rowkey)
+{
+  ObAiRowTask *hit = NULL;
+  for (int64_t i = 0; NULL == hit && i < g_ai_row_cnt; ++i) {
+    ObAiRowTask &r = g_ai_rows[i];
+    if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl)
+        && ai_eq(r.col_, col) && ai_eq(r.rowkey_, rowkey)) {
+      hit = &r;
+    }
+  }
+  return hit;
+}
+
+static ObAiRowTask *ai_touch_row(const char *db, const char *tbl, const char *col,
+                                 const char *rowkey)
+{
+  ObAiRowTask *r = ai_find_row(db, tbl, col, rowkey);
+  if (NULL == r) {
+    for (int64_t i = 0; NULL == r && i < g_ai_row_cnt; ++i) {
+      if (!g_ai_rows[i].used_) { r = &g_ai_rows[i]; }
+    }
+    if (NULL == r && g_ai_row_cnt < AI_MAX_ROW_TASK) {
+      r = &g_ai_rows[g_ai_row_cnt];
+      ++g_ai_row_cnt;
+    }
+    if (NULL != r) {
+      memset(r, 0, sizeof(ObAiRowTask));
+      r->used_ = true;
+      aim_copy(r->db_, sizeof(r->db_), db, static_cast<int32_t>(strlen(db)));
+      aim_copy(r->tbl_, sizeof(r->tbl_), tbl, static_cast<int32_t>(strlen(tbl)));
+      aim_copy(r->col_, sizeof(r->col_), col, static_cast<int32_t>(strlen(col)));
+      aim_copy(r->rowkey_, sizeof(r->rowkey_), rowkey, static_cast<int32_t>(strlen(rowkey)));
+    }
+  }
+  return r;
+}
+
+static void ai_drop_row(const char *db, const char *tbl, const char *col, const char *rowkey)
+{
+  for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
+    ObAiRowTask &r = g_ai_rows[i];
+    if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl)
+        && ai_eq(r.col_, col) && ai_eq(r.rowkey_, rowkey)) {
+      r.used_ = false;
+    }
+  }
+}
+
+static void ai_clear_rows(const char *db, const char *tbl, const char *col)
+{
+  for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
+    ObAiRowTask &r = g_ai_rows[i];
+    if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl) && ai_eq(r.col_, col)) {
+      r.used_ = false;
+    }
+  }
+}
+
+static ObAiColTask *ai_find_col(const char *db, const char *tbl, const char *col)
+{
+  ObAiColTask *hit = NULL;
+  for (int64_t i = 0; NULL == hit && i < g_ai_col_state_cnt; ++i) {
+    ObAiColTask &c = g_ai_cols_state[i];
+    if (c.used_ && ai_eq(c.db_, db) && ai_eq(c.tbl_, tbl) && ai_eq(c.col_, col)) {
+      hit = &c;
+    }
+  }
+  return hit;
+}
+
+static ObAiColTask *ai_touch_col(const char *db, const char *tbl, const char *col)
+{
+  ObAiColTask *c = ai_find_col(db, tbl, col);
+  if (NULL == c) {
+    for (int64_t i = 0; NULL == c && i < g_ai_col_state_cnt; ++i) {
+      if (!g_ai_cols_state[i].used_) { c = &g_ai_cols_state[i]; }
+    }
+    if (NULL == c && g_ai_col_state_cnt < AI_MAX_COL_TASK) {
+      c = &g_ai_cols_state[g_ai_col_state_cnt];
+      ++g_ai_col_state_cnt;
+    }
+    if (NULL != c) {
+      memset(c, 0, sizeof(ObAiColTask));
+      c->used_ = true;
+      aim_copy(c->db_, sizeof(c->db_), db, static_cast<int32_t>(strlen(db)));
+      aim_copy(c->tbl_, sizeof(c->tbl_), tbl, static_cast<int32_t>(strlen(tbl)));
+      aim_copy(c->col_, sizeof(c->col_), col, static_cast<int32_t>(strlen(col)));
+      c->state_ = AI_ST_READY;
+      c->touch_us_ = ai_now_us();
+    }
+  }
+  return c;
+}
+
+static void ai_set_col_state(const char *db, const char *tbl, const char *col)
+{
+  bool pending = false;
+  for (int64_t i = 0; !pending && i < g_ai_row_cnt; ++i) {
+    const ObAiRowTask &r = g_ai_rows[i];
+    if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl) && ai_eq(r.col_, col)
+        && AI_ST_PENDING == r.state_) {
+      pending = true;
+    }
+  }
+  ObAiColTask *c = ai_touch_col(db, tbl, col);
+  if (NULL != c) {
+    c->state_ = pending ? AI_ST_PENDING : AI_ST_READY;
+    c->touch_us_ = ai_now_us();
+  }
+}
+
+static void ai_vs_reset(ObAiNameValSet &s)
+{
+  s.cnt_ = 0;
+}
+
+static void ai_vs_put(ObAiNameValSet &s, const char *name, const char *val)
+{
+  bool replaced = false;
+  for (int64_t i = 0; !replaced && i < s.cnt_; ++i) {
+    if (ai_eq(s.items_[i].name_, name)) {
+      aim_copy(s.items_[i].val_, AI_VAL_CAP, val, static_cast<int32_t>(strlen(val)));
+      replaced = true;
+    }
+  }
+  if (!replaced && s.cnt_ < 32) {
+    aim_copy(s.items_[s.cnt_].name_, AI_NAME_CAP, name, static_cast<int32_t>(strlen(name)));
+    aim_copy(s.items_[s.cnt_].val_, AI_VAL_CAP, val, static_cast<int32_t>(strlen(val)));
+    ++s.cnt_;
+  }
+}
+
+static const char *ai_vs_get(const ObAiNameValSet &s, const char *name)
+{
+  const char *v = NULL;
+  for (int64_t i = 0; NULL == v && i < s.cnt_; ++i) {
+    if (ai_eq(s.items_[i].name_, name)) {
+      v = s.items_[i].val_;
+    }
+  }
+  return v;
+}
+
+static bool ai_render_input(const char *tmpl, const ObAiNameValSet &vals,
+                            char *out, int64_t cap)
+{
+  bool complete = true;
+  int64_t pos = 0;
+  const char *p = tmpl;
+  out[0] = '\0';
+  while (NULL != p && '\0' != *p) {
+    if (0 == strncmp(p, "%COL:", 5)) {
+      const char *q = strchr(p + 5, '%');
+      if (NULL == q) {
+        while ('\0' != *p && pos < cap - 1) { out[pos++] = *p++; }
+      } else {
+        char name[AI_NAME_CAP];
+        int64_t n = q - (p + 5);
+        if (n > AI_NAME_CAP - 1) { n = AI_NAME_CAP - 1; }
+        MEMCPY(name, p + 5, n);
+        name[n] = '\0';
+        const char *v = ai_vs_get(vals, name);
+        if (NULL == v) {
+          complete = false;
+          v = "";
+        }
+        for (const char *s = v; '\0' != *s && pos < cap - 1; ++s) { out[pos++] = *s; }
+        p = q + 1;
+      }
+    } else if (pos < cap - 1) {
+      out[pos++] = *p++;
+    } else {
+      ++p;
+    }
+  }
+  out[pos] = '\0';
+  return complete;
+}
+
+static bool ai_tmpl_uses(const char *tmpl, const ObAiNameValSet &vals)
+{
+  bool hit = false;
+  const char *p = tmpl;
+  while (!hit && NULL != p && '\0' != *p) {
+    const char *m = strstr(p, "%COL:");
+    if (NULL == m) {
+      p = NULL;
+    } else {
+      const char *q = strchr(m + 5, '%');
+      if (NULL == q) {
+        p = NULL;
+      } else {
+        char name[AI_NAME_CAP];
+        int64_t n = q - (m + 5);
+        if (n > AI_NAME_CAP - 1) { n = AI_NAME_CAP - 1; }
+        MEMCPY(name, m + 5, n);
+        name[n] = '\0';
+        if (NULL != ai_vs_get(vals, name)) { hit = true; }
+        p = q + 1;
+      }
+    }
+  }
+  return hit;
+}
+
+static void ai_make_json(const char *input, char *out, int64_t cap)
+{
+  char esc[AI_VAL_CAP * 2 + 4];
+  int64_t ep = 0;
+  for (const char *p = input; NULL != p && '\0' != *p
+       && ep < static_cast<int64_t>(sizeof(esc)) - 2; ++p) {
+    if ('"' == *p || '\\' == *p) { esc[ep++] = '\\'; }
+    esc[ep++] = *p;
+  }
+  esc[ep] = '\0';
+  snprintf(out, cap, "{\"category\":\"mock\",\"input\":\"%s\"}", esc);
+}
+
+static bool ai_meta_at(int64_t idx, char *db, char *tbl, char *col);
+
+// AI 列相关语句必须每次重新 resolve：结果依赖内存状态，不能命中计划缓存
+static void ai_set_no_plan_cache(ObQueryCtx *query_ctx)
+{
+  if (NULL != query_ctx) {
+    ObGlobalHint &global_hint = const_cast<ObGlobalHint &>(query_ctx->get_global_hint());
+    global_hint.merge_plan_cache_hint(ObPlanCachePolicy::OB_USE_PLAN_CACHE_NONE);
+  }
+}
+
+static bool ai_table_has_col(const char *db, const char *tbl)
+{
+  bool hit = false;
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; !hit && i < total; ++i) {
+    char mdb[AI_NAME_CAP];
+    char mtbl[AI_NAME_CAP];
+    char mcol[AI_NAME_CAP];
+    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mdb, db) && ai_eq(mtbl, tbl)) {
+      hit = true;
+    }
+  }
+  return hit;
+}
+
+static int64_t ai_list_size(const ParseNode *n)
+{
+  int64_t sz = 0;
+  if (NULL != n) {
+    if (T_LINK_NODE == n->type_) {
+      const ParseNode *p = n;
+      while (NULL != p) {
+        if (T_LINK_NODE == p->type_ && p->num_child_ >= 2) {
+          ++sz;
+          p = p->children_[1];
+        } else {
+          ++sz;
+          p = NULL;
+        }
+      }
+    } else {
+      sz = n->num_child_;
+    }
+  }
+  return sz;
+}
+
+static const ParseNode *ai_list_item(const ParseNode *n, int64_t idx)
+{
+  const ParseNode *item = NULL;
+  if (NULL != n && idx >= 0) {
+    if (T_LINK_NODE == n->type_) {
+      const ParseNode *p = n;
+      int64_t k = 0;
+      while (NULL != p && NULL == item) {
+        if (T_LINK_NODE == p->type_ && p->num_child_ >= 2) {
+          if (k == idx) { item = p->children_[0]; }
+          ++k;
+          p = p->children_[1];
+        } else {
+          if (k == idx) { item = p; }
+          p = NULL;
+        }
+      }
+    } else if (idx < n->num_child_) {
+      item = n->children_[idx];
+    }
+  }
+  return item;
+}
+
+static bool ai_node_literal(const ParseNode *n, char *out, int64_t cap)
+{
+  bool ok = false;
+  if (NULL == n || cap <= 1) {
+  } else {
+    out[0] = '\0';
+    if (NULL != n->str_value_ && n->str_len_ > 0) {
+      const int64_t len = n->str_len_ < cap - 1 ? n->str_len_ : cap - 1;
+      MEMCPY(out, n->str_value_, len);
+      out[len] = '\0';
+      ok = true;
+    } else if (T_INT == n->type_ || T_NUMBER == n->type_) {
+      snprintf(out, cap, "%ld", static_cast<long>(n->value_));
+      ok = true;
+    } else if (1 == n->num_child_ && NULL != n->children_[0]) {
+      ok = ai_node_literal(n->children_[0], out, cap);
+    }
+  }
+  return ok;
+}
+
+static bool ai_values_like(const ParseNode *n)
+{
+  return NULL != n && (T_VALUE_LIST == n->type_ || T_VALUES_ROW_LIST == n->type_
+                       || T_VALUE_VECTOR == n->type_ || T_LINK_NODE == n->type_);
+}
+
+static const ParseNode *ai_find_relation(const ParseNode *n, int depth)
+{
+  const ParseNode *found = NULL;
+  if (NULL != n && depth <= 12) {
+    if (T_RELATION_FACTOR == n->type_) {
+      found = n;
+    } else {
+      for (int64_t i = 0; NULL == found && i < n->num_child_; ++i) {
+        found = ai_find_relation(n->children_[i], depth + 1);
+      }
+    }
+  }
+  return found;
+}
+
+static bool ai_relation_of(const ParseNode *rel, char *db, int64_t dbcap,
+                           char *tbl, int64_t tblcap)
+{
+  bool ok = false;
+  const ParseNode *names[3] = {NULL, NULL, NULL};
+  int64_t cnt = 0;
+  db[0] = '\0';
+  tbl[0] = '\0';
+  for (int64_t i = 0; NULL != rel && i < rel->num_child_ && cnt < 3; ++i) {
+    const ParseNode *c = rel->children_[i];
+    if (NULL != c && NULL != c->str_value_ && c->str_len_ > 0) {
+      names[cnt] = c;
+      ++cnt;
+    }
+  }
+  if (1 == cnt) {
+    aim_copy(tbl, tblcap, names[0]->str_value_, names[0]->str_len_);
+    ok = true;
+  } else if (2 == cnt) {
+    aim_copy(db, dbcap, names[0]->str_value_, names[0]->str_len_);
+    aim_copy(tbl, tblcap, names[1]->str_value_, names[1]->str_len_);
+    ok = true;
+  }
+  return ok;
+}
+
+static bool ai_colref_is(const ParseNode *n, const char *col)
+{
+  return NULL != n && T_COLUMN_REF == n->type_ && NULL != n->str_value_
+         && ai_len_eq(n->str_value_, n->str_len_, col);
+}
+
+static bool ai_meta_at(int64_t idx, char *db, char *tbl, char *col)
+{
+  const char *pdb = NULL;
+  const char *ptbl = NULL;
+  const char *pcol = NULL;
+  const char *pexpr = NULL;
+  int32_t a = 0;
+  int32_t b = 0;
+  int32_t c = 0;
+  int32_t d = 0;
+  int64_t e = 0;
+  int64_t f = 0;
+  bool ok = (OB_SUCCESS == ob_ai_meta_get(idx, pdb, a, ptbl, b, pcol, c,
+                                          pexpr, d, e, f));
+  if (ok) {
+    aim_copy(db, AI_NAME_CAP, pdb, a);
+    aim_copy(tbl, AI_NAME_CAP, ptbl, b);
+    aim_copy(col, AI_NAME_CAP, pcol, c);
+  }
+  return ok;
+}
+
+static bool ai_tmpl_at(int64_t idx, char *buf, int64_t cap)
+{
+  const char *p = NULL;
+  int32_t len = 0;
+  bool ok = (OB_SUCCESS == ob_ai_meta_get_tmpl(idx, p, len));
+  if (ok) {
+    aim_copy(buf, cap, p, len);
+  }
+  return ok;
+}
+
+static bool ai_pk_name(ObSchemaChecker *sc, const char *db,
+                       const char *tbl, char *out, int64_t cap)
+{
+  bool ok = false;
+  out[0] = '\0';
+  if (NULL != sc) {
+    const share::schema::ObTableSchema *ts = NULL;
+    ObString db_name(static_cast<int32_t>(strlen(db)), db);
+    ObString tbl_name(static_cast<int32_t>(strlen(tbl)), tbl);
+    if (OB_SUCCESS == sc->get_table_schema(db_name, tbl_name, false, ts)
+        && NULL != ts) {
+      const common::ObRowkeyInfo &ri = ts->get_rowkey_info();
+      uint64_t cid = 0;
+      if (ri.get_size() > 0 && OB_SUCCESS == ri.get_column_id(0, cid)) {
+        const share::schema::ObColumnSchemaV2 *cs = ts->get_column_schema(cid);
+        if (NULL != cs) {
+          const ObString &nm = cs->get_column_name_str();
+          aim_copy(out, cap, nm.ptr(), nm.length());
+          ok = (strlen(out) > 0);
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+static void ai_where_pk_rec(const ParseNode *n, const char *pk,
+                            char out[][512], int64_t max, int64_t &cnt, int depth)
+{
+  if (NULL == n || depth > 24) {
+  } else if (T_OP_EQ == n->type_ && n->num_child_ >= 2) {
+    if (ai_colref_is(n->children_[0], pk)) {
+      char v[AI_VAL_CAP];
+      if (cnt < max && ai_node_literal(n->children_[1], v, sizeof(v))) {
+        aim_copy(out[cnt], AI_VAL_CAP, v, static_cast<int32_t>(strlen(v)));
+        ++cnt;
+      }
+    }
+  } else if (T_OP_IN == n->type_ && n->num_child_ >= 2) {
+    if (ai_colref_is(n->children_[0], pk)) {
+      const ParseNode *list = n->children_[1];
+      for (int64_t i = 0; NULL != list && i < ai_list_size(list) && cnt < max; ++i) {
+        char v[AI_VAL_CAP];
+        if (ai_node_literal(ai_list_item(list, i), v, sizeof(v))) {
+          aim_copy(out[cnt], AI_VAL_CAP, v, static_cast<int32_t>(strlen(v)));
+          ++cnt;
+        }
+      }
+    }
+  } else {
+    for (int64_t i = 0; i < n->num_child_; ++i) {
+      ai_where_pk_rec(n->children_[i], pk, out, max, cnt, depth + 1);
+    }
+  }
+}
+
+static int64_t ai_where_pk(const ParseNode *where, const char *pk,
+                           char out[][512], int64_t max)
+{
+  int64_t cnt = 0;
+  const ParseNode *cond = (NULL != where && where->num_child_ > 0)
+                            ? where->children_[0] : NULL;
+  ai_where_pk_rec(cond, pk, out, max, cnt, 0);
+  return cnt;
+}
+
+static void ai_apply_insert(const char *db, const char *tbl,
+                            const ParseNode *into, const ParseNode *values,
+                            ObSchemaChecker *sc)
+{
+  char col_names[32][AI_NAME_CAP];
+  int64_t col_cnt = 0;
+  const ParseNode *cl = (NULL != into && into->num_child_ > 1) ? into->children_[1] : NULL;
+  for (int64_t i = 0; NULL != cl && i < ai_list_size(cl) && col_cnt < 32; ++i) {
+    const ParseNode *c = ai_list_item(cl, i);
+    if (NULL != c && NULL != c->str_value_ && c->str_len_ > 0) {
+      aim_copy(col_names[col_cnt], AI_NAME_CAP, c->str_value_, c->str_len_);
+      ++col_cnt;
+    }
+  }
+  char pk[AI_NAME_CAP];
+  if (0 == col_cnt || !ai_pk_name(sc, db, tbl, pk, sizeof(pk))) {
+  } else {
+    const int64_t total = ob_ai_meta_count();
+    const int64_t row_cnt = ai_list_size(values);
+    for (int64_t i = 0; i < total; ++i) {
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      char tmpl[AI_VAL_CAP];
+      if (!ai_meta_at(i, mdb, mtbl, mcol)) {
+      } else if (!ai_eq(mdb, db) || !ai_eq(mtbl, tbl)) {
+      } else if (!ai_tmpl_at(i, tmpl, sizeof(tmpl))) {
+      } else {
+        for (int64_t r = 0; r < row_cnt; ++r) {
+          const ParseNode *row = ai_list_item(values, r);
+          if (!ai_values_like(row)) {
+            continue;
+          }
+          ObAiNameValSet vals;
+          ai_vs_reset(vals);
+          const int64_t vcnt = ai_list_size(row);
+          for (int64_t v = 0; v < vcnt && v < col_cnt; ++v) {
+            char vb[AI_VAL_CAP];
+            if (ai_node_literal(ai_list_item(row, v), vb, sizeof(vb))) {
+              ai_vs_put(vals, col_names[v], vb);
+            }
+          }
+          const char *pkv = ai_vs_get(vals, pk);
+          if (NULL == pkv) {
+            continue;
+          }
+          char rowkey[256];
+          snprintf(rowkey, sizeof(rowkey), "`%s` = %s", pk, pkv);
+          char input[AI_VAL_CAP];
+          ai_render_input(tmpl, vals, input, sizeof(input));
+          ObAiRowTask *t = ai_touch_row(db, tbl, mcol, rowkey);
+          if (NULL != t) {
+            t->state_ = AI_ST_PENDING;
+            t->touch_us_ = ai_now_us();
+            aim_copy(t->input_, AI_VAL_CAP, input, static_cast<int32_t>(strlen(input)));
+          }
+        }
+        ai_set_col_state(db, tbl, mcol);
+      }
+    }
+  }
+}
+
+static void ai_apply_update(const char *db, const char *tbl, const ParseNode *assign,
+                            const ParseNode *where, ObSchemaChecker *sc)
+{
+  char pk[AI_NAME_CAP];
+  if (!ai_pk_name(sc, db, tbl, pk, sizeof(pk))) {
+  } else {
+    ObAiNameValSet setv;
+    ai_vs_reset(setv);
+    for (int64_t i = 0; NULL != assign && i < ai_list_size(assign); ++i) {
+      const ParseNode *item = ai_list_item(assign, i);
+      if (NULL == item || item->num_child_ < 2) {
+        continue;
+      }
+      const ParseNode *lhs = item->children_[0];
+      char vb[AI_VAL_CAP];
+      if (NULL != lhs && NULL != lhs->str_value_ && lhs->str_len_ > 0
+          && ai_node_literal(item->children_[1], vb, sizeof(vb))) {
+        char nm[AI_NAME_CAP];
+        aim_copy(nm, sizeof(nm), lhs->str_value_, lhs->str_len_);
+        ai_vs_put(setv, nm, vb);
+      }
+    }
+    const char *new_pk_val = ai_vs_get(setv, pk);
+    char rk_vals[32][512];
+    const int64_t rk_cnt = ai_where_pk(where, pk, rk_vals, 32);
+    const int64_t total = ob_ai_meta_count();
+    for (int64_t i = 0; i < total; ++i) {
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      char tmpl[AI_VAL_CAP];
+      if (!ai_meta_at(i, mdb, mtbl, mcol) || !ai_eq(mdb, db) || !ai_eq(mtbl, tbl)) {
+        continue;
+      }
+      if (!ai_tmpl_at(i, tmpl, sizeof(tmpl))) {
+        continue;
+      }
+      const bool dep = ai_tmpl_uses(tmpl, setv);
+      if (!dep && NULL == new_pk_val) {
+        continue;
+      }
+      char old_vals[32][512];
+      int64_t old_cnt = 0;
+      if (rk_cnt > 0) {
+        for (int64_t k = 0; k < rk_cnt && old_cnt < 32; ++k) {
+          aim_copy(old_vals[old_cnt], AI_VAL_CAP, rk_vals[k],
+                   static_cast<int32_t>(strlen(rk_vals[k])));
+          ++old_cnt;
+        }
+      } else {
+        for (int64_t k = 0; k < g_ai_row_cnt && old_cnt < 32; ++k) {
+          const ObAiRowTask &r = g_ai_rows[k];
+          if (r.used_ && ai_eq(r.db_, db) && ai_eq(r.tbl_, tbl) && ai_eq(r.col_, mcol)) {
+            const char *eqp = strstr(r.rowkey_, "` = ");
+            if (NULL != eqp) {
+              aim_copy(old_vals[old_cnt], AI_VAL_CAP, eqp + 7,
+                       static_cast<int32_t>(strlen(eqp + 7)));
+              ++old_cnt;
+            }
+          }
+        }
+      }
+      for (int64_t k = 0; k < old_cnt; ++k) {
+        char oldkey[256];
+        snprintf(oldkey, sizeof(oldkey), "`%s` = %s", pk, old_vals[k]);
+        ObAiRowTask *old = ai_find_row(db, tbl, mcol, oldkey);
+        char keep[AI_VAL_CAP];
+        keep[0] = '\0';
+        if (NULL != old) {
+          aim_copy(keep, sizeof(keep), old->input_,
+                   static_cast<int32_t>(strlen(old->input_)));
+        }
+        char input[AI_VAL_CAP];
+        const bool complete = ai_render_input(tmpl, setv, input, sizeof(input));
+        if (!complete && '\0' != keep[0]) {
+          aim_copy(input, sizeof(input), keep, static_cast<int32_t>(strlen(keep)));
+        }
+        const char *npv = (NULL != new_pk_val) ? new_pk_val : old_vals[k];
+        char newkey[256];
+        snprintf(newkey, sizeof(newkey), "`%s` = %s", pk, npv);
+        if (NULL != old) {
+          old->used_ = false;
+        }
+        ObAiRowTask *t = ai_touch_row(db, tbl, mcol, newkey);
+        if (NULL != t) {
+          t->state_ = AI_ST_PENDING;
+          t->touch_us_ = ai_now_us();
+          aim_copy(t->input_, AI_VAL_CAP, input, static_cast<int32_t>(strlen(input)));
+        }
+      }
+      ai_set_col_state(db, tbl, mcol);
+    }
+  }
+}
+
+static void ai_apply_delete(const char *db, const char *tbl, const ParseNode *where,
+                            ObSchemaChecker *sc)
+{
+  char pk[AI_NAME_CAP];
+  if (!ai_pk_name(sc, db, tbl, pk, sizeof(pk))) {
+  } else {
+    char rk_vals[32][512];
+    const int64_t rk_cnt = ai_where_pk(where, pk, rk_vals, 32);
+    const int64_t total = ob_ai_meta_count();
+    for (int64_t i = 0; i < total; ++i) {
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      if (!ai_meta_at(i, mdb, mtbl, mcol) || !ai_eq(mdb, db) || !ai_eq(mtbl, tbl)) {
+        continue;
+      }
+      if (rk_cnt > 0) {
+        for (int64_t k = 0; k < rk_cnt; ++k) {
+          char key[256];
+          snprintf(key, sizeof(key), "`%s` = %s", pk, rk_vals[k]);
+          ai_drop_row(db, tbl, mcol, key);
+        }
+      } else {
+        ai_clear_rows(db, tbl, mcol);
+      }
+      ai_set_col_state(db, tbl, mcol);
+    }
+  }
+}
+
+int ob_ai_column_note_dml(const ParseNode &stmt_node,
+                          ObSchemaChecker *schema_checker,
+                          const common::ObString &cur_db,
+                          bool in_txn,
+                          const void *sess_key,
+                          ObQueryCtx *query_ctx)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *node = &stmt_node;
+  const bool is_write = (T_INSERT == node->type_ || T_UPDATE == node->type_
+                         || T_DELETE == node->type_);
+  if (is_write && in_txn && NULL == ai_find_snap(sess_key)) {
+    ai_take_snap(sess_key);
+  }
+  char db[AI_NAME_CAP];
+  char tbl[AI_NAME_CAP];
+  db[0] = '\0';
+  tbl[0] = '\0';
+  if (T_INSERT == node->type_ && node->num_child_ > 0) {
+    const ParseNode *single = node->children_[0];
+    const ParseNode *into = (NULL != single && single->num_child_ > 0)
+                              ? single->children_[0] : NULL;
+    const ParseNode *values = (NULL != single && single->num_child_ > 1)
+                                ? single->children_[1] : NULL;
+    if (NULL != into && ai_values_like(values)
+        && ai_relation_of(ai_find_relation(into->children_[0], 0),
+                          db, sizeof(db), tbl, sizeof(tbl))) {
+      if ('\0' == db[0]) {
+        aim_copy(db, sizeof(db), cur_db.ptr(), cur_db.length());
+      }
+      ai_apply_insert(db, tbl, into, values, schema_checker);
+    }
+  } else if (T_UPDATE == node->type_ && node->num_child_ > 3) {
+    if (ai_relation_of(ai_find_relation(node->children_[1], 0),
+                       db, sizeof(db), tbl, sizeof(tbl))) {
+      if ('\0' == db[0]) {
+        aim_copy(db, sizeof(db), cur_db.ptr(), cur_db.length());
+      }
+      ai_apply_update(db, tbl, node->children_[2], node->children_[3], schema_checker);
+    }
+  } else if (T_DELETE == node->type_ && node->num_child_ > 2) {
+    const ParseNode *dtn = node->children_[1];
+    const ParseNode *from = (NULL != dtn && dtn->num_child_ > 1) ? dtn->children_[1] : dtn;
+    if (ai_relation_of(ai_find_relation(from, 0), db, sizeof(db), tbl, sizeof(tbl))) {
+      if ('\0' == db[0]) {
+        aim_copy(db, sizeof(db), cur_db.ptr(), cur_db.length());
+      }
+      ai_apply_delete(db, tbl, node->children_[2], schema_checker);
+    }
+  }
+  if (is_write && ai_table_has_col(db, tbl)) {
+    ai_set_no_plan_cache(query_ctx);
+  }
+  return ret;
+}
+
+int ob_ai_column_end_trans(const void *sess_key, bool is_rollback)
+{
+  int ret = OB_SUCCESS;
+  ObAiEndTransSnap *s = ai_find_snap(sess_key);
+  if (is_rollback) {
+    if (NULL != s) {
+      MEMCPY(g_ai_rows, s->rows_, sizeof(g_ai_rows));
+      g_ai_row_cnt = s->row_cnt_;
+      MEMCPY(g_ai_cols_state, s->cols_, sizeof(g_ai_cols_state));
+      g_ai_col_state_cnt = s->col_cnt_;
+      s->used_ = false;
+      s->key_ = NULL;
+    }
+  } else {
+    const int64_t now_us = ai_now_us();
+    for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
+      if (g_ai_rows[i].used_ && AI_ST_PENDING == g_ai_rows[i].state_) {
+        g_ai_rows[i].state_ = AI_ST_READY;
+        g_ai_rows[i].touch_us_ = now_us;
+      }
+    }
+    for (int64_t i = 0; i < g_ai_col_state_cnt; ++i) {
+      if (g_ai_cols_state[i].used_ && AI_ST_PENDING == g_ai_cols_state[i].state_) {
+        g_ai_cols_state[i].state_ = AI_ST_READY;
+        g_ai_cols_state[i].touch_us_ = now_us;
+      }
+    }
+    if (NULL != s) {
+      s->used_ = false;
+      s->key_ = NULL;
+    }
+  }
+  return ret;
+}
+
+static bool ai_stmt_has_table(ObDMLStmt *stmt, const char *tbl)
+{
+  bool hit = (NULL == stmt);
+  for (int64_t i = 0; !hit && i < stmt->get_table_size(); ++i) {
+    const TableItem *ti = stmt->get_table_item(i);
+    if (NULL != ti && 0 == ti->table_name_.case_compare(ObString::make_string(tbl))) {
+      hit = true;
+    }
+  }
+  return hit;
+}
+
+int ob_ai_column_read_replace(const common::ObString &db_name,
+                              const common::ObString &tbl_name,
+                              const common::ObString &col_name,
+                              const common::ObString &cur_db,
+                              ObDMLStmt *stmt,
+                              ObRawExprFactory *expr_factory,
+                              common::ObIAllocator *alloc,
+                              ObQueryCtx *query_ctx,
+                              ObRawExpr *&real_ref_expr,
+                              bool &handled)
+{
+  int ret = OB_SUCCESS;
+  handled = false;
+  UNUSED(cur_db);
+  if (NULL == expr_factory || NULL == alloc || col_name.empty()) {
+  } else {
+    const int64_t total = ob_ai_meta_count();
+    for (int64_t i = 0; OB_SUCC(ret) && !handled && i < total; ++i) {
+      char mdb[AI_NAME_CAP];
+      char mtbl[AI_NAME_CAP];
+      char mcol[AI_NAME_CAP];
+      if (!ai_meta_at(i, mdb, mtbl, mcol)) {
+      } else if (0 != ObString::make_string(mcol).case_compare(col_name)) {
+      } else if (!tbl_name.empty()
+                 && 0 != ObString::make_string(mtbl).case_compare(tbl_name)) {
+      } else if (!db_name.empty()
+                 && 0 != ObString::make_string(mdb).case_compare(db_name)) {
+      } else if (!ai_stmt_has_table(stmt, mtbl)) {
+      } else {
+        ai_set_no_plan_cache(query_ctx);
+        const ObAiColTask *cs = ai_find_col(mdb, mtbl, mcol);
+        if (NULL == cs) {
+        } else if (AI_ST_READY == cs->state_) {
+          char input[AI_VAL_CAP];
+          input[0] = '\0';
+          bool found = false;
+          for (int64_t k = 0; !found && k < g_ai_row_cnt; ++k) {
+            const ObAiRowTask &r = g_ai_rows[k];
+            if (r.used_ && ai_eq(r.db_, mdb) && ai_eq(r.tbl_, mtbl)
+                && ai_eq(r.col_, mcol) && AI_ST_READY == r.state_) {
+              aim_copy(input, sizeof(input), r.input_,
+                       static_cast<int32_t>(strlen(r.input_)));
+              found = true;
+            }
+          }
+          char json[AI_VAL_CAP + 64];
+          ai_make_json(input, json, sizeof(json));
+          const int64_t len = static_cast<int64_t>(strlen(json));
+          char *dup = static_cast<char *>(alloc->alloc(len + 1));
+          ObConstRawExpr *const_expr = NULL;
+          if (OB_ISNULL(dup)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(dup, json, len);
+            dup[len] = '\0';
+            if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+                          *expr_factory, ObVarcharType,
+                          ObString(static_cast<int32_t>(len), dup),
+                          CS_TYPE_UTF8MB4_GENERAL_CI, const_expr))) {
+            } else {
+              real_ref_expr = const_expr;
+              handled = true;
+            }
+          }
+        } else if (AI_ST_PENDING == cs->state_) {
+          if (OB_FAIL(ObRawExprUtils::build_null_expr(*expr_factory, real_ref_expr))) {
+          } else {
+            handled = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
                                          const ParseNode *alias_node,
                                          TableItem *&table_item,
@@ -1590,6 +2545,8 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
   }
   const bool is_ai_col = (0 == strcasecmp(db_buf, "oceanbase")) && (0 == strcasecmp(tbl_buf, "__all_ai_column"));
   bool is_sys_col = (0 == strcasecmp(db_buf, "oceanbase")) && (0 == strcasecmp(tbl_buf, "__all_column"));
+  const bool is_task_tbl = (0 == strcasecmp(db_buf, "oceanbase"))
+                        && (0 == strcasecmp(tbl_buf, "__all_ai_column_task"));
   if (is_sys_col) {
     // 只在同一条语句里已经出现过 __all_ai_column 时才接管，避免影响其它系统查询
     bool seen_ai = false;
@@ -1606,9 +2563,9 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
       is_sys_col = false;
     }
   }
-  if (!is_ai_col && !is_sys_col) {
+  if (!is_ai_col && !is_sys_col && !is_task_tbl) {
     // 不归我们管
-  } else if (ob_ai_meta_count() <= 0) {
+  } else if (ob_ai_meta_count() <= 0 && !is_task_tbl) {
     // 没有登记过 AI 列：保持系统表原样
     if (is_ai_col) {
       handled = true;
@@ -1617,7 +2574,48 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
     }
   } else {
     ObSqlString csv;
-    if (is_ai_col) {
+    if (is_task_tbl) {
+      if (OB_FAIL(csv.append("table_id,column_id,eligible_ts,state,rowkey_predicate,retry_count\n"))) {
+      }
+      int64_t emitted = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < g_ai_row_cnt; ++i) {
+        const ObAiRowTask &t = g_ai_rows[i];
+        if (!t.used_ || AI_ST_PENDING != t.state_) {
+          continue;
+        }
+        ObString t_db_name(static_cast<int32_t>(strlen(t.db_)), t.db_);
+        ObString t_tbl_name(static_cast<int32_t>(strlen(t.tbl_)), t.tbl_);
+        ObString t_col_name(static_cast<int32_t>(strlen(t.col_)), t.col_);
+        const share::schema::ObTableSchema *ts = NULL;
+        const share::schema::ObColumnSchemaV2 *cs = NULL;
+        if (OB_FAIL(schema_checker_->get_table_schema(t_db_name, t_tbl_name, false, ts))
+            || NULL == ts) {
+          ret = OB_SUCCESS;
+          continue;
+        }
+        if (OB_FAIL(schema_checker_->get_column_schema(ts->get_table_id(), t_col_name, cs))
+            || NULL == cs) {
+          ret = OB_SUCCESS;
+          continue;
+        }
+        char tsbuf[40];
+        ai_fmt_datetime(t.touch_us_, tsbuf, sizeof(tsbuf));
+        if (OB_FAIL(csv.append_fmt("%lu,%lu,%s,0,\"%s\",0\n",
+                                   static_cast<uint64_t>(ts->get_table_id()),
+                                   static_cast<uint64_t>(cs->get_column_id()),
+                                   tsbuf,
+                                   t.rowkey_))) {
+        } else {
+          ++emitted;
+        }
+      }
+      // read_csv 生成的值表在 0 行时会走引擎异常路径(4016)，因此无任务时补一条
+      // 全 NULL 哨兵行：它不参与任何 __all_table 连接，对 count(*) 结果无影响
+      if (OB_SUCC(ret) && 0 == emitted) {
+        if (OB_FAIL(csv.append(",,,,,-1\n"))) {
+        }
+      }
+    } else if (is_ai_col) {
       if (OB_FAIL(csv.append("table_id,column_id,column_name,state_column_id,"
                              "request_column_id,result_spec_column_id,normalized_expr,max_retries\n"))) {
       }
@@ -1625,7 +2623,7 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
       if (OB_FAIL(csv.append("table_id,column_id,is_hidden\n"))) {
       }
     }
-    const int64_t total = ob_ai_meta_count();
+    const int64_t total = is_task_tbl ? 0 : ob_ai_meta_count();
     for (int64_t i = 0; OB_SUCC(ret) && i < total; ++i) {
       const char *db = NULL;
       const char *tbl = NULL;

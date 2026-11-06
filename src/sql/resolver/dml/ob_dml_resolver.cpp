@@ -2242,10 +2242,28 @@ void ObDMLResolver::report_user_error_msg(int &ret, const ObRawExpr *root_expr, 
 }
 
 //select resolver has namespace more than one layer, select resolve will overwrite it
+int ob_ai_column_read_replace(const common::ObString &db_name,
+                              const common::ObString &tbl_name,
+                              const common::ObString &col_name,
+                              const common::ObString &cur_db,
+                              ObDMLStmt *stmt,
+                              ObRawExprFactory *expr_factory,
+                              common::ObIAllocator *alloc,
+                              ObQueryCtx *query_ctx,
+                              ObRawExpr *&real_ref_expr,
+                              bool &handled);
+
 int ObDMLResolver::resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(resolve_table_column_expr(q_name, real_ref_expr))) {
+  bool ai_handled = false;
+  if (OB_FAIL(ob_ai_column_read_replace(q_name.database_name_, q_name.tbl_name_,
+                                        q_name.col_name_, common::ObString(),
+                                        get_stmt(), params_.expr_factory_, allocator_,
+                                        params_.query_ctx_, real_ref_expr, ai_handled))) {
+  } else if (ai_handled) {
+    /* AI 列读侧替换为常量，不再解析真实列 */
+  } else if (OB_FAIL(resolve_table_column_expr(q_name, real_ref_expr))) {
     LOG_WARN_IGNORE_COL_NOTFOUND(ret, "resolve table column failed", K(q_name), K(ret));
   }
   return ret;

@@ -200,6 +200,8 @@ int ObSqlTransControl::explicit_end_trans(ObExecContext &exec_ctx, const bool is
                    hint);
 }
 
+int ob_ai_column_end_trans(const void *sess_key, bool is_rollback);
+
 int ObSqlTransControl::end_trans(ObSQLSessionInfo *session,
                                  bool &need_disconnect,
                                  TransState &trans_state,
@@ -284,6 +286,11 @@ int ObSqlTransControl::end_trans(ObSQLSessionInfo *session,
     LOG_INFO("explicit end trans with hint",
              "trans_id", tx_id, "action", (is_rollback ? "ROLLBACK" : "COMMIT"),
              K(ret), K(hint), "session_id", session->get_server_sid());
+  }
+  // 只有显式 commit/rollback 才推进 AI 列状态机：语句级隐式结束事务不能提前
+  // 把 PENDING 转成 READY（事务内的 select 也会走到这里）
+  if (is_explicit && !OB_ISNULL(session)) {
+    (void)ob_ai_column_end_trans(static_cast<const void *>(session), is_rollback);
   }
   return ret;
 }
