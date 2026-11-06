@@ -18,6 +18,9 @@
 #include <sys/select.h>
 #include "observer/omt/ob_ai_service.h"
 #include "share/rc/ob_server_runtime.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_client.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func_utils.h"
 static bool g_ai_internal_file_table = false;
 
 namespace oceanbase
@@ -1594,8 +1597,11 @@ struct ObAiRowTask {
   char col_[AI_NAME_CAP];
   char rowkey_[256];
   char input_[AI_VAL_CAP];
+  char value_[AI_VAL_CAP];
   int state_;
   bool committed_;
+  int64_t retry_count_;
+  int64_t request_id_;
   int64_t touch_us_;
   int64_t col_cnt_;
   ObAiRowVal vals_[AI_ROW_MAX_COLS];
@@ -1630,6 +1636,56 @@ struct ObAiEndTransSnap {
 };
 
 static bool g_ai_write_uncommitted = false;
+static int64_t g_ai_request_seq = 0;
+
+struct ObAiIdCacheEntry {
+  char db_[AI_NAME_CAP];
+  char tbl_[AI_NAME_CAP];
+  char col_[AI_NAME_CAP];
+  int64_t table_id_;
+  int64_t column_id_;
+};
+static const int64_t AI_MAX_ID_CACHE = 64;
+static ObAiIdCacheEntry g_ai_id_cache[AI_MAX_ID_CACHE];
+static int64_t g_ai_id_cache_cnt = 0;
+
+static bool ai_id_eq(const char *a, const char *b)
+{
+  return NULL != a && NULL != b && 0 == strcasecmp(a, b);
+}
+
+static ObAiIdCacheEntry *ai_id_cache_find(const char *db, const char *tbl, const char *col)
+{
+  ObAiIdCacheEntry *hit = NULL;
+  for (int64_t i = 0; NULL == hit && i < g_ai_id_cache_cnt; ++i) {
+    ObAiIdCacheEntry &e = g_ai_id_cache[i];
+    if (ai_id_eq(e.db_, db) && ai_id_eq(e.tbl_, tbl) && ai_id_eq(e.col_, col)) {
+      hit = &e;
+    }
+  }
+  return hit;
+}
+
+static void ai_id_cache_put(const char *db, const char *tbl, const char *col,
+                            int64_t table_id, int64_t column_id)
+{
+  ObAiIdCacheEntry *e = ai_id_cache_find(db, tbl, col);
+  if (NULL == e && g_ai_id_cache_cnt < AI_MAX_ID_CACHE) {
+    e = &g_ai_id_cache[g_ai_id_cache_cnt];
+    ++g_ai_id_cache_cnt;
+    e->db_[0] = 0;
+    e->tbl_[0] = 0;
+    e->col_[0] = 0;
+  }
+  if (NULL != e) {
+    aim_copy(e->db_, sizeof(e->db_), db, static_cast<int32_t>(strlen(db)));
+    aim_copy(e->tbl_, sizeof(e->tbl_), tbl, static_cast<int32_t>(strlen(tbl)));
+    aim_copy(e->col_, sizeof(e->col_), col, static_cast<int32_t>(strlen(col)));
+    e->table_id_ = table_id;
+    e->column_id_ = column_id;
+  }
+}
+
 static ObAiRowTask g_ai_rows[AI_MAX_ROW_TASK];
 static int64_t g_ai_row_cnt = 0;
 static ObAiColTask g_ai_cols_state[AI_MAX_COL_TASK];
@@ -2139,6 +2195,8 @@ static bool ai_tmpl_at(int64_t idx, char *buf, int64_t cap)
 
 static void ai_row_val_put(ObAiRowTask &r, const char *name, const char *val);
 static bool ai_stmt_has_table(ObDMLStmt *stmt, const char *tbl);
+static bool ai_stmt_table_db_matches(ObDMLStmt *stmt, const char *tbl,
+                                     const common::ObString &cur_db, const char *mdb);
 
 static bool ai_pk_name(ObSchemaChecker *sc, const char *db,
                        const char *tbl, char *out, int64_t cap)
@@ -2263,8 +2321,22 @@ static void ai_apply_insert(const char *db, const char *tbl,
           ai_render_input(tmpl, vals, input, sizeof(input));
           ObAiRowTask *t = ai_touch_row(db, tbl, mcol, rowkey);
           if (NULL != t) {
+            int64_t group_rid = 0;
+            for (int64_t k = 0; 0 == group_rid && k < g_ai_row_cnt; ++k) {
+              const ObAiRowTask &other = g_ai_rows[k];
+              if (other.used_ && other.request_id_ > 0 && ai_eq(other.db_, db)
+                  && ai_eq(other.tbl_, tbl) && ai_eq(other.rowkey_, rowkey)) {
+                group_rid = other.request_id_;
+              }
+            }
+            if (0 == group_rid) {
+              group_rid = ++g_ai_request_seq;
+            }
             t->state_ = AI_ST_PENDING;
             t->committed_ = !g_ai_write_uncommitted;
+            t->retry_count_ = 0;
+            t->request_id_ = group_rid;
+            t->value_[0] = 0;
             t->touch_us_ = ai_now_us();
             t->col_cnt_ = 0;
             aim_copy(t->input_, AI_VAL_CAP, input, static_cast<int32_t>(strlen(input)));
@@ -2416,7 +2488,8 @@ static void ai_apply_delete(const char *db, const char *tbl, const ParseNode *wh
 }
 
 // ---- 严格读 / retry：行级取值、STATUS 伪列、连通性探测 ----
-static const int AI_ST_FAILED = 3;
+static const int AI_ST_RETRYING = 3;
+static const int AI_ST_FAILED = 4;
 
 static bool ai_state_ready(int st)
 {
@@ -2428,13 +2501,16 @@ static const char *ai_state_name(int st)
   const char *name = "PENDING";
   if (AI_ST_READY == st) {
     name = "READY";
+  } else if (AI_ST_RETRYING == st) {
+    name = "RETRYING";
   } else if (AI_ST_FAILED == st) {
     name = "FAILED";
   }
   return name;
 }
 
-static bool ai_meta_model_at(const char *col, char *model, int64_t cap)
+static bool ai_meta_model_at(const char *db, const char *tbl, const char *col,
+                             char *model, int64_t cap)
 {
   bool ok = false;
   const int64_t total = ob_ai_meta_count();
@@ -2443,7 +2519,8 @@ static bool ai_meta_model_at(const char *col, char *model, int64_t cap)
     char mdb[AI_NAME_CAP];
     char mtbl[AI_NAME_CAP];
     char mcol[AI_NAME_CAP];
-    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mcol, col)) {
+    if (ai_meta_at(i, mdb, mtbl, mcol) && ai_eq(mdb, db) && ai_eq(mtbl, tbl)
+        && ai_eq(mcol, col)) {
       const char *p = NULL;
       int32_t len = 0;
       if (OB_SUCCESS == ob_ai_meta_get_model(i, p, len)) {
@@ -2480,6 +2557,55 @@ static bool ai_table_ids(ObSchemaChecker *sc, const char *db, const char *tbl,
     }
   }
   return ok;
+}
+
+static bool ai_meta_sysprompt_at(const char *db, const char *tbl, const char *col,
+                                char *buf, int64_t cap)
+{
+  bool ok = false;
+  buf[0] = '\0';
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; !ok && i < total; ++i) {
+    const char *mdb = NULL;
+    const char *mtbl = NULL;
+    const char *mcol = NULL;
+    const char *pexpr = NULL;
+    int32_t a = 0;
+    int32_t b = 0;
+    int32_t c = 0;
+    int32_t d = 0;
+    int64_t mr = 0;
+    int64_t mj = 0;
+    if (OB_SUCCESS == ob_ai_meta_get(i, mdb, a, mtbl, b, mcol, c, pexpr, d, mr, mj)
+        && NULL != mcol && ai_eq(mdb, db) && ai_eq(mtbl, tbl) && ai_eq(mcol, col)) {
+      aim_copy(buf, cap, pexpr, d);
+      ok = ('\0' != buf[0]);
+    }
+  }
+  return ok;
+}
+
+static void ai_meta_max_retries_at(const char *db, const char *tbl, const char *col,
+                                   int64_t &max_retries)
+{
+  max_retries = 0;
+  const int64_t total = ob_ai_meta_count();
+  for (int64_t i = 0; i < total; ++i) {
+    const char *mdb = NULL;
+    const char *mtbl = NULL;
+    const char *mcol = NULL;
+    const char *pexpr = NULL;
+    int32_t a = 0;
+    int32_t b = 0;
+    int32_t c = 0;
+    int32_t d = 0;
+    int64_t mr = 0;
+    int64_t mj = 0;
+    if (OB_SUCCESS == ob_ai_meta_get(i, mdb, a, mtbl, b, mcol, c, pexpr, d, mr, mj)
+        && NULL != mcol && ai_eq(mdb, db) && ai_eq(mtbl, tbl) && ai_eq(mcol, col)) {
+      max_retries = mr;
+    }
+  }
 }
 
 static void ai_rowkey_value(const char *rowkey, char *out, int64_t cap)
@@ -2628,7 +2754,134 @@ static bool ai_model_url(const char *model, char *url, int64_t cap)
   return ok;
 }
 
-// 异步 worker tick：PENDING 行探测 endpoint，结论落到 READY / FAILED
+// ---- worker：真发 HTTP 完成请求（typed system prompt + 重试 + 终态） ----
+static const int64_t AI_MAX_EP_CACHE = 32;
+
+struct ObAiEndpointCache {
+  char model_[AI_NAME_CAP];
+  char url_[512];
+  char key_[256];
+  char provider_[64];
+  char request_model_[128];
+};
+
+static ObAiEndpointCache g_ai_eps[AI_MAX_EP_CACHE];
+static int64_t g_ai_ep_cnt = 0;
+
+static void ai_unescape_json_str(const char *src, int64_t len, char *out, int64_t cap)
+{
+  int64_t pos = 0;
+  int64_t i = 0;
+  int64_t end = len;
+  if (end >= 2 && '"' == src[0] && '"' == src[end - 1]) {
+    i = 1;
+    end -= 1;
+  }
+  for (; i < end && pos < cap - 1; ++i) {
+    if ('\\' == src[i] && i + 1 < end) {
+      ++i;
+      char c = src[i];
+      if ('n' == c) {
+        c = '\n';
+      } else if ('t' == c) {
+        c = '\t';
+      } else if ('r' == c) {
+        c = '\r';
+      }
+      out[pos++] = c;
+    } else {
+      out[pos++] = src[i];
+    }
+  }
+  out[pos] = '\0';
+}
+
+static bool ai_endpoint_get(const char *model, ObAiEndpointCache &ep)
+{
+  bool ok = false;
+  for (int64_t i = 0; !ok && i < g_ai_ep_cnt; ++i) {
+    if (ai_eq(g_ai_eps[i].model_, model)) {
+      ep = g_ai_eps[i];
+      ok = true;
+    }
+  }
+  if (!ok && g_ai_ep_cnt < AI_MAX_EP_CACHE) {
+    omt::ObAiService *ai_service = ::oceanbase::share::server_service<omt::ObAiService>();
+    if (NULL != ai_service) {
+      omt::ObAiServiceGuard guard;
+      const share::ObAiModelEndpointInfo *endpoint = NULL;
+      if (OB_SUCCESS == ai_service->get_ai_service_guard(guard)
+          && OB_SUCCESS == guard.get_ai_endpoint_by_ai_model_name(
+                               ObString(static_cast<int32_t>(strlen(model)), model), endpoint)
+          && NULL != endpoint) {
+        ObArenaAllocator tmp_alloc("ai_worker_ep");
+        ObString key;
+        if (OB_SUCCESS == endpoint->get_unencrypted_access_key(tmp_alloc, key)) {
+          ObAiEndpointCache &slot = g_ai_eps[g_ai_ep_cnt];
+          memset(&slot, 0, sizeof(slot));
+          const ObString &u = endpoint->get_url();
+          const ObString &p = endpoint->get_provider();
+          const ObString &rm = endpoint->get_request_model_name();
+          aim_copy(slot.model_, sizeof(slot.model_), model,
+                   static_cast<int32_t>(strlen(model)));
+          aim_copy(slot.url_, sizeof(slot.url_), u.ptr(), u.length());
+          aim_copy(slot.key_, sizeof(slot.key_), key.ptr(), key.length());
+          aim_copy(slot.provider_, sizeof(slot.provider_), p.ptr(), p.length());
+          aim_copy(slot.request_model_, sizeof(slot.request_model_), rm.ptr(), rm.length());
+          if (slot.request_model_[0] == '\0') {
+            aim_copy(slot.request_model_, sizeof(slot.request_model_), model,
+                     static_cast<int32_t>(strlen(model)));
+          }
+          ++g_ai_ep_cnt;
+          ep = slot;
+          ok = ('\0' != ep.url_[0] && '\0' != ep.key_[0]);
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+// 发一次完成请求，成功时把响应 content 放进 out
+static bool ai_send_completion(const ObAiEndpointCache &ep, const char *system_prompt,
+                               const char *user_text, char *out, int64_t cap)
+{
+  bool ok = false;
+  ObArenaAllocator arena("ai_worker_http");
+  ObAIFuncIComplete *provider = NULL;
+  ObString sys_prompt(static_cast<int32_t>(strlen(system_prompt)), system_prompt);
+  ObString user_prompt(static_cast<int32_t>(strlen(user_text)), user_text);
+  ObString req_model(static_cast<int32_t>(strlen(ep.request_model_)), ep.request_model_);
+  ObString provider_name(static_cast<int32_t>(strlen(ep.provider_)), ep.provider_);
+  if (OB_SUCCESS != ObAIFuncUtils::get_complete_provider(arena, provider_name, provider)
+      || NULL == provider) {
+  } else {
+    ObString api_key(static_cast<int32_t>(strlen(ep.key_)), ep.key_);
+    ObArray<ObString> headers;
+    ObJsonObject *body = NULL;
+    if (OB_SUCCESS == provider->get_header(arena, api_key, headers)
+        && OB_SUCCESS == provider->get_body(arena, req_model, sys_prompt, user_prompt,
+                                            NULL, body)) {
+      ObAIFuncClient client;
+      ObJsonObject *response = NULL;
+      client.set_timeout_sec(3);
+      if (OB_SUCCESS == client.send_post(arena, ObString(static_cast<int32_t>(strlen(ep.url_)), ep.url_),
+                                         headers, body, response)) {
+        ObIJsonBase *content_base = NULL;
+        ObString content_str;
+        if (OB_SUCCESS == provider->parse_output(arena, response, content_base)
+            && NULL != content_base
+            && OB_SUCCESS == ObAIFuncJsonUtils::print_json_to_str(arena, content_base, content_str)) {
+          ai_unescape_json_str(content_str.ptr(), content_str.length(), out, cap);
+          ok = ('\0' != out[0]);
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+// 异步 worker tick：对已提交的 PENDING 行发一次真实请求（每条语句一次尝试）
 static void ai_worker_tick()
 {
   if (0 == g_ai_row_cnt) {
@@ -2636,20 +2889,33 @@ static void ai_worker_tick()
   }
   for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
     ObAiRowTask &r = g_ai_rows[i];
-    if (!r.used_ || AI_ST_PENDING != r.state_ || !r.committed_) {
+    if (!r.used_ || (AI_ST_PENDING != r.state_ && AI_ST_RETRYING != r.state_)
+        || !r.committed_) {
       continue;
     }
     char model[AI_NAME_CAP];
-    char url[512];
-    char host[192];
-    int32_t port = 0;
-    bool reachable = false;
-    if (ai_meta_model_at(r.col_, model, sizeof(model))
-        && ai_model_url(model, url, sizeof(url))
-        && ai_parse_url(url, host, sizeof(host), port)) {
-      reachable = ai_tcp_probe(host, port);
+    char sys_prompt[AI_VAL_CAP];
+    char value[AI_VAL_CAP];
+    int64_t max_retries = 0;
+    value[0] = '\0';
+    bool ok = false;
+    if (!ai_meta_model_at(r.db_, r.tbl_, r.col_, model, sizeof(model))
+        || !ai_meta_sysprompt_at(r.db_, r.tbl_, r.col_, sys_prompt, sizeof(sys_prompt))) {
+      r.state_ = AI_ST_FAILED;
+    } else {
+      ai_meta_max_retries_at(r.db_, r.tbl_, r.col_, max_retries);
+      ObAiEndpointCache ep;
+      ok = ai_endpoint_get(model, ep)
+           && ai_send_completion(ep, sys_prompt, r.input_, value, sizeof(value));
+      if (ok) {
+        r.state_ = AI_ST_READY;
+        r.retry_count_ = 0;
+        aim_copy(r.value_, sizeof(r.value_), value, static_cast<int32_t>(strlen(value)));
+      } else {
+        ++r.retry_count_;
+        r.state_ = (r.retry_count_ > max_retries) ? AI_ST_FAILED : AI_ST_RETRYING;
+      }
     }
-    r.state_ = reachable ? AI_ST_READY : AI_ST_FAILED;
     r.touch_us_ = ai_now_us();
     ai_set_col_state(r.db_, r.tbl_, r.col_);
   }
@@ -2904,7 +3170,6 @@ int ob_ai_column_plan_read(const common::ObString &db_name,
                            ObAiReadPlan &plan)
 {
   int ret = OB_SUCCESS;
-  UNUSED(cur_db);
   ob_ai_column_plan_reset(plan);
   if (col_name.empty()) {
   } else {
@@ -2920,6 +3185,7 @@ int ob_ai_column_plan_read(const common::ObString &db_name,
       } else if (!db_name.empty()
                  && 0 != ObString::make_string(mdb).case_compare(db_name)) {
       } else if (!ai_stmt_has_table(stmt, mtbl)) {
+      } else if (!ai_stmt_table_db_matches(stmt, mtbl, cur_db, mdb)) {
       } else {
         plan.matched_ = true;
         aim_copy(plan.tbl_, sizeof(plan.tbl_), mtbl, static_cast<int32_t>(strlen(mtbl)));
@@ -2944,7 +3210,8 @@ int ob_ai_column_plan_read(const common::ObString &db_name,
             row.state_ = r.state_;
             row.json_[0] = '\0';
             if (ai_state_ready(r.state_)) {
-              ai_make_json(r.input_, row.json_, sizeof(row.json_));
+              aim_copy(row.json_, sizeof(row.json_), r.value_,
+                       static_cast<int32_t>(strlen(r.value_)));
               if (0 == plan.row_cnt_) {
                 aim_copy(plan.first_json_, sizeof(plan.first_json_), row.json_,
                          static_cast<int32_t>(strlen(row.json_)));
@@ -3105,20 +3372,10 @@ int ob_ai_column_end_trans(const void *sess_key, bool is_rollback)
       s->key_ = NULL;
     }
   } else {
-    const int64_t now_us = ai_now_us();
     for (int64_t i = 0; i < g_ai_row_cnt; ++i) {
       if (g_ai_rows[i].used_) {
+        /* 提交后只标记可见；真正的取值由 worker 发请求后写入 */
         g_ai_rows[i].committed_ = true;
-        if (AI_ST_PENDING == g_ai_rows[i].state_) {
-          g_ai_rows[i].state_ = AI_ST_READY;
-          g_ai_rows[i].touch_us_ = now_us;
-        }
-      }
-    }
-    for (int64_t i = 0; i < g_ai_col_state_cnt; ++i) {
-      if (g_ai_cols_state[i].used_ && AI_ST_PENDING == g_ai_cols_state[i].state_) {
-        g_ai_cols_state[i].state_ = AI_ST_READY;
-        g_ai_cols_state[i].touch_us_ = now_us;
       }
     }
     if (NULL != s) {
@@ -3127,6 +3384,36 @@ int ob_ai_column_end_trans(const void *sess_key, bool is_rollback)
     }
   }
   return ret;
+}
+
+static bool ai_stmt_table_db(ObDMLStmt *stmt, const char *tbl,
+                             char *db_out, int64_t cap)
+{
+  bool hit = false;
+  db_out[0] = '\0';
+  for (int64_t i = 0; NULL != stmt && !hit && i < stmt->get_table_size(); ++i) {
+    const TableItem *ti = stmt->get_table_item(i);
+    if (NULL != ti
+        && (0 == ti->table_name_.case_compare(ObString::make_string(tbl))
+            || 0 == ti->alias_name_.case_compare(ObString::make_string(tbl)))) {
+      aim_copy(db_out, cap, ti->database_name_.ptr(), ti->database_name_.length());
+      hit = true;
+    }
+  }
+  return hit;
+}
+
+// 读侧必须按 (db, tbl, col) 三元组命中：优先用语句里该表的库名，
+// 缺失时退回会话默认库，再与登记项比较
+static bool ai_stmt_table_db_matches(ObDMLStmt *stmt, const char *tbl,
+                                     const common::ObString &cur_db, const char *mdb)
+{
+  char stmt_db[AI_NAME_CAP];
+  const bool found = ai_stmt_table_db(stmt, tbl, stmt_db, sizeof(stmt_db));
+  if ('\0' == stmt_db[0]) {
+    aim_copy(stmt_db, sizeof(stmt_db), cur_db.ptr(), cur_db.length());
+  }
+  return found && '\0' != stmt_db[0] && ai_eq(stmt_db, mdb);
 }
 
 static bool ai_stmt_has_table(ObDMLStmt *stmt, const char *tbl)
@@ -3207,12 +3494,12 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
   } else {
     ObSqlString csv;
     if (is_task_tbl) {
-      if (OB_FAIL(csv.append("table_id,column_id,eligible_ts,state,rowkey_predicate,retry_count\n"))) {
+      if (OB_FAIL(csv.append("table_id,column_id,eligible_ts,state,rowkey_predicate,retry_count,request_id\n"))) {
       }
       int64_t emitted = 0;
       for (int64_t i = 0; OB_SUCC(ret) && i < g_ai_row_cnt; ++i) {
         const ObAiRowTask &t = g_ai_rows[i];
-        if (!t.used_ || AI_ST_PENDING != t.state_) {
+        if (!t.used_ || (AI_ST_PENDING != t.state_ && AI_ST_RETRYING != t.state_)) {
           continue;
         }
         ObString t_db_name(static_cast<int32_t>(strlen(t.db_)), t.db_);
@@ -3220,23 +3507,38 @@ int ObDMLResolver::resolve_ai_meta_table(const ParseNode &table_node,
         ObString t_col_name(static_cast<int32_t>(strlen(t.col_)), t.col_);
         const share::schema::ObTableSchema *ts = NULL;
         const share::schema::ObColumnSchemaV2 *cs = NULL;
-        if (OB_FAIL(schema_checker_->get_table_schema(t_db_name, t_tbl_name, false, ts))
-            || NULL == ts) {
-          ret = OB_SUCCESS;
+        int64_t table_id = 0;
+        int64_t column_id = 0;
+        if (OB_SUCCESS == schema_checker_->get_table_schema(t_db_name, t_tbl_name, false, ts)
+            && NULL != ts) {
+          table_id = static_cast<int64_t>(ts->get_table_id());
+          if (OB_SUCCESS == schema_checker_->get_column_schema(ts->get_table_id(), t_col_name, cs)
+              && NULL != cs) {
+            column_id = static_cast<int64_t>(cs->get_column_id());
+          }
+        }
+        if (0 == table_id || 0 == column_id) {
+          /* 事务里的 schema guard 可能看不到新表：退回登记时缓存的 id */
+          const ObAiIdCacheEntry *cached = ai_id_cache_find(t.db_, t.tbl_, t.col_);
+          if (NULL != cached) {
+            table_id = cached->table_id_;
+            column_id = cached->column_id_;
+          }
+        }
+        if (0 == table_id || 0 == column_id) {
           continue;
         }
-        if (OB_FAIL(schema_checker_->get_column_schema(ts->get_table_id(), t_col_name, cs))
-            || NULL == cs) {
-          ret = OB_SUCCESS;
-          continue;
-        }
+        ai_id_cache_put(t.db_, t.tbl_, t.col_, table_id, column_id);
         char tsbuf[40];
         ai_fmt_datetime(t.touch_us_, tsbuf, sizeof(tsbuf));
-        if (OB_FAIL(csv.append_fmt("%lu,%lu,%s,0,\"%s\",0\n",
-                                   static_cast<uint64_t>(ts->get_table_id()),
-                                   static_cast<uint64_t>(cs->get_column_id()),
+        if (OB_FAIL(csv.append_fmt("%lu,%lu,%s,%ld,\"%s\",%ld,%ld\n",
+                                   static_cast<uint64_t>(table_id),
+                                   static_cast<uint64_t>(column_id),
                                    tsbuf,
-                                   t.rowkey_))) {
+                                   static_cast<int64_t>(t.state_),
+                                   t.rowkey_,
+                                   t.retry_count_,
+                                   t.request_id_))) {
         } else {
           ++emitted;
         }

@@ -2337,10 +2337,11 @@ int ObDMLResolver::resolve_ai_column_expr(const ObQualifiedName &q_name,
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(session_info_->get_sys_variable_by_name(var_name, var_obj))) {
   } else if (FALSE_IT(strict_read = var_obj.get_bool())) {
-  } else if (OB_FAIL(ob_ai_column_plan_read(q_name.database_name_, q_name.tbl_name_,
-                                            q_name.col_name_, common::ObString(),
-                                            get_stmt(), schema_checker_,
-                                            strict_read, plan))) {
+  } else if (OB_FAIL(ob_ai_column_plan_read(
+               q_name.database_name_, q_name.tbl_name_, q_name.col_name_,
+               (NULL != session_info_) ? session_info_->get_database_name()
+                                       : common::ObString(),
+               get_stmt(), schema_checker_, strict_read, plan))) {
   }
   if (OB_FAIL(ret)) {
   } else if (plan.strict_error_) {

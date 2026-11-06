@@ -2026,7 +2026,8 @@ static void ai_build_template(const ParseNode *call, char *buf, int64_t cap)
 static int ai_register(const char *db, int32_t db_len,
                        const char *tbl, int32_t tbl_len,
                        const char *col, int32_t col_len,
-                       const ParseNode *attr, int32_t vector_dim, int32_t is_json)
+                       const ParseNode *attr, int32_t vector_dim, int32_t is_json,
+                       int32_t is_int_col)
 {
   int ret = OB_SUCCESS;
   char db_buf[130];
@@ -2107,6 +2108,9 @@ static int ai_register(const char *db, int32_t db_len,
         if (is_json) {
           snprintf(m.normalized_expr_, sizeof(m.normalized_expr_),
                    "Return exactly one valid JSON value (ai column %s)", col_buf);
+        } else if (is_int_col) {
+          snprintf(m.normalized_expr_, sizeof(m.normalized_expr_),
+                   "Return exactly one base-10 integer (ai column %s)", col_buf);
         } else {
           snprintf(m.normalized_expr_, sizeof(m.normalized_expr_), "ai column %s", col_buf);
         }
@@ -2177,7 +2181,8 @@ int ob_ddl_resolve_ai_column_attr(share::schema::ObColumnSchemaV2 &column,
     if (OB_FAIL(ai_register(db_name.ptr(), db_name.length(),
                             table_name.ptr(), table_name.length(),
                             col_name.ptr(), col_name.length(),
-                            ai_attr, vector_dim, is_json))) {
+                            ai_attr, vector_dim, is_json,
+                            (ob_is_integer_type(column.get_data_type()) ? 1 : 0)))) {
       SQL_RESV_LOG(WARN, "fail to register ai column", K(ret), K(db_name),
                    K(table_name), K(col_name), K(vector_dim), K(is_json));
     }
