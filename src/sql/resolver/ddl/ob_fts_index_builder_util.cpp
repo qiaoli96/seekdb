@@ -25,6 +25,7 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
+#include "lib/cpu/ob_cpu_topology.h"
 
 namespace oceanbase
 {
@@ -1031,6 +1032,9 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
   return ret;
 }
 
+// Upper bound of the DDL degree of parallelism derived for fulltext index builds.
+static constexpr int64_t FTS_DDL_MAX_PARALLELISM = 2;
+
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,
     const int64_t original_parallelism,
@@ -1060,7 +1064,27 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = 1;
         break;
     }
+    // The DDL statement did not ask for any parallelism (the index schema dop
+    // defaults to 1 and no PARALLEL clause / hint was given), while the fulltext
+    // index build is CPU bound: derive a degree of parallelism from the machine
+    // instead of falling back to a single thread.  On a single core machine this
+    // keeps the previous behaviour exactly.
+    if (OB_SUCC(ret) && original_parallelism <= 1) {
+      switch (index_type) {
+        case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
+        case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+        case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
+        case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL: {
+          const int64_t cpu_cnt = common::get_cpu_count();
+          decided_parallelism = MAX(1, MIN(cpu_cnt, FTS_DDL_MAX_PARALLELISM));
+          break;
+        }
+        default:
+          break;
+      }
+    }
   }
+  LOG_INFO("decide ddl parallelism for fts", K(index_type), K(original_parallelism), K(decided_parallelism));
   return ret;
 }
 
