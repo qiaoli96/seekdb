@@ -596,7 +596,9 @@ static int glob_paths(const char *pattern, ObIAllocator &alloc, ObIArray<ObStrin
     } else {
       struct dirent *ent = NULL;
       while (OB_SUCC(ret) && NULL != (ent = readdir(dp))) {
-        if (0 == strcmp(ent->d_name, ".") || 0 == strcmp(ent->d_name, "..")) { continue; }
+        // 与 POSIX glob 语义一致：不匹配以 "." 开头的隐藏文件（如 macOS 的 ._xxx）
+        if (0 == strcmp(ent->d_name, ".") || 0 == strcmp(ent->d_name, "..")
+            || '.' == ent->d_name[0]) { continue; }
         ObSqlString full;
         if (OB_FAIL(full.append(dir.ptr(), dir.length()))) {
         } else if (OB_FAIL(full.append("/"))) {
