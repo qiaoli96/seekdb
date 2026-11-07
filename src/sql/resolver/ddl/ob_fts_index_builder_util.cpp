@@ -1033,7 +1033,7 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
 }
 
 // Upper bound of the DDL degree of parallelism derived for fulltext index builds.
-static constexpr int64_t FTS_DDL_MAX_PARALLELISM = 2;
+static constexpr int64_t FTS_DDL_MAX_PARALLELISM = 4;
 
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,

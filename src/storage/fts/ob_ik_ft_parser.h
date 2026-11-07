@@ -46,7 +46,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        own_dicts_(true)
   {
   }
 
@@ -106,6 +107,8 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  // false when the dictionaries are borrowed from ObFTParseData's process wide cache
+  bool own_dicts_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

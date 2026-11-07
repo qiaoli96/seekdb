@@ -18,6 +18,7 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/lock/ob_mutex.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
@@ -39,6 +40,9 @@ namespace storage
 class ObStopWordChecker;
 class ObFTDictHub;
 class ObAddWord;
+class ObIFTDict;
+class ObFTCacheRangeContainer;
+class ObFTDictDesc;
 
 #define FTS_BUILD_IN_PARSER_LIST                                                                   \
   FT_PARSER_TYPE(FTP_SPACE, space)                                                                 \
@@ -120,15 +124,36 @@ public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
   int get_dict_hub(ObFTDictHub *&hub);
 
+  /**
+   * The IK dictionaries are immutable once built and the dictionary system
+   * tables are no longer reloaded at runtime, so build them once per process
+   * instead of once per tokenize call: rebuilding them for every row costs
+   * three dictionary cache lookups plus three dictionary objects.
+   */
+  int get_ik_dicts(ObIFTDict *&main_dict, ObIFTDict *&quan_dict, ObIFTDict *&stop_dict);
+
 private:
   int init_and_set_stopword_list();
   int init_dict_hub();
+  int load_or_build_dict_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
+  int build_ik_dicts();
 
 private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
   common::ObFIFOAllocator handler_allocator_;
   bool                    is_inited_         = false;
+
+  // IK dictionary cache, see get_ik_dicts(). The range containers must outlive
+  // the dictionaries, which point at them.
+  ObIFTDict *              ik_dict_main_    = nullptr;
+  ObIFTDict *              ik_dict_quan_    = nullptr;
+  ObIFTDict *              ik_dict_stop_    = nullptr;
+  ObFTCacheRangeContainer *ik_cache_main_   = nullptr;
+  ObFTCacheRangeContainer *ik_cache_quan_   = nullptr;
+  ObFTCacheRangeContainer *ik_cache_stop_   = nullptr;
+  lib::ObMutex            ik_dict_lock_;
+  bool                     ik_dicts_inited_ = false;
 };
 
 class ObFTParseHelper final

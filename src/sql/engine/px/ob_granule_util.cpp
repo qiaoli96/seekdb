@@ -31,6 +31,20 @@ namespace oceanbase
 namespace sql
 {
 
+static constexpr int64_t DDL_SPLIT_MIN_DATA_KB = 256;
+
+// Only plans built for an online ddl data build carry a ddl task id, see
+// ObStaticEngineCG: the id is taken from the DDL_TASK_ID hint of an online ddl
+// plan.  Everything else, plain queries included, keeps the default split.
+static bool is_ddl_data_build_plan(ObExecContext &exec_ctx)
+{
+  const ObPhysicalPlanCtx *plan_ctx = exec_ctx.get_physical_plan_ctx();
+  const ObPhysicalPlan *plan = nullptr != plan_ctx ? plan_ctx->get_phy_plan() : nullptr;
+  return nullptr != plan && plan->get_ddl_task_id() > 0;
+}
+
+
+
 
 
 int ObGranuleUtil::use_partition_granule(ObGranulePumpArgs &args, bool &partition_granule)
@@ -220,6 +234,18 @@ int ObGranuleUtil::split_block_granule(ObExecContext &exec_ctx,
     data_plane::ObParallelRangeTaskParams params(config::px_task_size() >> 10);
     params.parallelism_ = parallelism;
     params.expected_task_load_kb_ = tablet_size/1024;
+    // A DDL data build (the plan carries an online ddl task id) scans the real
+    // data through a single text scan, and the task planner below would collapse
+    // it to one task: it takes the tablet's declared size, which is far larger
+    // than the data actually stored, as the expected load of one task.  Derive
+    // that load from the real data size instead for those plans only, so the
+    // build gets one task per worker.  Ordinary query plans never enter here and
+    // keep exactly the previous split, and small builds are left alone.
+    if (is_ddl_data_build_plan(exec_ctx) && parallelism > 1 && total_size >= DDL_SPLIT_MIN_DATA_KB) {
+      const int64_t per_task_size_kb = MAX(total_size / parallelism, 1L);
+      params.expected_task_load_kb_ = per_task_size_kb;
+      params.min_task_access_size_kb_ = per_task_size_kb;
+    }
     if (OB_FAIL(data_plane::ObParallelRangeTaskPlanner::compute_total_task_count(
         params, total_size, esti_task_cnt_by_data_size))) {
     } else {
