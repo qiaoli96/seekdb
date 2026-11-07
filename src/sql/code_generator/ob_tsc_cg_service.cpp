@@ -3066,6 +3066,20 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
+  if (OB_SUCC(ret) && nullptr != tr_info.match_count_expr_) {
+    // COUNT(*) pushdown: the text retrieval scan itself produces the number of
+    // matching documents, the aggregation above it only sums this value up.
+    if (OB_FAIL(cg_.mark_expr_self_produced(tr_info.match_count_expr_))) {
+    } else if (OB_FAIL(cg_.generate_rt_expr(*tr_info.match_count_expr_,
+                                            text_ir_scan_ctdef.match_count_expr_))) {
+    } else if (OB_ISNULL(text_ir_scan_ctdef.match_count_expr_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(result_output.push_back(text_ir_scan_ctdef.match_count_expr_))) {
+    } else {
+      text_ir_scan_ctdef.has_match_count_agg_ = true;
+    }
+  }
+
   if (OB_SUCC(ret) && tr_info.need_block_max_scan()) {
     bool is_skip_index_valid = false;
     if (OB_FAIL(check_skip_index_validity(tr_info, is_skip_index_valid))) {

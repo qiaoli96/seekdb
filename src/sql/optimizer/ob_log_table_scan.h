@@ -61,6 +61,7 @@ struct ObTextRetrievalInfo
     doc_token_cnt_(NULL),
     avg_doc_token_cnt_(NULL),
     relevance_expr_(NULL),
+    match_count_expr_(NULL),
     column_boost_idx_(-1)
   { }
   ~ObTextRetrievalInfo() {}
@@ -93,6 +94,11 @@ struct ObTextRetrievalInfo
   ObAggFunRawExpr *doc_token_cnt_;  // sum(token_cnt_column) or the number of doc_length_column_
   ObRawExpr *avg_doc_token_cnt_; // avg(token_cnt_column) group by doc_id, average doc length
   ObRawExpr *relevance_expr_; // BM25
+  // Set only when COUNT(*) over the pushed down MATCH predicate is computed by the
+  // text retrieval scan itself: the scan then emits exactly one row whose value of
+  // this pseudo column is the number of matching documents. See
+  // ObLogPlan::prepare_match_count_pushdown for the whitelist.
+  ObRawExpr *match_count_expr_;
   int column_boost_idx_;
 };
 

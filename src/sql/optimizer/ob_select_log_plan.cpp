@@ -4700,6 +4700,7 @@ int ObSelectLogPlan::generate_raw_plan_for_plain_select()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(generate_plan_tree())) {
+  } else if (OB_FAIL(prepare_match_count_pushdown())) {
   } else if (OB_FAIL(allocate_plan_top())) {
   } else {
   }

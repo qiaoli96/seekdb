@@ -1423,6 +1423,7 @@ public:
   common::ObIArray<ObRawExpr *> &get_new_or_quals() { return new_or_quals_; }
 
   int construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogicalOperator *log_op);
+  int prepare_match_count_pushdown();
   int prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                   const ObIArray<ObRawExpr *> &scan_match_filters,
                                   const ObIArray<ObRawExpr *> &all_match_filters,

@@ -105,9 +105,17 @@ public:
   int get_query_max_score(double &score);
 
 private:
+  bool need_match_count_agg() const;
+  int reset_match_count();
+  int project_match_count();
+
   common::ObArenaAllocator engine_allocator_;
   ObIDASTextRetrievalEngine *engine_;
   bool is_inited_;
+  const ObDASIRScanCtDef *ir_ctdef_;
+  ObDASIRScanRtDef *ir_rtdef_;
+  int64_t match_count_;
+  bool match_count_done_;
   DISALLOW_COPY_AND_ASSIGN(ObDASTRMergeIter);
 };
 

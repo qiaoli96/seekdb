@@ -11987,6 +11987,134 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// Rewrite COUNT(*) over a pushed down MATCH predicate so that the text
+// retrieval scan never materializes the matching documents into the SQL layer:
+// the scan accumulates the number of matching documents and emits exactly one
+// row holding it in a pseudo column, and the aggregation above it then consumes
+// that pseudo column with SUM instead of counting rows.
+//
+// Everything that is not exactly this shape keeps the original plan and the
+// original behaviour. The whitelist below has five conditions, all must hold:
+//   1. the projection is exactly one COUNT(*), with no other aggregate function
+//      and no HAVING clause;
+//   2. the only filter of the table scan is MATCH ... AGAINST;
+//   3. the statement has no ORDER BY and no LIMIT / OFFSET;
+//   4. the aggregation is not evaluated in a derived table or a subquery;
+//   5. the scan needs no index back, i.e. it projects no other column.
+int ObLogPlan::prepare_match_count_pushdown()
+{
+  int ret = OB_SUCCESS;
+  ObSelectStmt *select_stmt = nullptr;
+  ObAggFunRawExpr *count_expr = nullptr;
+  ObOpPseudoColumnRawExpr *match_count_expr = nullptr;
+  ObAggFunRawExpr *sum_expr = nullptr;
+  ObSysFunRawExpr *cast_expr = nullptr;
+  bool can_push = !candidates_.candidate_plans_.empty();
+
+  if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(!get_stmt()->is_select_stmt())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(select_stmt = const_cast<ObSelectStmt *>(
+                 static_cast<const ObSelectStmt *>(get_stmt())))) {
+  } else if (!can_push) {
+    // nothing to inspect
+  } else if (!is_final_root_plan()) {
+    can_push = false;  // whitelist 4
+  } else if (0 != select_stmt->get_group_expr_size() || select_stmt->has_rollup()
+             || select_stmt->has_having() || select_stmt->has_order_by()
+             || select_stmt->has_limit() || select_stmt->has_distinct()
+             || select_stmt->has_window_function() || select_stmt->has_for_update()
+             || select_stmt->has_select_into()) {
+    can_push = false;  // whitelist 1 and 3
+  } else if (1 != select_stmt->get_select_item_size()
+             || 1 != select_stmt->get_aggr_items().count()) {
+    can_push = false;  // whitelist 1: exactly one aggregate function
+  } else if (OB_ISNULL(count_expr = select_stmt->get_aggr_items().at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (select_stmt->get_select_item(0).expr_ != count_expr
+             || T_FUN_COUNT != count_expr->get_expr_type()
+             || 0 != count_expr->get_real_param_count()
+             || count_expr->is_param_distinct()) {
+    can_push = false;  // whitelist 1: the projection is exactly COUNT(*)
+  } else {
+    // whitelist 2 and 5: every candidate plan must be the same text retrieval
+    // scan, with the MATCH predicate as its only filter and without index back.
+    for (int64_t i = 0; OB_SUCC(ret) && can_push
+         && i < candidates_.candidate_plans_.count(); ++i) {
+      ObLogicalOperator *plan_tree = candidates_.candidate_plans_.at(i).plan_tree_;
+      if (OB_ISNULL(plan_tree)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (LOG_TABLE_SCAN != plan_tree->get_type() || 0 != plan_tree->get_num_of_child()) {
+        can_push = false;
+      } else {
+        ObLogTableScan *scan = static_cast<ObLogTableScan *>(plan_tree);
+        const ObTextRetrievalInfo &tr_info = scan->get_text_retrieval_info();
+        if (!scan->is_text_retrieval_scan()
+            || OB_ISNULL(tr_info.match_expr_)
+            || OB_ISNULL(tr_info.pushdown_match_filter_)
+            || tr_info.need_sort()
+            || OB_NOT_NULL(tr_info.topk_limit_expr_)
+            || OB_NOT_NULL(tr_info.topk_offset_expr_)
+            || tr_info.with_ties_
+            || !scan->get_filter_exprs().empty()
+            || !scan->get_pushdown_filter_exprs().empty()
+            || scan->get_index_back()
+            || scan->use_index_merge()
+            || scan->is_vec_idx_scan()) {
+          can_push = false;
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && can_push) {
+    ObRawExprFactory *expr_factory = &optimizer_context_.get_expr_factory();
+    ObSQLSessionInfo *session_info = optimizer_context_.get_session_info();
+    ObRawExprResType match_count_res_type;
+    ObSEArray<ObRawExpr *, 1> old_exprs;
+    ObSEArray<ObRawExpr *, 1> new_exprs;
+    match_count_res_type.set_type(ObIntType);
+    match_count_res_type.set_accuracy(ObAccuracy::MAX_ACCURACY[ObIntType]);
+    if (OB_ISNULL(session_info)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(ObRawExprUtils::build_op_pseudo_column_expr(*expr_factory,
+                                                                    T_PSEUDO_COLUMN,
+                                                                    "match_count_expr",
+                                                                    match_count_res_type,
+                                                                    match_count_expr))) {
+    } else if (OB_FAIL(match_count_expr->formalize(session_info))) {
+    } else if (OB_FAIL(expr_factory->create_raw_expr(T_FUN_SUM, sum_expr))) {
+    } else if (OB_FAIL(sum_expr->add_real_param_expr(match_count_expr))) {
+    } else if (OB_FAIL(sum_expr->formalize(session_info))) {
+    } else if (OB_FAIL(ObRawExprUtils::create_cast_expr(*expr_factory,
+                                                        sum_expr,
+                                                        count_expr->get_result_type(),
+                                                        cast_expr,
+                                                        session_info))) {
+    } else if (OB_ISNULL(cast_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(cast_expr->pull_relation_id())) {
+    } else if (OB_FAIL(old_exprs.push_back(count_expr))) {
+    } else if (OB_FAIL(new_exprs.push_back(cast_expr))) {
+    } else {
+      // the expression behind the projection is no longer a COUNT(*), keep the name
+      if (select_stmt->get_select_item(0).alias_name_.empty()) {
+        select_stmt->get_select_item(0).alias_name_ = ObString::make_string("COUNT(*)");
+      }
+      if (OB_FAIL(select_stmt->replace_relation_exprs(old_exprs, new_exprs))) {
+      } else {
+        // replace_relation_exprs does not guarantee to rewrite the aggregate
+        // function list of the statement, make sure it consumes the sum
+        select_stmt->get_aggr_items().at(0) = sum_expr;
+        for (int64_t i = 0; OB_SUCC(ret) && i < candidates_.candidate_plans_.count(); ++i) {
+          static_cast<ObLogTableScan *>(candidates_.candidate_plans_.at(i).plan_tree_)
+              ->get_text_retrieval_info().match_count_expr_ = match_count_expr;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,

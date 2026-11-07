@@ -83,12 +83,19 @@ public:
       avg_doc_len_est_spec_(alloc),
       mode_flag_(NATURAL_LANGUAGE_MODE),
       flags_(0),
+      match_count_expr_(nullptr),
       field_boost_expr_(nullptr) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
   bool need_block_max_scan() const { return has_block_max_scan_; }
   bool need_avg_doc_len_est() const { return has_avg_doc_len_est_ && nullptr != avg_doc_token_cnt_expr_; }
+  // The text retrieval scan is the only producer of the whole-MATCH document
+  // count: when this is set, the scan emits exactly one row whose
+  // match_count_expr_ datum holds the number of matching documents (0 when
+  // nothing matches), and the aggregator above it just sums that value.
+  // See ObTscCgService for the (deliberately narrow) whitelist.
+  bool need_match_count_agg() const { return has_match_count_agg_ && nullptr != match_count_expr_; }
   bool has_pushdown_topk() const { return nullptr != topk_limit_expr_; }
   bool is_block_scan_valid() const
   {
@@ -191,9 +198,11 @@ public:
       uint8_t reserved_ir_scan_flag_:1;
       uint8_t has_block_max_scan_:1;
       uint8_t has_avg_doc_len_est_:1;
-      uint8_t reserved_:3;
+      uint8_t has_match_count_agg_:1;
+      uint8_t reserved_:2;
     };
   };
+  ObExpr *match_count_expr_;
   ObExpr *field_boost_expr_;
 };
 

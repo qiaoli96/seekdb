@@ -325,6 +325,9 @@ int ObLogTableScan::allocate_expr_post(ObAllocExprContext &ctx)
   if (OB_SUCC(ret)) {
     if (!is_plan_root() && OB_FAIL(append(output_exprs_, access_exprs_))) {
     } else if (OB_FAIL(append(output_exprs_, pushdown_aggr_exprs_))) {
+    } else if (nullptr != get_text_retrieval_info().match_count_expr_
+               && OB_FAIL(add_var_to_array_no_dup(output_exprs_,
+                                                  get_text_retrieval_info().match_count_expr_))) {
     } else if (OB_FAIL(ObLogicalOperator::allocate_expr_post(ctx))) {
     } else { /*do nothing*/ }
   }
@@ -2524,6 +2527,8 @@ int ObLogTableScan::get_text_retrieval_calc_exprs(ObTextRetrievalInfo &tr_info,
       && OB_FAIL(all_exprs.push_back(tr_info.topk_limit_expr_))) {
   } else if (nullptr != tr_info.topk_offset_expr_
       && OB_FAIL(all_exprs.push_back(tr_info.topk_offset_expr_))) {
+  } else if (nullptr != tr_info.match_count_expr_
+      && OB_FAIL(all_exprs.push_back(tr_info.match_count_expr_))) {
   }
   return ret;
 }

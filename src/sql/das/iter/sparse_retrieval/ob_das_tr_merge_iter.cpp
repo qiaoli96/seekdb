@@ -21,6 +21,7 @@
 #include <mutex>
 
 #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
+#include "sql/engine/ob_exec_context.h"
 
 namespace oceanbase
 {
@@ -121,12 +122,17 @@ ObDASTRMergeIter::ObDASTRMergeIter()
   : ObDASIter(ObDASIterType::DAS_ITER_TEXT_RETRIEVAL_MERGE),
     engine_allocator_(lib::ObMemAttr("DASRetrieval"), OB_MALLOC_NORMAL_BLOCK_SIZE),
     engine_(nullptr),
-    is_inited_(false)
+    is_inited_(false),
+    ir_ctdef_(nullptr),
+    ir_rtdef_(nullptr),
+    match_count_(0),
+    match_count_done_(false)
 {}
 
 int ObDASTRMergeIter::inner_init(ObDASIterParam &param)
 {
   int ret = OB_SUCCESS;
+  ObDASTRMergeIterParam &merge_param = static_cast<ObDASTRMergeIterParam &>(param);
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
   } else if (OB_UNLIKELY(
@@ -134,9 +140,12 @@ int ObDASTRMergeIter::inner_init(ObDASIterParam &param)
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(create_das_text_retrieval_engine(
       engine_allocator_, engine_))) {
-  } else if (OB_FAIL(engine_->init(
-      static_cast<ObDASTRMergeIterParam &>(param)))) {
+  } else if (OB_FAIL(engine_->init(merge_param))) {
   } else {
+    ir_ctdef_ = merge_param.ir_ctdef_;
+    ir_rtdef_ = merge_param.ir_rtdef_;
+    match_count_ = 0;
+    match_count_done_ = false;
     is_inited_ = true;
   }
   return ret;
@@ -159,6 +168,7 @@ int ObDASTRMergeIter::do_table_scan()
   if (IS_NOT_INIT || OB_ISNULL(engine_)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(engine_->bind_source_tree(children_, children_cnt_))) {
+  } else if (OB_FAIL(reset_match_count())) {
   } else if (OB_FAIL(engine_->do_table_scan())) {
   }
   return ret;
@@ -170,6 +180,7 @@ int ObDASTRMergeIter::inner_reuse()
   if (IS_NOT_INIT || OB_ISNULL(engine_)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(engine_->bind_source_tree(children_, children_cnt_))) {
+  } else if (OB_FAIL(reset_match_count())) {
   } else if (OB_FAIL(engine_->reuse())) {
   }
   return ret;
@@ -181,6 +192,7 @@ int ObDASTRMergeIter::rescan()
   if (IS_NOT_INIT || OB_ISNULL(engine_)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(engine_->bind_source_tree(children_, children_cnt_))) {
+  } else if (OB_FAIL(reset_match_count())) {
   } else if (OB_FAIL(engine_->rescan())) {
   }
   return ret;
@@ -197,10 +209,78 @@ int ObDASTRMergeIter::inner_release()
   return OB_SUCCESS;
 }
 
+bool ObDASTRMergeIter::need_match_count_agg() const
+{
+  return OB_NOT_NULL(ir_ctdef_) && ir_ctdef_->need_match_count_agg();
+}
+
+int ObDASTRMergeIter::reset_match_count()
+{
+  match_count_ = 0;
+  match_count_done_ = false;
+  return OB_SUCCESS;
+}
+
+int ObDASTRMergeIter::project_match_count()
+{
+  int ret = OB_SUCCESS;
+  ObExpr *match_count_expr = nullptr;
+  ObEvalCtx *eval_ctx = nullptr;
+  if (OB_ISNULL(ir_ctdef_) || OB_ISNULL(ir_rtdef_)
+      || OB_ISNULL(match_count_expr = ir_ctdef_->match_count_expr_)
+      || OB_ISNULL(eval_ctx = ir_rtdef_->eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid match count projection context", K(ret));
+  } else {
+    // The scan emits exactly one row, so the value always sits at batch index 0,
+    // and its single requested column is the number of matching documents. Zero
+    // matches still produce this one row so that the sum above stays non-null.
+    ObDatum *datums = nullptr;
+    if (eval_ctx->is_vectorized()) {
+      if (OB_ISNULL(datums = match_count_expr->locate_datums_for_update(*eval_ctx, 1))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to locate the match count datum", K(ret));
+      } else {
+        datums[0].set_int(match_count_);
+      }
+    } else {
+      match_count_expr->locate_datum_for_write(*eval_ctx).set_int(match_count_);
+    }
+    if (OB_SUCC(ret)) {
+      match_count_expr->get_evaluated_flags(*eval_ctx).set(0);
+      match_count_expr->set_evaluated_projected(*eval_ctx);
+    }
+  }
+  return ret;
+}
+
 int ObDASTRMergeIter::inner_get_next_row()
 {
-  return IS_NOT_INIT || OB_ISNULL(engine_)
-      ? OB_NOT_INIT : engine_->get_next_row();
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT || OB_ISNULL(engine_)) {
+    ret = OB_NOT_INIT;
+  } else if (!need_match_count_agg()) {
+    ret = engine_->get_next_row();
+  } else if (match_count_done_) {
+    ret = OB_ITER_END;
+  } else {
+    // The upper aggregation only needs the number of matching documents, so drain
+    // the retrieval engine here instead of materializing the documents.
+    while (OB_SUCC(ret)) {
+      ret = engine_->get_next_row();
+      if (OB_SUCC(ret)) {
+        ++match_count_;
+      }
+    }
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      LOG_WARN("failed to drain the text retrieval iterator", K(ret));
+    } else if (OB_FAIL(project_match_count())) {
+    } else {
+      ret = OB_SUCCESS;
+      match_count_done_ = true;
+    }
+  }
+  return ret;
 }
 
 int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
@@ -209,8 +289,27 @@ int ObDASTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   count = 0;
   if (IS_NOT_INIT || OB_ISNULL(engine_)) {
     ret = OB_NOT_INIT;
-  } else {
+  } else if (!need_match_count_agg()) {
     ret = engine_->get_next_rows(count, capacity);
+  } else if (match_count_done_) {
+    ret = OB_ITER_END;
+  } else {
+    const int64_t batch_capacity = capacity > 0 ? capacity : 1;
+    while (OB_SUCC(ret)) {
+      int64_t batch_count = 0;
+      ret = engine_->get_next_rows(batch_count, batch_capacity);
+      if (batch_count > 0) {
+        match_count_ += batch_count;
+      }
+    }
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      LOG_WARN("failed to drain the text retrieval iterator", K(ret));
+    } else if (OB_FAIL(project_match_count())) {
+    } else {
+      count = 1;
+      ret = OB_SUCCESS;
+      match_count_done_ = true;
+    }
   }
   return ret;
 }
