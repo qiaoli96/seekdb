@@ -100,6 +100,7 @@ protected:
   int fast_fill_merge_array();
   int fast_collect_dims_by_id(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
   int fast_push_item(const ObSRMergeItem &item);
+  bool is_canonical_match_filter() const;
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -121,6 +122,10 @@ protected:
   ObSRMergeItem fast_items_[FAST_MERGE_MAX_DIMS];
   int64_t fast_item_cnt_;
   bool use_fast_merge_;
+  // filter_expr_ is the canonical T_OP_BOOL(<relevance datum>) node, so the whole
+  // predicate is ObExprBool's double path and can be evaluated without the expression
+  // machinery (see filter_on_demand).
+  bool use_inline_match_filter_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

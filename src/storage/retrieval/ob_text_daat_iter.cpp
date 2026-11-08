@@ -40,6 +40,11 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
     // FAST_MERGE_MAX_DIMS of them the generic round runs through ObSimpleRowsMerger,
     // which the fast path replaces one-for-one. Anything else keeps the generic path.
     use_fast_merge_ = (dim_iters_->count() > 0 && dim_iters_->count() <= FAST_MERGE_MAX_DIMS);
+    // Natural language mode only: boolean mode scores through ObFtsEvalNode instead of
+    // the inner product collector, and the query expansion modes rewrite the token set,
+    // so in both the pushed-down filter is not the plain score coercion.
+    use_inline_match_filter_ = (sql::NATURAL_LANGUAGE_MODE == param.mode_flag_)
+                               && is_canonical_match_filter();
     LOG_DEBUG("daat text retrieval fast merge gate", K(use_fast_merge_), "dim_cnt", dim_iters_->count());
   }
   return ret;

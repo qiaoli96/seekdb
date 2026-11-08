@@ -92,7 +92,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     next_round_cnt_(0),
     set_datum_func_(nullptr),
     fast_item_cnt_(0),
-    use_fast_merge_(false)
+    use_fast_merge_(false),
+    use_inline_match_filter_(false)
 {
 }
 
@@ -168,6 +169,7 @@ void ObSRDaaTIterImpl::reset()
   next_round_cnt_ = 0;
   fast_item_cnt_ = 0;
   use_fast_merge_ = false;
+  use_inline_match_filter_ = false;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   is_inited_ = false;
@@ -360,17 +362,82 @@ int ObSRDaaTIterImpl::process_collected_row(const ObDatum &id_datum, const doubl
   return OB_SUCCESS;
 }
 
+// The match filter pushed into the text retrieval scan is, for the ordinary
+// "MATCH(...) AGAINST(...)" predicate, the bool coercion operator applied to the very
+// relevance value this iterator already computed (ObExprBool, T_OP_BOOL). Both sides of
+// that identity have to be checked, because ObRawExprUtils::try_create_bool_expr may
+// hand back the source expression unchanged instead of wrapping it:
+//   * the runtime expression is T_OP_BOOL with exactly one argument,
+//   * that argument is the same ObExpr object the relevance is written into
+//     (relevance_proj_expr_), so the filter cannot depend on any other datum,
+//   * the argument is a double, i.e. ObExprBool dispatches to its double path.
+// Anything else (boolean mode, query expansion, a predicate over more than the score,
+// a non-double score) keeps the generic path.
+bool ObSRDaaTIterImpl::is_canonical_match_filter() const
+{
+  bool bret = false;
+  const ObExpr *filter_expr = nullptr;
+  const ObExpr *relevance_proj_expr = nullptr;
+  if (OB_NOT_NULL(iter_param_)) {
+    filter_expr = iter_param_->filter_expr_;
+    relevance_proj_expr = iter_param_->relevance_proj_expr_;
+  }
+  if (OB_NOT_NULL(filter_expr) && OB_NOT_NULL(relevance_proj_expr)
+      && T_OP_BOOL == filter_expr->type_
+      && 1 == filter_expr->arg_cnt_
+      && OB_NOT_NULL(filter_expr->args_)
+      && filter_expr->args_[0] == relevance_proj_expr
+      && (common::ObDoubleType == relevance_proj_expr->datum_meta_.type_
+          || common::ObUDoubleType == relevance_proj_expr->datum_meta_.type_)) {
+    bret = true;
+  }
+  return bret;
+}
+
 int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevance, bool &need_project)
 {
   int ret = OB_SUCCESS;
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
-  ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
   if (!iter_param_->need_filter()) {
     need_project = true;
+  } else if (OB_UNLIKELY(use_inline_match_filter_)) {
+    // ObExprBool's double path is res = (0 == child) ? 0 : 1, with NULL propagating as
+    // NULL (see the CHECK_IS_TRUE_FUNC_NAME(double_type) expansion). The child here is
+    // the datum written just below, which the iterator itself filled from a plain double,
+    // so it is never NULL and the predicate reduces to the comparison below -- exact for
+    // every value, including -0.0 and NaN (NaN != 0 keeps the row exactly as the generic
+    // eval does). is_valid / should_match_ filtering happens in collect_dims_by_id
+    // before this point and is untouched; offset and limit stay in cache_result.
+    if (eval_ctx->is_vectorized()) {
+      if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        if (!iter_param_->need_project_relevance()) {
+          // nothing downstream rewrites the relevance datum, keep the generic write
+          ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+          guard.set_batch_idx(count);
+          ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+          relevance_proj_datum.set_double(relevance);
+          relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
+          relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+        }
+        need_project = (0 != relevance);
+      }
+    } else if (OB_UNLIKELY(0 != count)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      // the generic path does not evaluate the filter in the non-vectorized case either
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+      guard.set_batch_idx(0);
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(relevance);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
   } else if (eval_ctx->is_vectorized()) {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
     if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -389,6 +456,7 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   } else if (OB_UNLIKELY(0 != count)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
     guard.set_batch_idx(0);
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(relevance);
