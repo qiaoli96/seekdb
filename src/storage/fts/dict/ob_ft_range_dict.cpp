@@ -378,19 +378,26 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+// CS_TYPE_UTF8MB4_BIN 的 collation handler 是 ob_strnncoll_mb_bin：先对 min(len)
+// 做 memcmp，再以长度差决定次序；ObCharset::strcmp 的 ObString 重载对空串给出的
+// 结果与之相同。这里内联同一语义，省掉每次比较的 is_argument_valid() +
+// get_charset() + 间接调用——三者都与比较内容无关。
+static inline int ft_bin_strcmp(const ObString &lhs, const ObString &rhs)
+{
+  const int64_t cmp_len = lhs.length() < rhs.length() ? lhs.length() : rhs.length();
+  const int cmp = cmp_len > 0 ? memcmp(lhs.ptr(), rhs.ptr(), static_cast<size_t>(cmp_len)) : 0;
+  return 0 != cmp
+             ? cmp
+             : (lhs.length() < rhs.length() ? -1 : (lhs.length() > rhs.length() ? 1 : 0));
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
   for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+    if (0 >= ft_bin_strcmp(range_dicts_[i].start_.get_word(), single_word)
+        && 0 <= ft_bin_strcmp(range_dicts_[i].end_.get_word(), single_word)) {
       dict = range_dicts_[i].dict_;
       found = true;
     }
