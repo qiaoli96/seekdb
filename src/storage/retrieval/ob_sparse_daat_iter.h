@@ -95,6 +95,11 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // Fast path: identical k-way doc-id intersection, inline merge state.
+  int fast_do_one_merge_round(int64_t &count);
+  int fast_fill_merge_array();
+  int fast_collect_dims_by_id(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
+  int fast_push_item(const ObSRMergeItem &item);
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -108,6 +113,14 @@ protected:
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
+  // The fast path replaces ObSimpleRowsMerger, whose own boundary is
+  // USE_SIMPLE_MERGER_MAX_TABLE_CNT: at or below it the generic code uses that
+  // merger, above it a loser tree. So this is a drop-in replacement for exactly
+  // the merger it replaces, not a shape specialized for any particular query.
+  static constexpr int64_t FAST_MERGE_MAX_DIMS = ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT;
+  ObSRMergeItem fast_items_[FAST_MERGE_MAX_DIMS];
+  int64_t fast_item_cnt_;
+  bool use_fast_merge_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

@@ -34,6 +34,13 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
   } else {
     mode_flag_ = param.mode_flag_;
     function_lookup_mode_ = param.function_lookup_mode_;
+    // The DAAT text engine is only ever built with one ObTextRetrievalDaaTTokenIter per
+    // query token (ObDASLegacyTRMergeIter::create_dim_iters, daat_mode_), i.e. plain
+    // forward postings cursors: no skip list, no block max. With at most
+    // FAST_MERGE_MAX_DIMS of them the generic round runs through ObSimpleRowsMerger,
+    // which the fast path replaces one-for-one. Anything else keeps the generic path.
+    use_fast_merge_ = (dim_iters_->count() > 0 && dim_iters_->count() <= FAST_MERGE_MAX_DIMS);
+    LOG_DEBUG("daat text retrieval fast merge gate", K(use_fast_merge_), "dim_cnt", dim_iters_->count());
   }
   return ret;
 }

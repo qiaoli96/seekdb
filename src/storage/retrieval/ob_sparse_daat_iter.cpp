@@ -90,7 +90,9 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
-    set_datum_func_(nullptr)
+    set_datum_func_(nullptr),
+    fast_item_cnt_(0),
+    use_fast_merge_(false)
 {
 }
 
@@ -164,6 +166,8 @@ void ObSRDaaTIterImpl::reset()
   buffered_relevances_.reset();
   next_round_iter_idxes_.reset();
   next_round_cnt_ = 0;
+  fast_item_cnt_ = 0;
+  use_fast_merge_ = false;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   is_inited_ = false;
@@ -180,6 +184,7 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
     for (int64_t i = 0; i < next_round_cnt_; ++i) {
       next_round_iter_idxes_[i] = i;
     }
+    fast_item_cnt_ = 0;
   }
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reuse();
@@ -241,8 +246,9 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
     while (OB_SUCC(ret) && count < real_capacity) {
-      if (OB_FAIL(do_one_merge_round(count))) {
-        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      const int merge_ret = use_fast_merge_ ? fast_do_one_merge_round(count) : do_one_merge_round(count);
+      if (OB_FAIL(merge_ret)) {
+        if (OB_UNLIKELY(OB_ITER_END != merge_ret)) {
         }
       }
     }
@@ -452,6 +458,153 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(buffered_relevances_[0]);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+  }
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Fast path for the simple-merger shape.
+//
+// The generic round (fill_merge_heap + collect_dims_by_id) keeps its k-way state in
+// an ObSimpleRowsMerger: a heap-allocated object, reached through virtual push/pop/
+// top/is_unique_champion, whose comparisons go back through iter_ids_->at(). With at
+// most USE_SIMPLE_MERGER_MAX_TABLE_CNT live items that machinery dominates the round.
+//
+// The fast path keeps the assignment of work identical:
+//   * only the dimensions consumed by the previous round advance (next_round_cnt_),
+//   * the live items stay sorted by (doc id, dim index), the same order and the same
+//     ObSRMergeCmp call ObSimpleRowsMerger::push produces,
+//   * equal_with_next_ is maintained exactly as push() does, so a document hit by
+//     several dimensions is consumed as one row,
+//   * a dimension that runs out of postings drops out of the round (not re-pushed),
+//   * rows are consumed front-to-back, i.e. dimensions accumulate in ascending dim
+//     index, which is what keeps the relevance sum bit-identical (double addition is
+//     not associative).
+// Only the data structure changes: a fixed inline array instead of the merger object.
+// filter_on_demand / cache_result / project_results are untouched and shared with the
+// generic path.
+// ---------------------------------------------------------------------------
+int ObSRDaaTIterImpl::fast_push_item(const ObSRMergeItem &item)
+{
+  int ret = OB_SUCCESS;
+  bool equal_with_next = false;
+  if (OB_UNLIKELY(fast_item_cnt_ >= FAST_MERGE_MAX_DIMS)) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (0 == fast_item_cnt_) {
+    fast_items_[0] = item;
+  } else {
+    int64_t cmp_ret = 0;
+    int64_t i = fast_item_cnt_ - 1;
+    for (; OB_SUCC(ret) && i >= 0; --i) {
+      if (OB_FAIL(merge_cmp_.cmp(item, fast_items_[i], cmp_ret))) {
+      } else if (cmp_ret < 0) {
+        fast_items_[i + 1] = fast_items_[i];
+      } else if (0 == cmp_ret) {
+        // same doc id: keep dim index ascending, and remember the run of equal ids
+        if (item.iter_idx_ < fast_items_[i].iter_idx_) {
+          fast_items_[i + 1] = fast_items_[i];
+          equal_with_next = true;
+        } else {
+          fast_items_[i].equal_with_next_ = true;
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      fast_items_[i + 1] = item;
+      if (equal_with_next) {
+        fast_items_[i + 1].equal_with_next_ = true;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ++fast_item_cnt_;
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::fast_fill_merge_array()
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+    const int64_t iter_idx = next_round_iter_idxes_[i];
+    ObISRDaaTDimIter *dim_iter = nullptr;
+    ObSRMergeItem item;
+    if (OB_ISNULL(dim_iter = dim_iters_->at(iter_idx))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(dim_iter->get_next_row())) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      } else {
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+    } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+    } else if (OB_FAIL(fast_push_item(item))) {
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (0 == fast_item_cnt_) {
+    ret = OB_ITER_END;
+  } else {
+    next_round_cnt_ = 0;
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::fast_collect_dims_by_id(const ObDatum *&id_datum, double &relevance, bool &got_valid_id)
+{
+  int ret = OB_SUCCESS;
+  bool curr_doc_end = false;
+  int64_t iter_idx = 0;
+  relevance = 0.0;
+  got_valid_id = false;
+
+  while (OB_SUCC(ret) && fast_item_cnt_ > 0 && !curr_doc_end) {
+    if (!fast_items_[0].equal_with_next_) {
+      // no other dimension carries this doc id, so this is the last item of the row
+      curr_doc_end = true;
+    }
+    iter_idx = fast_items_[0].iter_idx_;
+    if (OB_FAIL(relevance_collector_->collect_one_dim(iter_idx, fast_items_[0].relevance_))) {
+    } else {
+      for (int64_t i = 0; i < fast_item_cnt_ - 1; ++i) {
+        fast_items_[i] = fast_items_[i + 1];
+      }
+      --fast_item_cnt_;
+      next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    id_datum = iter_domain_ids_[iter_idx];
+    if (OB_ISNULL(id_datum)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
+    } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::fast_do_one_merge_round(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  bool need_project = true;
+  double relevance = 0.0;
+  const ObDatum *id_datum = nullptr;
+  if (OB_FAIL(fast_fill_merge_array())) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    }
+  } else if (OB_FAIL(fast_collect_dims_by_id(id_datum, relevance, need_project))) {
+  } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
+  } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
+    if (OB_ITER_END != ret) {
+    }
   }
   return ret;
 }
