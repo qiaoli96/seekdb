@@ -20,6 +20,7 @@
 #include "lib/container/ob_se_array.h"
 #include "query/engine/expr/ob_expr.h"
 #include "ob_block_max_iter.h"
+#include "ob_sparse_retrieval_util.h"
 #include "ob_i_sparse_retrieval_iter.h"
 namespace oceanbase
 {
@@ -157,6 +158,7 @@ private:
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
   bool is_inited_;
+  bool fast_cmp_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
 };
 

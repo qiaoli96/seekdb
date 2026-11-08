@@ -18,6 +18,7 @@
 #define OB_SPARSE_DAAT_ITER_H_
 
 #include "ob_i_sparse_retrieval_iter.h"
+#include "ob_sparse_retrieval_util.h"
 #include "ob_sparse_utils.h"
 #include "storage/access/ob_scan_merge_loser_tree.h"
 #include "storage/access/ob_simple_rows_merger.h"
@@ -58,6 +59,7 @@ private:
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
   bool is_inited_;
+  bool fast_cmp_;
 };
 
 typedef ObSimpleRowsMerger<ObSRMergeItem, ObSRMergeCmp> ObSRSimpleMerger;

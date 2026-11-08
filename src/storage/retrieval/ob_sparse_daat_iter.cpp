@@ -26,7 +26,8 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
-    is_inited_(false)
+    is_inited_(false),
+    fast_cmp_(false)
 {
 }
 
@@ -44,6 +45,7 @@ int ObSRMergeCmp::init(
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      fast_cmp_ = ob_sparse_is_binary_string_id(id_meta.type_, id_meta.cs_type_);
       is_inited_ = true;
     }
   }
@@ -60,8 +62,14 @@ int ObSRMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
+    const ObDatum &lhs_id = get_id_datum(l.iter_idx_);
+    const ObDatum &rhs_id = get_id_datum(r.iter_idx_);
+    if (fast_cmp_ && ob_sparse_is_memcmpable(lhs_id, rhs_id)) {
+      if (OB_FAIL(ob_sparse_memcmp_id(lhs_id, rhs_id, tmp_ret))) {
+      } else {
+        cmp_ret = tmp_ret;
+      }
+    } else if (OB_FAIL(cmp_func_(lhs_id, rhs_id, tmp_ret, nullptr))) {
     } else {
       cmp_ret = tmp_ret;
     }

@@ -65,7 +65,6 @@ private:
       const ObDatum *&min_domain_id_with_pivot,
       const ObDatum *&max_domain_id_without_pivot);
   int project_rows_from_top_k_heap(const int64_t capacity, int64_t &count);
-  int unify_dim_iters_for_next_round();
   int advance_dim_iters_for_next_round(const ObDatum &target_id, const bool iter_end_available);
   void set_next_round_iter_end(const int64_t idx) { next_round_iter_idxes_[idx] = -1; }
   bool is_next_round_iter_end(const int64_t idx) const { return next_round_iter_idxes_[idx] == -1; }
@@ -105,6 +104,11 @@ protected:
   ObDomainIdCmp domain_id_cmp_;
   ObFixedArray<ObDocIdExt, ObIAllocator> id_cache_;
   BMWStatus status_;
+  // Block level pruning is adaptive: once the range probe has rejected no pivot in
+  // this scan it is pure overhead, and scoring a pivot is always sound.
+  int64_t range_probe_cnt_;
+  int64_t range_prune_cnt_;
+  bool skip_range_check_;
 };
 
 

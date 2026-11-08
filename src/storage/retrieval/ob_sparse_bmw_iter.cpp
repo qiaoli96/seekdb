@@ -23,6 +23,8 @@ namespace oceanbase
 {
 namespace storage
 {
+// How many pivots to probe with the block bound before concluding that it never prunes.
+static constexpr int64_t RANGE_PROBE_LIMIT = 64;
 
 ObSRBMWIterImpl::ObSRBMWIterImpl()
   : ObSRDaaTIterImpl(),
@@ -32,7 +34,10 @@ ObSRBMWIterImpl::ObSRBMWIterImpl()
     top_k_count_(0),
     domain_id_cmp_(),
     id_cache_(),
-    status_(BMWStatus::MAX_STATUS)
+    status_(BMWStatus::MAX_STATUS),
+    range_probe_cnt_(0),
+    range_prune_cnt_(0),
+    skip_range_check_(false)
 {}
 
 int ObSRBMWIterImpl::init(
@@ -42,6 +47,9 @@ int ObSRBMWIterImpl::init(
     ObSRDaaTRelevanceCollector &relevance_collector)
 {
   int ret = OB_SUCCESS;
+  range_probe_cnt_ = 0;
+  range_prune_cnt_ = 0;
+  skip_range_check_ = false;
   if (OB_FAIL(ObSRDaaTIterImpl::init(iter_param, dim_iters, iter_allocator, relevance_collector))) {
   } else if (OB_UNLIKELY(iter_param.topk_limit_ < 0)) {
     ret = OB_INVALID_ARGUMENT;
@@ -70,6 +78,9 @@ void ObSRBMWIterImpl::reuse(const bool switch_tablet)
     top_k_heap_.pop();
   }
   status_ = BMWStatus::MAX_STATUS;
+  range_probe_cnt_ = 0;
+  range_prune_cnt_ = 0;
+  skip_range_check_ = false;
   ObSRDaaTIterImpl::reuse(switch_tablet);
 }
 
@@ -371,19 +382,85 @@ int ObSRBMWIterImpl::next_pivot_range(int64_t &skip_range_cnt)
 int ObSRBMWIterImpl::evaluate_pivot(const int64_t pivot_iter_idx)
 {
   int ret = OB_SUCCESS;
-  ObISRDimBlockMaxIter *iter = get_iter(pivot_iter_idx);
+  ObISRDimBlockMaxIter *pivot_iter = get_iter(pivot_iter_idx);
   const ObDatum *pivot_id = nullptr;
-  const ObDatum *collected_id = nullptr;
+  const ObDatum *matched_id = nullptr;
   double pivot_relevance = 0.0;
-  bool need_project = false;
-  if (OB_ISNULL(iter)) {
+  bool got_valid_id = false;
+  int64_t matched_cnt = 0;
+  ObSRMergeItem item;
+  if (OB_ISNULL(pivot_iter)) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(iter->get_curr_id(pivot_id))) {
-  } else if (OB_FAIL(advance_dim_iters_for_next_round(*pivot_id, true))) {
-  } else if (OB_FAIL(collect_dims_by_id(collected_id, pivot_relevance, need_project))) {
-  } else if (OB_FAIL(unify_dim_iters_for_next_round())) {
-  } else if (OB_FAIL(fill_merge_heap())) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+  } else if (OB_FAIL(pivot_iter->get_curr_id(pivot_id))) {
+  } else if (OB_ISNULL(pivot_id)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // Advance every dimension of this round onto the pivot id and split them in one pass: the
+    // dimensions that hold the pivot document are scored here, the ones that moved past it go
+    // back to the merge heap.  Same work as advance -> push -> pop -> push, without the heap
+    // round trips in the middle.
+    for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t iter_idx = next_round_iter_idxes_[i];
+      ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
+      const ObDatum *curr_id = nullptr;
+      int cmp_ret = 0;
+      if (is_next_round_iter_end(i)) {
+        // this dimension was already exhausted by the range probe
+      } else if (OB_ISNULL(iter)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(iter->advance_to(*pivot_id))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        } else {
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(iter->get_curr_id(curr_id))) {
+      } else if (FALSE_IT(iter_domain_ids_[iter_idx] = curr_id)) {
+      } else if (OB_FAIL(domain_id_cmp_.compare(*curr_id, *pivot_id, cmp_ret))) {
+      } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
+      } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+      } else if (0 == cmp_ret) {
+        if (OB_FAIL(relevance_collector_->collect_one_dim(iter_idx, item.relevance_))) {
+        } else if (FALSE_IT(matched_id = curr_id)) {
+        } else if (FALSE_IT(next_round_iter_idxes_[matched_cnt++] = iter_idx)) {
+        }
+      } else if (OB_FAIL(merge_heap_->push(item))) {
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (merge_heap_->empty() && 0 == matched_cnt) {
+      ret = OB_ITER_END;
+    } else if (!merge_heap_->empty() && OB_FAIL(merge_heap_->rebuild())) {
+    } else if (OB_FAIL(relevance_collector_->get_result(pivot_relevance, got_valid_id))) {
+    } else if (got_valid_id && nullptr != matched_id) {
+      if (OB_FAIL(process_collected_row(*matched_id, pivot_relevance))) {
+      }
+    }
+
+    // move the dimensions that contributed to this document one row forward
+    for (int64_t i = 0; OB_SUCC(ret) && i < matched_cnt; ++i) {
+      const int64_t iter_idx = next_round_iter_idxes_[i];
+      ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
+      if (OB_ISNULL(iter)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(iter->get_next_row())) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        } else {
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
+      } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
+      } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+      } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+      } else if (OB_FAIL(merge_heap_->push(item))) {
+      }
+    }
+    next_round_cnt_ = 0;
+
+    if (OB_FAIL(ret)) {
+    } else if (merge_heap_->empty()) {
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(merge_heap_->rebuild())) {
     }
   }
 
@@ -393,34 +470,46 @@ int ObSRBMWIterImpl::evaluate_pivot(const int64_t pivot_iter_idx)
 int ObSRBMWIterImpl::evaluate_pivot_range(const int64_t pivot_iter_idx, bool &is_candidate)
 {
   int ret = OB_SUCCESS;
-  ObISRDimBlockMaxIter *iter = get_iter(pivot_iter_idx);
   const ObDatum *pivot_id = nullptr;
-  if (OB_ISNULL(iter)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(iter->get_curr_id(pivot_id))) {
-  }
-
   double block_max_score = 0.0;
-  const ObMaxScoreTuple *max_score_tuple = nullptr;
-  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
-    ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
-    if (OB_ISNULL(iter) || OB_UNLIKELY(is_next_round_iter_end(i))) {
+  // Scoring a pivot is always sound: an extra exact evaluation can only raise the top k
+  // threshold, it can never change which ids end up in the top k set.  So once the block
+  // bound has stopped rejecting pivots the probe is pure overhead and can be dropped.
+  is_candidate = true;
+  if (!skip_range_check_) {
+    ObISRDimBlockMaxIter *pivot_iter = get_iter(pivot_iter_idx);
+    if (OB_ISNULL(pivot_iter)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(iter->advance_shallow(*pivot_id, true))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      } else {
-        set_next_round_iter_end(i);
-        ret = OB_SUCCESS;
-      }
-    } else if (OB_FAIL(iter->get_curr_block_max_info(max_score_tuple))) {
-    } else {
-      block_max_score += max_score_tuple->max_score_;
+    } else if (OB_FAIL(pivot_iter->get_curr_id(pivot_id))) {
     }
-  }
 
-  if (OB_SUCC(ret)) {
-    is_candidate = block_max_score > get_top_k_threshold();
+    const ObMaxScoreTuple *max_score_tuple = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t iter_idx = next_round_iter_idxes_[i];
+      ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
+      if (OB_ISNULL(iter) || OB_UNLIKELY(is_next_round_iter_end(i))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(iter->advance_shallow(*pivot_id, true))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        } else {
+          set_next_round_iter_end(i);
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(iter->get_curr_block_max_info(max_score_tuple))) {
+      } else {
+        block_max_score += max_score_tuple->max_score_;
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      is_candidate = block_max_score > get_top_k_threshold();
+      ++range_probe_cnt_;
+      if (!is_candidate) {
+        ++range_prune_cnt_;
+      } else if (0 == range_prune_cnt_ && range_probe_cnt_ >= RANGE_PROBE_LIMIT) {
+        skip_range_check_ = true;
+      }
+    }
   }
 
   LOG_DEBUG("[Sparse Retrieval] BMW evaluate pivot range", K(ret),
@@ -583,27 +672,6 @@ int ObSRBMWIterImpl::project_rows_from_top_k_heap(const int64_t capacity, int64_
       }
     }
   }
-  return ret;
-}
-
-int ObSRBMWIterImpl::unify_dim_iters_for_next_round()
-{
-  int ret = OB_SUCCESS;
-
-  ObDatum *curr_domain_id = nullptr;
-  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
-    ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
-    const ObDatum *curr_domain_id = nullptr;
-    if (OB_ISNULL(iter)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (!iter->in_shallow_status()) {
-      // skip
-    } else if (OB_FAIL(iter->get_curr_id(curr_domain_id))) {
-    } else if (OB_FAIL(iter->advance_to(*curr_domain_id))) {
-    }
-  }
-
   return ret;
 }
 

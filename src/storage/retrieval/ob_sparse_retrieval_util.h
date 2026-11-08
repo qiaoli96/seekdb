@@ -18,6 +18,7 @@
 #define OB_SPARSE_RETRIEVAL_UTIL_H_
 
 #include "common/datum/ob_datum.h"
+#include "lib/charset/ob_charset.h"
 #include "share/datum/ob_datum_funcs.h"
 
 namespace oceanbase
@@ -25,16 +26,53 @@ namespace oceanbase
 namespace storage
 {
 
+// The domain id of an inverted index row is an opaque binary key stored in a column
+// whose collation lives in the binary charset, where comparison is byte-wise.  For an
+// equal length pair the order is therefore exactly memcmp order, so the generic
+// collation dispatch (per call argument validation plus charset lookup) is skipped.
+// Anything else -- null, min/max, different lengths, non binary collation -- keeps
+// using the collation function, so the result is bit identical to the old path.
+inline bool ob_sparse_is_binary_string_id(
+    const common::ObObjType type, const common::ObCollationType cs_type)
+{
+  return ob_is_string_type(type) && common::CS_TYPE_INVALID != cs_type
+      && common::CHARSET_BINARY == ObCharset::charset_type_by_coll(cs_type);
+}
+
+inline bool ob_sparse_is_memcmpable(const common::ObDatum &lhs, const common::ObDatum &rhs)
+{
+  return !lhs.is_null() && !rhs.is_null() && !lhs.is_ext() && !rhs.is_ext()
+      && lhs.len_ == rhs.len_;
+}
+
+inline int ob_sparse_memcmp_id(
+    const common::ObDatum &lhs, const common::ObDatum &rhs, int &cmp_ret)
+{
+  int ret = OB_SUCCESS;
+  cmp_ret = 0;
+  if (0 == lhs.len_) {
+    // both are empty, equal
+  } else if (OB_ISNULL(lhs.ptr_) || OB_ISNULL(rhs.ptr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "unexpected null domain id pointer", K(ret), KP(lhs.ptr_), KP(rhs.ptr_));
+  } else {
+    const int cmp = MEMCMP(lhs.ptr_, rhs.ptr_, lhs.len_);
+    cmp_ret = cmp < 0 ? -1 : (cmp > 0 ? 1 : 0);
+  }
+  return ret;
+}
+
 class ObDomainIdCmp
 {
 public:
-  ObDomainIdCmp() : cmp_func_(nullptr) {}
+  ObDomainIdCmp() : cmp_func_(nullptr), fast_cmp_(false) {}
   ~ObDomainIdCmp() {}
   inline int init(const ObObjMeta &obj_meta);
   inline int compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret) const;
-  inline void reset() { cmp_func_ = nullptr; }
+  inline void reset() { cmp_func_ = nullptr; fast_cmp_ = false; }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  bool fast_cmp_;
   DISALLOW_COPY_AND_ASSIGN(ObDomainIdCmp);
 };
 
@@ -52,6 +90,7 @@ int ObDomainIdCmp::init(const ObObjMeta &obj_meta)
       STORAGE_LOG(WARN,"failed to get basic functions", K(ret), K(obj_meta));
     } else {
       cmp_func_ = id_basic_funcs->null_first_cmp_;
+      fast_cmp_ = ob_sparse_is_binary_string_id(obj_meta.get_type(), obj_meta.get_collation_type());
     }
   }
   return ret;
@@ -67,6 +106,8 @@ int ObDomainIdCmp::compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret)
   if (OB_UNLIKELY(nullptr == cmp_func_)) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN,"not init", K(ret));
+  } else if (fast_cmp_ && ob_sparse_is_memcmpable(lhs, rhs)) {
+    ret = ob_sparse_memcmp_id(lhs, rhs, cmp_ret);
   } else if (lhs.is_ext() || rhs.is_ext()) {
     if (OB_UNLIKELY(!(lmax || lmin || rmax || rmin))) {
       ret = OB_ERR_UNEXPECTED;

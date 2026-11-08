@@ -413,7 +413,8 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
-    is_inited_(false)
+    is_inited_(false),
+    fast_cmp_(false)
 {
 }
 
@@ -436,6 +437,7 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       cmp_func_ = basic_funcs->null_first_cmp_;
+      fast_cmp_ = ob_sparse_is_binary_string_id(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {
@@ -551,8 +553,13 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   }
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
-      if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+      const ObDatum &cached_id = doc_id_[cur_idx_].get_datum();
+      if (fast_cmp_ && ob_sparse_is_memcmpable(id_datum, cached_id)) {
+        ret = ob_sparse_memcmp_id(id_datum, cached_id, result);
+      } else {
+        ret = cmp_func_(id_datum, cached_id, result, nullptr);
+      }
+      if (OB_FAIL(ret)) {
       } else if (result <= 0) {
         find = true;
       } else {
@@ -566,6 +573,13 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
       }
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (fast_cmp_ && ob_sparse_is_memcmpable(id_datum, doc_id_[cur_idx_].get_datum())) {
+      if (OB_FAIL(ob_sparse_memcmp_id(id_datum, doc_id_[cur_idx_].get_datum(), result))) {
+      } else if (result <= 0) {
+        find = true;
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+      }
     } else if (OB_FAIL(cmp_func_(
                    id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
     } else if (result <= 0) {
