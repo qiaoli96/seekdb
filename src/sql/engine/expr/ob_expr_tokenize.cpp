@@ -88,7 +88,9 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
+                                                      param.parser_,
+                                                      param.parser_property_))) {
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
@@ -229,6 +231,11 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
   } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
   } else {
     param.parser_name_ = ObString::make_string(parser_name_buf);
+    // Keep the parsed form too: the tokenizer helper needs exactly this object, and parsing the
+    // "name.version" string back there would repeat the same work for every row.
+    if (OB_FAIL(param.parser_.parse_from_str(param.parser_name_.ptr(),
+                                             param.parser_name_.length()))) {
+    }
   }
   return ret;
 }
@@ -375,13 +382,22 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (properties.empty()) {
+    // No additional argument: the property is the parser's defaults, exactly what the json path
+    // below produces after rebuild_props_for_ddl() fills the defaults in, but without building a
+    // json document (and a json object for every default) just to read it back here.
+    ret = parser_property_.set_default_for_parser(parser_);
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
-  } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (OB_FAIL(parser_property_.parse_from_json_props(parser_,
+                                                            parser_properties,
+                                                            parser_properties.is_empty()))) {
+    // Fill the property object directly: serializing it to json only for the tokenizer to
+    // parse it back was a pure round trip, the canonical form is this object.
   }
 
   return ret;

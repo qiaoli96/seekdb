@@ -22,6 +22,7 @@
 #include "lib/string/ob_string.h"
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "data_plane/fts/ob_fts_parser_property.h"
+#include "data_plane/fts/ob_fts_parser_helper.h"
 
 namespace oceanbase
 {
@@ -71,6 +72,11 @@ private:
     mutable ObArenaAllocator allocator_;
     ObString parser_name_;
     ObString properties_;
+    // Parsed forms of (parser_name_, properties_). Both are pure functions of this evaluation's
+    // arguments and are rebuilt on every evaluation: nothing here outlives the call, so two
+    // statements sharing one physical plan can never observe each other's parser.
+    storage::ObFTParser parser_;
+    storage::ObFTParserProperty parser_property_;
     ObObjMeta meta_;
     ObString fulltext_;
     enum OUTPUT_MODE

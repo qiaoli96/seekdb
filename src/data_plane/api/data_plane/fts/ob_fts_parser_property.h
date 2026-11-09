@@ -137,6 +137,21 @@ public:
   ObFTParserProperty();
   ~ObFTParserProperty() = default;
   int parse_for_parser_helper(const ObFTParser &parser, const ObString &json_str);
+  /**
+   * Same result as parse_for_parser_helper(parser, props-as-a-json-string), but takes the
+   * property object the caller already has, so the caller does not have to serialize it and
+   * this function does not have to parse it back.
+   * props_empty must be true exactly when to_format_json() would yield an empty string
+   * (it yields one iff props.is_empty()), the two forms then behave identically.
+   */
+  int parse_from_json_props(const ObFTParser &parser,
+                            const ObFTParserJsonProps &props,
+                            const bool props_empty);
+  /**
+   * Property of a parser used without any additional argument, i.e. the same value the json path
+   * ends up with after rebuild_props_for_ddl() fills in the defaults, minus the json document.
+   */
+  int set_default_for_parser(const ObFTParser &parser);
 
   bool is_equal(const ObFTParserProperty &other) const
   {

@@ -482,6 +482,31 @@ int ObFTParseHelper::init(
   return ret;
 }
 
+int ObFTParseHelper::init_from_parsed(common::ObIAllocator *allocator,
+                                      const ObFTParser &parser,
+                                      const ObFTParserProperty &parser_property)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(!parser.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(parser.get_desc(parser_desc_))) {
+  } else if (OB_ISNULL(parser_desc_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(set_add_word_flag(*parser_desc_))) {
+  } else {
+    parser_name_ = parser;
+    parser_property_ = parser_property;
+    allocator_ = allocator;
+    is_inited_ = true;
+  }
+  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
+    reset();
+  }
+  return ret;
+}
+
 void ObFTParseHelper::reset()
 {
   parser_desc_ = nullptr;

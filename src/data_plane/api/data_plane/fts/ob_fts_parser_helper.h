@@ -187,6 +187,14 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
   /**
+   * Same post-condition as init(), for a caller that already parsed the parser name and its
+   * property: skips parse_from_str() and parse_for_parser_helper(). Nothing is kept between
+   * calls -- both objects stay owned by the caller and only need to outlive this call.
+   */
+  int init_from_parsed(common::ObIAllocator *allocator,
+                       const ObFTParser &parser,
+                       const ObFTParserProperty &parser_property);
+  /**
    * Split document into multiple words
    *
    * @param[in] type, collation type for fulltext
