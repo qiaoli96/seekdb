@@ -18,6 +18,7 @@
 
 #include "ob_sparse_bmw_iter.h"
 #include "ob_block_max_iter.h"
+#include "ob_text_retrieval_token_iter.h"
 
 namespace oceanbase
 {
@@ -32,6 +33,7 @@ ObSRBMWIterImpl::ObSRBMWIterImpl()
     less_score_cmp_(),
     top_k_heap_(less_score_cmp_, &allocator_),
     top_k_count_(0),
+    fast_dim_iters_(nullptr),
     domain_id_cmp_(),
     id_cache_(),
     status_(BMWStatus::MAX_STATUS),
@@ -47,6 +49,7 @@ int ObSRBMWIterImpl::init(
     ObSRDaaTRelevanceCollector &relevance_collector)
 {
   int ret = OB_SUCCESS;
+  fast_dim_iters_ = nullptr;
   range_probe_cnt_ = 0;
   range_prune_cnt_ = 0;
   skip_range_check_ = false;
@@ -59,6 +62,8 @@ int ObSRBMWIterImpl::init(
     is_inited_ = true;
   } else {
     top_k_count_ = iter_param.topk_limit_;
+    if (OB_FAIL(build_fast_dim_iters())) {
+    }
     status_ = BMWStatus::MAX_STATUS;
     id_cache_.set_allocator(&allocator_);
     if (OB_FAIL(domain_id_cmp_.init(iter_param.id_proj_expr_->obj_meta_))) {
@@ -264,7 +269,7 @@ int ObSRBMWIterImpl::next_pivot(int64_t &pivot_iter_idx)
     curr_id_end = merge_heap_->is_unique_champion();
     if (OB_FAIL(merge_heap_->top(top_item))) {
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
-    } else if (OB_FAIL(get_iter(iter_idx)->get_dim_max_score(iter_score))) {
+    } else if (OB_FAIL(fast_get_dim_max_score(iter_idx, get_iter(iter_idx), iter_score))) {
     } else if (FALSE_IT(max_score += iter_score)) {
     } else if (OB_FAIL(merge_heap_->pop())) {
     } else {
@@ -307,9 +312,9 @@ int ObSRBMWIterImpl::next_pivot_range(int64_t &skip_range_cnt)
     ObISRDimBlockMaxIter *iter = nullptr;
     if (is_next_round_iter_end(i)) {
       ++next_round_iter_end_cnt;
-    } else if (OB_ISNULL(iter = get_iter(iter_idx)) || OB_UNLIKELY(!iter->in_shallow_status())) {
+    } else if (OB_ISNULL(iter = get_iter(iter_idx)) || OB_UNLIKELY(!fast_in_shallow_status(iter_idx, iter))) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(iter->get_curr_block_max_info(max_score_tuple))) {
+    } else if (OB_FAIL(fast_get_curr_block_max_info(iter_idx, iter, max_score_tuple))) {
     } else if (OB_ISNULL(max_score_tuple)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (nullptr == minimum_max_domain_id) {
@@ -408,15 +413,15 @@ int ObSRBMWIterImpl::evaluate_pivot(const int64_t pivot_iter_idx)
         // this dimension was already exhausted by the range probe
       } else if (OB_ISNULL(iter)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(iter->advance_to(*pivot_id))) {
+      } else if (OB_FAIL(fast_advance_to(iter_idx, iter, *pivot_id))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         } else {
           ret = OB_SUCCESS;
         }
-      } else if (OB_FAIL(iter->get_curr_id(curr_id))) {
+      } else if (OB_FAIL(fast_get_curr_id(iter_idx, iter, curr_id))) {
       } else if (FALSE_IT(iter_domain_ids_[iter_idx] = curr_id)) {
       } else if (OB_FAIL(domain_id_cmp_.compare(*curr_id, *pivot_id, cmp_ret))) {
-      } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
+      } else if (OB_FAIL(fast_get_curr_score(iter_idx, iter, item.relevance_))) {
       } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
       } else if (0 == cmp_ret) {
         if (OB_FAIL(relevance_collector_->collect_one_dim(iter_idx, item.relevance_))) {
@@ -443,14 +448,14 @@ int ObSRBMWIterImpl::evaluate_pivot(const int64_t pivot_iter_idx)
       ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
       if (OB_ISNULL(iter)) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(iter->get_next_row())) {
+      } else if (OB_FAIL(fast_get_next_row(iter_idx, iter))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         } else {
           ret = OB_SUCCESS;
         }
-      } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
+      } else if (OB_FAIL(fast_get_curr_score(iter_idx, iter, item.relevance_))) {
       } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
-      } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+      } else if (OB_FAIL(fast_get_curr_id(iter_idx, iter, iter_domain_ids_[iter_idx]))) {
       } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
       } else if (OB_FAIL(merge_heap_->push(item))) {
       }
@@ -489,13 +494,13 @@ int ObSRBMWIterImpl::evaluate_pivot_range(const int64_t pivot_iter_idx, bool &is
       ObISRDimBlockMaxIter *iter = get_iter(iter_idx);
       if (OB_ISNULL(iter) || OB_UNLIKELY(is_next_round_iter_end(i))) {
         ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(iter->advance_shallow(*pivot_id, true))) {
+      } else if (OB_FAIL(fast_advance_shallow(iter_idx, iter, *pivot_id, true))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
         } else {
           set_next_round_iter_end(i);
           ret = OB_SUCCESS;
         }
-      } else if (OB_FAIL(iter->get_curr_block_max_info(max_score_tuple))) {
+      } else if (OB_FAIL(fast_get_curr_block_max_info(iter_idx, iter, max_score_tuple))) {
       } else {
         block_max_score += max_score_tuple->max_score_;
       }
@@ -535,12 +540,12 @@ int ObSRBMWIterImpl::fill_merge_heap_with_shallow_dims(const ObDatum *last_range
       // skip
     } else if (OB_ISNULL(iter = get_iter(iter_idx))) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(iter->advance_shallow(*last_range_border_id, inclusive))) {
+    } else if (OB_FAIL(fast_advance_shallow(iter_idx, iter, *last_range_border_id, inclusive))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
       } else {
         ret = OB_SUCCESS;
       }
-    } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    } else if (OB_FAIL(fast_get_curr_id(iter_idx, iter, iter_domain_ids_[iter_idx]))) {
     } else {
       item.iter_idx_ = iter_idx;
       item.relevance_ = 0.0;
@@ -585,15 +590,15 @@ int ObSRBMWIterImpl::try_generate_next_range_from_merge_heap(
     } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
     } else if (OB_ISNULL(iter = get_iter(iter_idx))) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (iter->in_shallow_status()) {
+    } else if (fast_in_shallow_status(iter_idx, iter)) {
       // already in shallow status, no need to advance shallow
     } else if (OB_FAIL(iter->get_curr_id(curr_domain_id))) {
-    } else if (OB_FAIL(iter->advance_shallow(*curr_domain_id, true))) {
+    } else if (OB_FAIL(fast_advance_shallow(iter_idx, iter, *curr_domain_id, true))) {
     }
 
     const ObMaxScoreTuple *max_score_tuple = nullptr;
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(iter->get_curr_block_max_info(max_score_tuple))) {
+    } else if (OB_FAIL(fast_get_curr_block_max_info(iter_idx, iter, max_score_tuple))) {
     } else if (OB_ISNULL(max_score_tuple)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -690,13 +695,13 @@ int ObSRBMWIterImpl::advance_dim_iters_for_next_round(
       }
     } else if (OB_ISNULL(iter = get_iter(iter_idx))) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(iter->advance_to(target_id))) {
+    } else if (OB_FAIL(fast_advance_to(iter_idx, iter, target_id))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
       } else {
         ret = OB_SUCCESS;
       }
-    } else if (OB_FAIL(iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
-    } else if (OB_FAIL(iter->get_curr_score(item.relevance_))) {
+    } else if (OB_FAIL(fast_get_curr_id(iter_idx, iter, iter_domain_ids_[iter_idx]))) {
+    } else if (OB_FAIL(fast_get_curr_score(iter_idx, iter, item.relevance_))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
     } else if (OB_FAIL(merge_heap_->push(item))) {
     }
@@ -718,6 +723,134 @@ int ObSRBMWIterImpl::advance_dim_iters_for_next_round(
 }
 
 
+
+
+int ObSRBMWIterImpl::build_fast_dim_iters()
+{
+  int ret = OB_SUCCESS;
+  fast_dim_iters_ = nullptr;
+  if (OB_ISNULL(dim_iters_) || dim_iters_->count() <= 0 || top_k_count_ <= 0) {
+    // Only top-k scans walk the per candidate path the fast binding is meant for: a plain
+    // COUNT(*) retrieval keeps the interface calls and pays nothing for the extra branch.
+  } else {
+    const int64_t cnt = dim_iters_->count();
+    bool all_text = true;
+    for (int64_t i = 0; i < cnt; ++i) {
+      ObISRDaaTDimIter *iter = dim_iters_->at(i);
+      if (OB_ISNULL(iter) || OB_UNLIKELY(!iter->is_text_block_max_iter())) {
+        all_text = false;
+        break;
+      }
+    }
+    if (all_text) {
+      ObTextRetrievalBlockMaxIter **arr = static_cast<ObTextRetrievalBlockMaxIter **>(
+          allocator_.alloc(sizeof(ObTextRetrievalBlockMaxIter *) * cnt));
+      if (OB_ISNULL(arr)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        for (int64_t i = 0; i < cnt; ++i) {
+          arr[i] = static_cast<ObTextRetrievalBlockMaxIter *>(dim_iters_->at(i));
+        }
+        fast_dim_iters_ = arr;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_advance_to(const int64_t idx, ObISRDimBlockMaxIter *iter, const ObDatum &id)
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->advance_to(id);
+  } else {
+    ret = iter->advance_to(id);
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_advance_shallow(const int64_t idx, ObISRDimBlockMaxIter *iter,
+                                          const ObDatum &id, const bool inclusive)
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->advance_shallow(id, inclusive);
+  } else {
+    ret = iter->advance_shallow(id, inclusive);
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_get_curr_id(const int64_t idx, ObISRDimBlockMaxIter *iter,
+                                      const ObDatum *&id) const
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->get_curr_id(id);
+  } else {
+    ret = iter->get_curr_id(id);
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_get_curr_score(const int64_t idx, ObISRDimBlockMaxIter *iter,
+                                          double &score) const
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->get_curr_score(score);
+  } else {
+    ret = iter->get_curr_score(score);
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_get_next_row(const int64_t idx, ObISRDimBlockMaxIter *iter)
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->get_next_row();
+  } else {
+    ret = iter->get_next_row();
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_get_dim_max_score(const int64_t idx, ObISRDimBlockMaxIter *iter, double &score)
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->get_dim_max_score(score);
+  } else {
+    ret = iter->get_dim_max_score(score);
+  }
+  return ret;
+}
+
+int ObSRBMWIterImpl::fast_get_curr_block_max_info(const int64_t idx, ObISRDimBlockMaxIter *iter,
+                                                  const ObMaxScoreTuple *&max_score_tuple)
+{
+  int ret = OB_SUCCESS;
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  if (nullptr != fast) {
+    ret = fast->get_curr_block_max_info(max_score_tuple);
+  } else {
+    ret = iter->get_curr_block_max_info(max_score_tuple);
+  }
+  return ret;
+}
+
+bool ObSRBMWIterImpl::fast_in_shallow_status(const int64_t idx, ObISRDimBlockMaxIter *iter) const
+{
+  ObTextRetrievalBlockMaxIter *fast = fast_iter(idx);
+  return (nullptr != fast) ? fast->in_shallow_status() : iter->in_shallow_status();
+}
 
 } // namespace storage
 } // namespace oceanbase

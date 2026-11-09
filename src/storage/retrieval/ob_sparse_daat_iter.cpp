@@ -52,18 +52,13 @@ int ObSRMergeCmp::init(
   return ret;
 }
 
-int ObSRMergeCmp::cmp(
-    const ObSRMergeItem &l,
-    const ObSRMergeItem &r,
-    int64_t &cmp_ret)
+int ObSRMergeCmp::cmp_datum(const ObDatum &lhs_id, const ObDatum &rhs_id, int64_t &cmp_ret)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    const ObDatum &lhs_id = get_id_datum(l.iter_idx_);
-    const ObDatum &rhs_id = get_id_datum(r.iter_idx_);
     if (fast_cmp_ && ob_sparse_is_memcmpable(lhs_id, rhs_id)) {
       if (OB_FAIL(ob_sparse_memcmp_id(lhs_id, rhs_id, tmp_ret))) {
       } else {
@@ -73,6 +68,19 @@ int ObSRMergeCmp::cmp(
     } else {
       cmp_ret = tmp_ret;
     }
+  }
+  return ret;
+}
+
+int ObSRMergeCmp::cmp(
+    const ObSRMergeItem &l,
+    const ObSRMergeItem &r,
+    int64_t &cmp_ret)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(cmp_datum(get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), cmp_ret))) {
   }
   return ret;
 }
@@ -93,8 +101,12 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     set_datum_func_(nullptr),
     fast_item_cnt_(0),
     use_fast_merge_(false),
-    use_inline_match_filter_(false)
+    use_inline_match_filter_(false),
+    use_batch_merge_(false),
+    batch_inited_(false),
+    batch_active_cnt_(0)
 {
+  batch_reset_state();
 }
 
 int ObSRDaaTIterImpl::init(
@@ -140,6 +152,15 @@ int ObSRDaaTIterImpl::init(
       for (int64_t i = 0; i < dim_iters.count(); ++i) {
         next_round_iter_idxes_[i] = i;
       }
+      // The batch shape needs every dimension to hand out the rows it already holds;
+      // anything else keeps the row at a time paths untouched.
+      use_batch_merge_ = (dim_iters.count() > 0 && dim_iters.count() <= FAST_MERGE_MAX_DIMS);
+      for (int64_t i = 0; use_batch_merge_ && i < dim_iters.count(); ++i) {
+        use_batch_merge_ = dim_iters.at(i)->support_batch_view();
+      }
+      LOG_INFO("Q2ENGAGE sparse merge shape", "dims", dim_iters.count(),
+               "batch_view", use_batch_merge_, "id_is_string",
+               ob_is_string_type(iter_param_->id_proj_expr_->datum_meta_.type_));
     }
 
     if (OB_SUCC(ret)) {
@@ -170,6 +191,7 @@ void ObSRDaaTIterImpl::reset()
   fast_item_cnt_ = 0;
   use_fast_merge_ = false;
   use_inline_match_filter_ = false;
+  batch_reset_state();
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
   is_inited_ = false;
@@ -187,6 +209,7 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
       next_round_iter_idxes_[i] = i;
     }
     fast_item_cnt_ = 0;
+    batch_reset_state();
   }
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reuse();
@@ -248,7 +271,9 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     count = 0;
     const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
     while (OB_SUCC(ret) && count < real_capacity) {
-      const int merge_ret = use_fast_merge_ ? fast_do_one_merge_round(count) : do_one_merge_round(count);
+      const int merge_ret = (use_fast_merge_ && use_batch_merge_)
+          ? batch_do_one_merge_round(count)
+          : (use_fast_merge_ ? fast_do_one_merge_round(count) : do_one_merge_round(count));
       if (OB_FAIL(merge_ret)) {
         if (OB_UNLIKELY(OB_ITER_END != merge_ret)) {
         }
@@ -672,6 +697,143 @@ int ObSRDaaTIterImpl::fast_do_one_merge_round(int64_t &count)
   } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
   } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
     if (OB_ITER_END != ret) {
+    }
+  }
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Batch shape of the same merge.
+//
+// The text dimension iterator keeps a whole batch of the postings it read in two fixed
+// arrays (doc ids and raw per token relevances) and serves one row at a time through
+// three virtual calls, of which a merge round uses exactly one id datum and one double.
+// This path takes a zero copy view of those arrays and merges on them directly, so a
+// round indexes arrays instead of paying that interface per row.
+//
+// The assignment of work is unchanged:
+//   * a row is consumed only when its id takes part in the current row, and the
+//     dimensions taking part are collected in ascending dimension order, which is the
+//     order the row at a time paths accumulate in (double addition is not associative),
+//   * a dimension that runs out of postings drops out of the merge,
+//   * field boost and dimension weights are applied to the raw relevance at the same
+//     point in the expression as before.
+// filter_on_demand / cache_result / project_results stay shared with the other paths.
+// ---------------------------------------------------------------------------
+void ObSRDaaTIterImpl::batch_reset_state()
+{
+  batch_inited_ = false;
+  batch_active_cnt_ = 0;
+  for (int64_t i = 0; i < FAST_MERGE_MAX_DIMS; ++i) {
+    batch_active_[i] = 0;
+    batch_cur_[i] = 0;
+    batch_views_[i].ids_ = nullptr;
+    batch_views_[i].scores_ = nullptr;
+    batch_views_[i].count_ = 0;
+  }
+}
+
+int ObSRDaaTIterImpl::batch_refill_dim(const int64_t dim)
+{
+  int ret = OB_SUCCESS;
+  bool exhausted = false;
+  ObSRDimBatchView &view = batch_views_[dim];
+  while (OB_SUCC(ret) && !exhausted && batch_cur_[dim] >= view.count_) {
+    view.ids_ = nullptr;
+    view.scores_ = nullptr;
+    view.count_ = 0;
+    if (OB_FAIL(dim_iters_->at(dim)->get_batch_view(view))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to get batch view of dimension", K(ret), K(dim));
+      } else {
+        ret = OB_SUCCESS;
+        exhausted = true;
+      }
+    } else if (OB_UNLIKELY(view.count_ <= 0)) {
+      exhausted = true;
+    } else {
+      batch_cur_[dim] = 0;
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::batch_do_one_merge_round(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  bool need_project = true;
+  double relevance = 0.0;
+  const ObDatum *id_datum = nullptr;
+  if (OB_UNLIKELY(!batch_inited_)) {
+    batch_active_cnt_ = dim_iters_->count();
+    for (int64_t i = 0; i < batch_active_cnt_; ++i) {
+      batch_active_[i] = i;
+      batch_cur_[i] = 0;
+      batch_views_[i].ids_ = nullptr;
+      batch_views_[i].scores_ = nullptr;
+      batch_views_[i].count_ = 0;
+    }
+    batch_inited_ = true;
+  }
+  // Retire what the previous round consumed, and drop the dimensions that have no
+  // more postings -- the same set that the row at a time path stops re-pushing.
+  int64_t kept = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < batch_active_cnt_; ++i) {
+    const int64_t dim = batch_active_[i];
+    if (OB_FAIL(batch_refill_dim(dim))) {
+    } else if (batch_cur_[dim] < batch_views_[dim].count_) {
+      batch_active_[kept++] = dim;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (FALSE_IT(batch_active_cnt_ = kept)) {
+  } else if (0 == batch_active_cnt_) {
+    ret = OB_ITER_END;
+  } else {
+    int64_t min_dim = batch_active_[0];
+    const ObDatum *min_id = &batch_views_[min_dim].ids_[batch_cur_[min_dim]].get_datum();
+    for (int64_t i = 1; OB_SUCC(ret) && i < batch_active_cnt_; ++i) {
+      const int64_t dim = batch_active_[i];
+      const ObDatum *id = &batch_views_[dim].ids_[batch_cur_[dim]].get_datum();
+      int64_t cmp_ret = 0;
+      if (OB_FAIL(merge_cmp_.cmp_datum(*id, *min_id, cmp_ret))) {
+      } else if (cmp_ret < 0) {
+        min_dim = dim;
+        min_id = id;
+      }
+    }
+    // Collect every dimension carrying this id -- the run of equal ids -- ascending by
+    // dimension index, then advance past the consumed rows.
+    for (int64_t i = 0; OB_SUCC(ret) && i < batch_active_cnt_; ++i) {
+      const int64_t dim = batch_active_[i];
+      const ObDatum *id = &batch_views_[dim].ids_[batch_cur_[dim]].get_datum();
+      int64_t cmp_ret = 0;
+      if (OB_FAIL(merge_cmp_.cmp_datum(*id, *min_id, cmp_ret))) {
+      } else if (0 != cmp_ret) {
+      } else {
+        double score = batch_views_[dim].scores_[batch_cur_[dim]];
+        ++batch_cur_[dim];
+        if (OB_NOT_NULL(iter_param_->dim_weights_)
+            && FALSE_IT(score = score * iter_param_->field_boost_ * iter_param_->dim_weights_->at(dim))) {
+        } else if (OB_FAIL(relevance_collector_->collect_one_dim(dim, score))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      bool got_valid_id = false;
+      id_datum = min_id;
+      if (OB_ISNULL(id_datum)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
+      } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
+      } else {
+        need_project = got_valid_id;
+      }
+    }
+    if (OB_SUCC(ret) && need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
+    } else if (OB_SUCC(ret) && need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
+      if (OB_ITER_END != ret) {
+      }
     }
   }
   return ret;

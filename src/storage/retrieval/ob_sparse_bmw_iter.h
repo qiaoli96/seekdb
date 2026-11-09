@@ -25,6 +25,12 @@ namespace oceanbase
 {
 namespace storage
 {
+class ObTextRetrievalBlockMaxIter;
+
+class ObTextRetrievalBlockMaxIter;
+
+class ObTextRetrievalBlockMaxIter;
+
 class ObSRBMWIterImpl : public ObSRDaaTIterImpl
 {
 public:
@@ -42,6 +48,27 @@ public:
 protected:
   virtual int process_collected_row(const ObDatum &id_datum, const double relevance) override;
   virtual int init_before_wand_process() { return OB_SUCCESS; }
+
+  // Text fast path: every dimension is a text block-max cursor, so the per candidate calls bind
+  // statically instead of through ObISRDimBlockMaxIter. fast_dim_iters_ stays null (and every
+  // helper below falls back to the interface) as soon as one dimension is another implementation.
+  int build_fast_dim_iters();
+  ObTextRetrievalBlockMaxIter *fast_iter(const int64_t idx) const
+  {
+    return (nullptr == fast_dim_iters_) ? nullptr : fast_dim_iters_[idx];
+  }
+  int fast_advance_to(const int64_t idx, ObISRDimBlockMaxIter *iter, const ObDatum &id);
+  int fast_advance_shallow(const int64_t idx, ObISRDimBlockMaxIter *iter, const ObDatum &id,
+                           const bool inclusive);
+  int fast_get_curr_id(const int64_t idx, ObISRDimBlockMaxIter *iter, const ObDatum *&id) const;
+  int fast_get_curr_score(const int64_t idx, ObISRDimBlockMaxIter *iter, double &score) const;
+  int fast_get_next_row(const int64_t idx, ObISRDimBlockMaxIter *iter);
+  int fast_get_dim_max_score(const int64_t idx, ObISRDimBlockMaxIter *iter, double &score);
+  int fast_get_curr_block_max_info(const int64_t idx, ObISRDimBlockMaxIter *iter,
+                                   const ObMaxScoreTuple *&max_score_tuple);
+  bool fast_in_shallow_status(const int64_t idx, ObISRDimBlockMaxIter *iter) const;
+
+
 
   int top_k_search();
   int build_top_k_heap();
@@ -101,6 +128,7 @@ protected:
   // Maybe domain id not need to be cached within the topk heap since there would be top-n sort with datum store above
   TopKHeap top_k_heap_;
   int64_t top_k_count_;
+  ObTextRetrievalBlockMaxIter **fast_dim_iters_;
   ObDomainIdCmp domain_id_cmp_;
   ObFixedArray<ObDocIdExt, ObIAllocator> id_cache_;
   BMWStatus status_;

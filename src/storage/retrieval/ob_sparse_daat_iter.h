@@ -46,6 +46,7 @@ struct ObSRMergeCmp
 
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
+  int cmp_datum(const ObDatum &lhs, const ObDatum &rhs, int64_t &cmp_ret);
 private:
   inline const ObDatum &get_id_datum(const int64_t iter_idx)
   {
@@ -101,6 +102,10 @@ protected:
   int fast_collect_dims_by_id(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
   int fast_push_item(const ObSRMergeItem &item);
   bool is_canonical_match_filter() const;
+  // Batch path: same merge over the arrays the dimension iterators already hold.
+  int batch_refill_dim(const int64_t dim);
+  int batch_do_one_merge_round(int64_t &count);
+  void batch_reset_state();
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -126,6 +131,15 @@ protected:
   // predicate is ObExprBool's double path and can be evaluated without the expression
   // machinery (see filter_on_demand).
   bool use_inline_match_filter_;
+  // Batch path state: the dimensions still in the merge (ascending, so the relevance
+  // accumulation order is the one the row at a time paths use), the view handed out per
+  // dimension and the position inside it.
+  bool use_batch_merge_;
+  bool batch_inited_;
+  int64_t batch_active_[FAST_MERGE_MAX_DIMS];
+  int64_t batch_active_cnt_;
+  ObSRDimBatchView batch_views_[FAST_MERGE_MAX_DIMS];
+  int64_t batch_cur_[FAST_MERGE_MAX_DIMS];
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

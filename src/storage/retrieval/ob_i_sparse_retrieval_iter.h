@@ -42,6 +42,20 @@ using sql::ObEvalCtx;
 using sql::ObExpr;
 class ObMaxScoreTuple;
 
+// Zero copy view over the rows a dimension iterator already materialized internally.
+// The consumer reads ids and raw relevances in place instead of paying the per row
+// virtual interface, so a merge round costs array indexing rather than three calls.
+// Contract: the consumer spends the whole view before asking for the next one, and
+// stops asking once OB_ITER_END is returned. Iterators that cannot hand out their rows
+// keep the default answer and the caller keeps the per row interface.
+struct ObSRDimBatchView
+{
+  ObSRDimBatchView() : ids_(nullptr), scores_(nullptr), count_(0) {}
+  const ObDocIdExt *ids_;
+  const double *scores_;
+  int64_t count_;
+};
+
 class ObISparseRetrievalDimIter
 {
 public:
@@ -56,6 +70,12 @@ public:
   {
     UNUSED(id_datum);
     return OB_NOT_IMPLEMENT;
+  }
+  virtual bool support_batch_view() const { return false; }
+  virtual int get_batch_view(ObSRDimBatchView &view)
+  {
+    UNUSED(view);
+    return OB_NOT_SUPPORTED;
   }
   TO_STRING_EMPTY();
 private:
@@ -81,6 +101,10 @@ public:
   {
     return OB_NOT_SUPPORTED;
   }
+  // Fast-path tag: the text block-max cursor is the only implementation that answers true. The
+  // sparse BMW engine uses it to bind its hot calls statically to that type, and keeps the virtual
+  // path for every other implementation (see ob_sparse_bmw_iter.cpp).
+  virtual bool is_text_block_max_iter() const { return false; }
   TO_STRING_EMPTY();
 private:
   DISALLOW_COPY_AND_ASSIGN(ObISRDaaTDimIter);

@@ -410,6 +410,7 @@ ObTextRetrievalDaaTTokenIter::ObTextRetrievalDaaTTokenIter()
     max_batch_size_(1),
     cur_idx_(-1),
     count_(0),
+    handed_view_cnt_(0),
     relevance_(),
     doc_id_(),
     cmp_func_(nullptr),
@@ -458,6 +459,7 @@ void ObTextRetrievalDaaTTokenIter::reuse()
 {
   cur_idx_ = -1;
   count_ = 0;
+  handed_view_cnt_ = 0;
   token_iter_->reuse();
 }
 
@@ -468,6 +470,7 @@ void ObTextRetrievalDaaTTokenIter::reset()
   token_iter_->reset();
   cur_idx_ = -1;
   count_ = 0;
+  handed_view_cnt_ = 0;
 }
 
 // Sparse Retrieval Dimension Iter Interfaces
@@ -539,7 +542,84 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
 
 int ObTextRetrievalDaaTTokenIter::get_next_batch(const int64_t capacity, int64_t &count)
 {
+  UNUSED(capacity);
+  count = 0;
   return OB_NOT_IMPLEMENT;
+}
+
+// The batch view is served straight out of the two arrays this iterator fills in
+// save_relevances_and_docids / save_docids, so a merge round reads the rows where they
+// already are instead of calling get_next_row / get_curr_score / get_curr_id per row.
+// Scores are the raw per token relevances (weights are applied by the consumer, exactly
+// as the row at a time interface does).
+bool ObTextRetrievalDaaTTokenIter::support_batch_view() const
+{
+  return is_inited_ && OB_NOT_NULL(relevance_expr_) && OB_NOT_NULL(inv_scan_domain_id_col_);
+}
+
+int ObTextRetrievalDaaTTokenIter::get_batch_view(ObSRDimBatchView &view)
+{
+  int ret = OB_SUCCESS;
+  view.ids_ = nullptr;
+  view.scores_ = nullptr;
+  view.count_ = 0;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(!support_batch_view())) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    // A whole view is spent before the next one is asked for, so the rows handed out
+    // last time are exactly the rows consumed and can be retired here.
+    if (cur_idx_ < 0) {
+      cur_idx_ = 0;
+    }
+    cur_idx_ += handed_view_cnt_;
+    handed_view_cnt_ = 0;
+    while (OB_SUCC(ret) && cur_idx_ >= count_) {
+      if (OB_FAIL(fill_batch())) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("failed to fill text retrieval batch", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      view.ids_ = &doc_id_.at(cur_idx_);
+      view.scores_ = &relevance_.at(cur_idx_);
+      view.count_ = count_ - cur_idx_;
+      handed_view_cnt_ = view.count_;
+    }
+  }
+  return ret;
+}
+
+// The refill half of get_next_row, shared by both interfaces: one row at a time when the
+// expression evaluation is not vectorized, a whole batch otherwise.
+int ObTextRetrievalDaaTTokenIter::fill_batch()
+{
+  int ret = OB_SUCCESS;
+  bool need_load = false;
+  if (!eval_ctx_->is_vectorized()) {
+    if (OB_FAIL(token_iter_->get_next_row())) {
+    } else if (FALSE_IT(count_ = 1)) {
+    }
+    need_load = true;
+  } else if (OB_FAIL(token_iter_->get_next_batch(max_batch_size_, count_))) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    } else if (count_ != 0) {
+      ret = OB_SUCCESS;
+      need_load = true;
+    }
+  } else {
+    need_load = true;
+  }
+  if (OB_SUCC(ret) && need_load) {
+    if (OB_NOT_NULL(relevance_expr_)) {
+      ret = save_relevances_and_docids();
+    } else {
+      ret = save_docids();
+    }
+  }
+  return ret;
 }
 
 int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)

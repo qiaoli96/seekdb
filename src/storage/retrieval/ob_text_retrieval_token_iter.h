@@ -133,6 +133,8 @@ public:
   virtual int advance_to(const ObDatum &id_datum) override;
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
+  virtual bool support_batch_view() const override;
+  virtual int get_batch_view(ObSRDimBatchView &view) override;
 public:
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
@@ -146,6 +148,7 @@ public:
 private:
   int save_relevances_and_docids();
   int save_docids();
+  int fill_batch();
   ObArenaAllocator *allocator_;
   ObTextRetrievalTokenIter *token_iter_;
   sql::ObEvalCtx *eval_ctx_;
@@ -154,6 +157,8 @@ private:
   int64_t max_batch_size_;
   int64_t cur_idx_;
   int64_t count_;
+  // rows of the current internal batch already handed out through a batch view
+  int64_t handed_view_cnt_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
@@ -184,6 +189,9 @@ public:
   virtual int advance_shallow(const ObDatum &id_datum, const bool inclusive) override;
   virtual int get_curr_block_max_info(const ObMaxScoreTuple *&max_score_tuple) override;
   virtual bool in_shallow_status() const override;
+  // The text block-max cursor is the only dimension implementation the BMW engine is built from;
+  // it answers true so the engine can bind its hot calls statically (ob_sparse_bmw_iter.cpp).
+  virtual bool is_text_block_max_iter() const override { return true; }
   // currently, for text retrieval, total_doc_cnt and token_doc_cnt is required before block max calculation
   int init_block_max_iter(const int64_t total_doc_cnt, const double avg_doc_token_cnt);
 private:
