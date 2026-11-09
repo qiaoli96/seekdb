@@ -102,7 +102,8 @@ private:
   static int tokenize_fulltext(const TokenizeParam &param,
                                TokenizeParam::OUTPUT_MODE mode,
                                common::ObIAllocator &allocator,
-                               ObIJsonBase *&result);
+                               ObIJsonBase *&result,
+                               ObString &bin_result);
 
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
 

@@ -234,6 +234,14 @@ public:
   int make_token_array_json(
       const ObFTWordMap &words,
       common::ObIJsonBase *&json_root);
+  /**
+   * Same bytes as ObJsonWrapper::get_raw_binary(make_token_array_json(words)), but the binary json
+   * document is assembled directly instead of going tree -> bin: the per-token payload is still
+   * produced by ObJsonBinSerializer::serialize_json_string() and the container entry table by
+   * ObJsonBinMeta/ObJsonBinSerializer::set_value_entry(), so only the V0 container assembly is
+   * this function's own. The output is allocated once here and filled in place.
+   */
+  int make_token_array_bin(const ObFTWordMap &words, common::ObString &out);
 
   void reset();
 

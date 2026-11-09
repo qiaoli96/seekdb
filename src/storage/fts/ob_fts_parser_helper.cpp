@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "common/json_type/ob_json_bin.h"
+#include "lib/utility/serialization.h"
 #include "object/ob_object.h"
 #include "storage/fts/ob_fts_struct.h"
 #define USING_LOG_PREFIX STORAGE_FTS
@@ -629,6 +631,117 @@ int ObFTParseHelper::make_detail_json(
     OB_DELETEx(ObJsonArray, allocator_, token_array);
   }
 
+  return ret;
+}
+
+int ObFTParseHelper::make_token_array_bin(const ObFTWordMap &words, common::ObString &out)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t count = static_cast<uint64_t>(words.size());
+  uint64_t payload_size = 0;
+  for (ObFTWordMap::const_iterator it = words.begin(); OB_SUCC(ret) && it != words.end(); ++it) {
+    const ObString key = it->first.get_word().get_string();
+    payload_size += sizeof(uint8_t) + static_cast<uint64_t>(serialization::encoded_length_vi64(key.length()))
+                    + static_cast<uint64_t>(key.length());
+  }
+  if (OB_SUCC(ret)) {
+    ObJsonBinMeta meta;
+    meta.set_type(ObJsonBin::get_array_vertype(), false);
+    meta.set_element_count(count);
+    meta.set_element_count_var_type(ObJsonVar::get_var_type(count));
+    meta.set_is_continuous(true);
+    // The container size selects the width of its own size field, so solve it to a fixed point
+    // the same way the tree serializer does (it re-serializes when the estimate grows).
+    uint64_t obj_size = payload_size + sizeof(ObJsonBinObjHeader)
+                        + static_cast<uint64_t>(ObJsonVar::get_var_size(meta.element_count_var_type()));
+    for (int64_t i = 0; OB_SUCC(ret) && i < 8; ++i) {
+      const uint8_t size_var = static_cast<uint8_t>(ObJsonVar::get_var_type(obj_size));
+      const uint64_t real_size = sizeof(ObJsonBinObjHeader)
+                                 + static_cast<uint64_t>(ObJsonVar::get_var_size(meta.element_count_var_type()))
+                                 + static_cast<uint64_t>(ObJsonVar::get_var_size(size_var))
+                                 + count * (static_cast<uint64_t>(ObJsonVar::get_var_size(size_var)) + 1)
+                                 + payload_size;
+      if (real_size == obj_size) {
+        break;
+      } else {
+        obj_size = real_size;
+      }
+    }
+    meta.set_obj_size(obj_size);
+    meta.set_obj_size_var_type(ObJsonVar::get_var_type(obj_size));
+    meta.set_entry_var_type(meta.obj_size_var_type());
+    meta.calc_entry_array();
+    // entries live in [meta.get_value_entry_offset(0), +count*(entry+1)); payloads follow them
+    const uint64_t payload_start = meta.get_value_entry_offset(0)
+                                   + count * (static_cast<uint64_t>(ObJsonVar::get_var_size(meta.entry_var_type())) + 1);
+    const uint64_t total = sizeof(ObJsonBinDocHeader) + obj_size;
+    char *buf = nullptr;
+    if (OB_UNLIKELY(payload_start + payload_size != obj_size)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tokenize bin json size mismatch", K(payload_start), K(payload_size), K(obj_size));
+    } else if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(total)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      // build a real header object: reinterpret_cast onto raw arena memory would leave type_ and
+      // reserved_ uninitialised (the constructor is what sets J_DOC_HEADER_V0)
+      ObJsonBinDocHeader doc_header;
+      doc_header.extend_seg_offset_ = total;
+      doc_header.use_lexicographical_order_ = 0;
+      MEMCPY(buf, &doc_header, sizeof(ObJsonBinDocHeader));
+      char *base = buf + sizeof(ObJsonBinDocHeader);
+      ObJsonBinHeader *header = reinterpret_cast<ObJsonBinHeader *>(base);
+      header->type_ = static_cast<uint8_t>(ObJsonBin::get_array_vertype());
+      header->entry_size_ = meta.entry_var_type();
+      header->count_size_ = meta.element_count_var_type();
+      header->obj_size_size_ = meta.obj_size_var_type();
+      header->is_continuous_ = 1;
+      header->reserved_ = 0;
+      // header fields use the json container's own fixed-width var encoding, not vi64
+      int64_t pos = sizeof(ObJsonBinObjHeader);
+      if (OB_FAIL(ObJsonVar::set_var(count, meta.element_count_var_type(), base + pos))) {
+      } else if (OB_FALSE_IT(pos += ObJsonVar::get_var_size(meta.element_count_var_type()))) {
+      } else if (OB_FAIL(ObJsonVar::set_var(obj_size, meta.obj_size_var_type(), base + pos))) {
+      } else if (OB_FALSE_IT(pos += ObJsonVar::get_var_size(meta.obj_size_var_type()))) {
+      } else if (OB_UNLIKELY(static_cast<uint64_t>(pos) != meta.get_value_entry_offset(0))) {
+        // the fixed-width header must end exactly where the value entry table starts
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("tokenize bin json header size mismatch", K(pos), K(meta.get_value_entry_offset(0)));
+      } else {
+        int64_t index = 0;
+        uint64_t write_offset = payload_start;
+        const uint8_t value_type = static_cast<uint8_t>(ObJsonBin::get_string_vertype());
+        for (ObFTWordMap::const_iterator it = words.begin(); OB_SUCC(ret) && it != words.end(); ++it) {
+          const ObString key = it->first.get_word().get_string();
+          if (OB_FAIL(ObJsonBinSerializer::set_value_entry(meta, base, static_cast<int>(index),
+                                                           write_offset, value_type, false))) {
+          } else if (OB_UNLIKELY(write_offset + sizeof(uint8_t)
+                                     + static_cast<uint64_t>(serialization::encoded_length_vi64(key.length()))
+                                     + static_cast<uint64_t>(key.length()) > obj_size)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            base[write_offset] = static_cast<char>(value_type);
+            int64_t vpos = static_cast<int64_t>(write_offset) + sizeof(uint8_t);
+            if (OB_FAIL(serialization::encode_vi64(base, obj_size, vpos, key.length()))) {
+            } else if (OB_UNLIKELY(vpos + key.length() > static_cast<int64_t>(obj_size))) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              MEMCPY(base + vpos, key.ptr(), key.length());
+              write_offset = static_cast<uint64_t>(vpos) + static_cast<uint64_t>(key.length());
+              ++index;
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_UNLIKELY(write_offset != obj_size)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("tokenize bin json filled size mismatch", K(write_offset), K(obj_size));
+          } else {
+            out.assign_ptr(buf, static_cast<int32_t>(total));
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 

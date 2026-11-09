@@ -58,27 +58,103 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
 
   ObIJsonBase *json_result = nullptr;
+  ObString bin_result;
   TokenizeParam param;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result,
+                                       bin_result))) {
+  } else if (OB_NOT_NULL(json_result)) {
+    // output=all (or the self-check fallback): the document was built as a tree
+    if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr, ctx, temp_allocator, json_result, expr_datum))) {
+    }
+  } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, bin_result))) {
   }
 
   return ret;
 }
 
+static void tokenize_hex(char *out, const int64_t out_len, const char *data,
+                         const int64_t start, const int64_t end)
+{
+  int64_t pos = 0;
+  for (int64_t i = start; i < end && pos + 3 < out_len; ++i) {
+    if (i < 0) {
+      continue;
+    }
+    pos += snprintf(out + pos, out_len - pos, "%02x", static_cast<unsigned char>(data[i]));
+  }
+  out[pos] = '\0';
+}
+
+// Diagnostics for the self-check switch only: which byte diverges, the neighbourhood on both
+// sides, the input shape, and both blobs dumped whole for later comparison.
+static void tokenize_dump_bin_mismatch(const ObString &ref, const ObString &bin,
+                                       const storage::ObFTWordMap &words, const int mode)
+{
+  static int64_t seq = 0;
+  const int64_t seq_no = ++seq;
+  int64_t first_diff = 0;
+  const int64_t min_len = ref.length() < bin.length() ? ref.length() : bin.length();
+  while (first_diff < min_len && ref.ptr()[first_diff] == bin.ptr()[first_diff]) {
+    ++first_diff;
+  }
+  uint64_t token_len_sum = 0;
+  for (storage::ObFTWordMap::const_iterator it = words.begin(); it != words.end(); ++it) {
+    token_len_sum += static_cast<uint64_t>(it->first.get_word().get_string().length());
+  }
+  char ref_hex[96];
+  char bin_hex[96];
+  const int64_t win_start = first_diff - 8 < 0 ? 0 : first_diff - 8;
+  const int64_t win_end = first_diff + 8;
+  tokenize_hex(ref_hex, sizeof(ref_hex), ref.ptr(), win_start,
+               win_end > ref.length() ? ref.length() : win_end);
+  tokenize_hex(bin_hex, sizeof(bin_hex), bin.ptr(), win_start,
+               win_end > bin.length() ? bin.length() : win_end);
+  FILE *f = fopen("/root/w2/tok_bin_mismatch.txt", "a");
+  if (NULL != f) {
+    fprintf(f, "seq=%ld first_diff=%ld ref_len=%d new_len=%d ntok=%ld tok_len_sum=%lu mode=%d "
+               "arr_vertype=%d lex=0 win_from=%ld ref_win=%s new_win=%s\n",
+            static_cast<long>(seq_no), static_cast<long>(first_diff),
+            static_cast<int>(ref.length()), static_cast<int>(bin.length()),
+            static_cast<long>(words.size()), token_len_sum, mode,
+            static_cast<int>(common::ObJsonBin::get_array_vertype()),
+            static_cast<long>(win_start), ref_hex, bin_hex);
+    fclose(f);
+  }
+  char path[128];
+  FILE *fr = NULL;
+  FILE *fn = NULL;
+  snprintf(path, sizeof(path), "/root/w2/binmismatch/%04ld.ref.bin", static_cast<long>(seq_no));
+  if (NULL != (fr = fopen(path, "wb"))) {
+    if (ref.length() > 0) { fwrite(ref.ptr(), 1, ref.length(), fr); }
+    fclose(fr);
+  }
+  snprintf(path, sizeof(path), "/root/w2/binmismatch/%04ld.new.bin", static_cast<long>(seq_no));
+  if (NULL != (fn = fopen(path, "wb"))) {
+    if (bin.length() > 0) { fwrite(bin.ptr(), 1, bin.length(), fn); }
+    fclose(fn);
+  }
+}
+
+// Runtime switch, default off: with OB_TOKENIZE_BIN_SELFCHECK in the environment every evaluation
+// also builds the reference binary document through the tree path and compares the two byte by
+// byte; a mismatch is recorded and the reference is used instead, so a future layout change can
+// only fall back to the slower path, never produce different output.
+static bool tokenize_bin_selfcheck()
+{
+  static const bool enabled = (nullptr != getenv("OB_TOKENIZE_BIN_SELFCHECK"));
+  return enabled;
+}
+
 int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       TokenizeParam::OUTPUT_MODE mode,
                                       ObIAllocator &allocator,
-                                      ObIJsonBase *&result)
+                                      ObIJsonBase *&result,
+                                      ObString &bin_result)
 {
   int ret = OB_SUCCESS;
   storage::ObFTParseHelper tokenize_helper;
@@ -103,9 +179,20 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   } else {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(tokenize_helper.make_token_array_bin(token_map, bin_result))) {
+      } else if (!tokenize_bin_selfcheck()) {
       } else {
-        // pass
+        ObIJsonBase *ref = nullptr;
+        ObString ref_bin;
+        if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, ref))) {
+        } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(ref, ref_bin, &allocator))) {
+        } else if (ref_bin.length() == bin_result.length()
+                   && 0 == MEMCMP(ref_bin.ptr(), bin_result.ptr(), ref_bin.length())) {
+        } else {
+          tokenize_dump_bin_mismatch(ref_bin, bin_result, token_map,
+                                     static_cast<int>(param.output_mode_));
+          bin_result = ref_bin;
+        }
       }
       break;
     }
