@@ -18,6 +18,8 @@
 
 #include "config_bridge.h"
 #include "ob_sort_op_impl.h"
+#include <string.h>
+#include <stdlib.h>
 #include "query/engine/basic/ob_encoded_sort_row.h"
 #include "data_plane/encoding/ob_cpu_features.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
@@ -1833,6 +1835,150 @@ int ObSortOpImpl::part_topn_heap_next(int64_t &cur_heap_idx,
   return ret;
 }
 
+/*************************** start ObSortInlineKey (short key sort) ***************************/
+namespace {
+// Short-key optimization: keep the sort key bytes right next to the row pointer, so the most
+// frequent comparisons never chase the row payload. A key is inlined in full (never truncated),
+// therefore the comparison runs through the very same collation comparison function on the very
+// same bytes and the produced order is identical to the plain path, for every collation. Rows
+// whose key does not fit the inline buffer, is NULL, or ties on the inline bytes fall back to
+// the full row comparison, so no row is excluded and no order is ever approximated.
+constexpr int64_t OB_SORT_INLINE_KEY_BYTES = 16;
+constexpr int64_t OB_SORT_INLINE_KEY_MIN_ROWS = 64;
+constexpr uint16_t OB_SORT_ITEM_KEY0_INLINE = 0x1;
+constexpr uint16_t OB_SORT_ITEM_KEY1_INLINE = 0x2;
+
+struct ObInlineSortItem
+{
+  ObChunkDatumStore::StoredRow *row_;
+  uint8_t key0_len_;
+  uint8_t key1_len_;
+  uint16_t flags_;
+  uint8_t buf_[OB_SORT_INLINE_KEY_BYTES];
+  uint8_t key1_buf_[OB_SORT_INLINE_KEY_BYTES];
+};
+
+struct ObInlineSortItemCmp
+{
+  ObInlineSortItemCmp(ObSortOpImpl::Compare &comp, const ObDatumCmpFuncType key0_func,
+                      const bool key0_asc, const ObDatumCmpFuncType key1_func, const bool key1_asc)
+    : comp_(comp), key0_func_(key0_func), key0_asc_(key0_asc),
+      key1_func_(key1_func), key1_asc_(key1_asc) {}
+  bool operator()(const ObInlineSortItem &l, const ObInlineSortItem &r)
+  {
+    if ((l.flags_ & r.flags_ & OB_SORT_ITEM_KEY0_INLINE) != 0 && nullptr != key0_func_) {
+      int cmp = 0;
+      ObDatum l_key0(reinterpret_cast<const char *>(l.buf_), l.key0_len_, false);
+      ObDatum r_key0(reinterpret_cast<const char *>(r.buf_), r.key0_len_, false);
+      if (OB_SUCCESS == comp_.fast_check_status()
+          && OB_SUCCESS == key0_func_(l_key0, r_key0, cmp, comp_.access_ctx_)) {
+        if (0 != cmp) {
+          return key0_asc_ ? (cmp < 0) : (cmp > 0);
+        }
+        if ((l.flags_ & r.flags_ & OB_SORT_ITEM_KEY1_INLINE) != 0 && nullptr != key1_func_) {
+          int cmp1 = 0;
+          ObDatum l_key1(reinterpret_cast<const char *>(l.key1_buf_), l.key1_len_, false);
+          ObDatum r_key1(reinterpret_cast<const char *>(r.key1_buf_), r.key1_len_, false);
+          if (OB_SUCCESS == key1_func_(l_key1, r_key1, cmp1, comp_.access_ctx_) && 0 != cmp1) {
+            return key1_asc_ ? (cmp1 < 0) : (cmp1 > 0);
+          }
+        }
+      }
+    }
+    return comp_(l.row_, r.row_);
+  }
+  ObSortOpImpl::Compare &comp_;
+  const ObDatumCmpFuncType key0_func_;
+  const bool key0_asc_;
+  const ObDatumCmpFuncType key1_func_;
+  const bool key1_asc_;
+};
+
+bool ob_sort_inline_key_enabled()
+{
+  static const bool disabled = nullptr != ::getenv("OB_SORT_INLINE_KEY_OFF");
+  return !disabled;
+}
+
+// Sort rows[begin, end) through the inline key path. %used reports whether the inline path
+// produced the order; when it stays false the caller must run the plain comparison sort.
+int ob_sort_rows_inline_key(ObIArray<ObChunkDatumStore::StoredRow *> &rows,
+                            const int64_t begin, const int64_t end,
+                            ObSortOpImpl::Compare &comp, ObIAllocator &allocator,
+                            bool &used)
+{
+  int ret = OB_SUCCESS;
+  used = false;
+  const int64_t cnt = end - begin;
+  const ObIArray<ObSortFieldCollation> *colls = comp.sort_collations_;
+  const ObIArray<ObSortCmpFunc> *funs = comp.sort_cmp_funs_;
+  const bool has_key1 = nullptr != colls && nullptr != funs && colls->count() >= 2 && funs->count() >= 2;
+  if (cnt < OB_SORT_INLINE_KEY_MIN_ROWS || nullptr == colls || nullptr == funs
+      || colls->count() <= 0 || funs->count() <= 0
+      || common::CS_TYPE_INVALID == colls->at(0).cs_type_
+      || nullptr == funs->at(0).cmp_func_
+      || !ob_sort_inline_key_enabled()) {
+    // keep the plain path
+  } else {
+    const bool key1_inline = has_key1 && nullptr != funs->at(1).cmp_func_;
+    ObInlineSortItem *items = static_cast<ObInlineSortItem *>(
+        allocator.alloc(cnt * static_cast<int64_t>(sizeof(ObInlineSortItem))));
+    if (nullptr == items) {
+      // no memory for the inline array: the plain path stays available
+      LOG_WARN_RET(OB_ALLOCATE_MEMORY_FAILED, "no memory for inline sort items, fallback to plain sort", K(cnt));
+    } else {
+      const int64_t idx0 = static_cast<int64_t>(colls->at(0).field_idx_);
+      const int64_t idx1 = key1_inline ? static_cast<int64_t>(colls->at(1).field_idx_) : -1;
+      for (int64_t i = 0; i < cnt; ++i) {
+        ObInlineSortItem &item = items[i];
+        item.row_ = rows.at(begin + i);
+        item.key0_len_ = 0;
+        item.key1_len_ = 0;
+        item.flags_ = 0;
+        if (nullptr != item.row_) {
+          const ObDatum &key0 = item.row_->cells()[idx0];
+          if (!key0.is_null() && key0.len_ <= OB_SORT_INLINE_KEY_BYTES
+              && (0 == key0.len_ || nullptr != key0.ptr_)) {
+            item.key0_len_ = static_cast<uint8_t>(key0.len_);
+            item.flags_ |= OB_SORT_ITEM_KEY0_INLINE;
+            if (key0.len_ > 0) {
+              MEMCPY(item.buf_, key0.ptr_, key0.len_);
+            }
+            if (idx1 >= 0) {
+              const ObDatum &key1 = item.row_->cells()[idx1];
+              if (!key1.is_null() && key1.len_ <= OB_SORT_INLINE_KEY_BYTES
+                  && (0 == key1.len_ || nullptr != key1.ptr_)) {
+                item.key1_len_ = static_cast<uint8_t>(key1.len_);
+                item.flags_ |= OB_SORT_ITEM_KEY1_INLINE;
+                if (key1.len_ > 0) {
+                  MEMCPY(item.key1_buf_, key1.ptr_, key1.len_);
+                }
+              }
+            }
+          }
+        }
+      }
+      ObInlineSortItemCmp item_cmp(comp, funs->at(0).cmp_func_, colls->at(0).is_ascending_,
+                                   key1_inline ? funs->at(1).cmp_func_ : nullptr,
+                                   key1_inline ? colls->at(1).is_ascending_ : true);
+      lib::ob_sort(items, items + cnt, item_cmp);
+      if (OB_SUCCESS != comp.ret_) {
+        ret = comp.ret_;
+      } else {
+        for (int64_t i = 0; i < cnt; ++i) {
+          rows.at(begin + i) = items[i].row_;
+        }
+        used = true;
+      }
+      allocator.free(items);
+      items = nullptr;
+    }
+  }
+  return ret;
+}
+}  // namespace
+/**************************** end ObSortInlineKey (short key sort) ****************************/
+
 int ObSortOpImpl::sort_inmem_data()
 {
   int ret = OB_SUCCESS;
@@ -1862,7 +2008,12 @@ int ObSortOpImpl::sort_inmem_data()
           lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
         }
       } else {
-        lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+        bool inline_key_used = false;
+        if (OB_FAIL(ob_sort_rows_inline_key(*rows_, begin, rows_->count(), comp_,
+                                            mem_context_->get_malloc_allocator(), inline_key_used))) {
+        } else if (!inline_key_used) {
+          lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+        }
       }
       if (OB_SUCCESS != comp_.ret_) {
         ret = comp_.ret_;
