@@ -300,7 +300,7 @@ int ObDASLegacyTRMergeIter::init_das_iter_scan_param(const ObTabletID &tablet_id
 int ObDASLegacyTRMergeIter::create_dim_iters()
 {
   int ret = OB_SUCCESS;
-  if (topk_mode_) {
+  if (topk_mode_ && TOPK_BLOCK_MAX_ROUTE) {
     if (OB_FAIL(init_block_max_iter_param())) {
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < query_tokens_.count(); ++i) {
@@ -313,7 +313,7 @@ int ObDASLegacyTRMergeIter::create_dim_iters()
       } else if (OB_FAIL(dim_iters_.push_back(dim_iter))) {
       }
     }
-  } else if (daat_mode_) {
+  } else if (topk_mode_ || daat_mode_) {
     for (int64_t i = 0; OB_SUCC(ret) && i < query_tokens_.count(); ++i) {
       ObTextRetrievalScanIterParam iter_param;
       ObTextRetrievalDaaTTokenIter *dim_iter = nullptr;
@@ -375,7 +375,10 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
 {
   int ret = OB_SUCCESS;
   sr_iter_param_.dim_weights_ = dim_weights_.count() >= 1 ? &dim_weights_ : nullptr;
-  sr_iter_param_.limit_param_ = &ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_;
+  // A top-k scan keeps its own offset and limit bookkeeping in the heap, so the pushed down limit
+  // must not also stop the candidate walk: a walk stopped after limit rows would return the first
+  // limit rows by doc id instead of the top limit rows by score.
+  sr_iter_param_.limit_param_ = topk_daat() ? nullptr : &ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_;
   sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
@@ -408,6 +411,16 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
     }
   }
   if (OB_FAIL(ret)) {
+  } else if (topk_daat()) {
+    ObTextDaaTParam iter_param;
+    ObTextDaaTTopKIter *topk_iter = nullptr;
+    if (OB_FAIL(init_daat_iter_param(iter_param))) {
+    } else if (OB_ISNULL(topk_iter = OB_NEWx(ObTextDaaTTopKIter, &myself_allocator_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(topk_iter->init(iter_param))) {
+    } else {
+      sparse_retrieval_iter_ = topk_iter;
+    }
   } else if (topk_mode_) {
     ObTextDaaTParam iter_param;
     ObTextBMWIter *bmw_iter = nullptr;
@@ -576,6 +589,7 @@ int ObDASLegacyTRMergeIter::set_children_iter_rangekey()
       } else if (FALSE_IT(inv_idx_scan_range.group_idx_ = group_idx)) {
       } else if (OB_FAIL(inv_scan_params_[i]->key_ranges_.push_back(inv_idx_scan_range))) {
       } else if (topk_mode_ && ir_ctdef_->need_block_max_scan()
+          && !block_max_scan_params_.empty()
           && OB_FAIL(block_max_scan_params_[i]->key_ranges_.push_back(inv_idx_scan_range))) {
       }
     }

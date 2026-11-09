@@ -91,12 +91,13 @@ private:
       bool &is_candidate_range,
       const ObDatum *&min_domain_id_with_pivot,
       const ObDatum *&max_domain_id_without_pivot);
-  int project_rows_from_top_k_heap(const int64_t capacity, int64_t &count);
   int advance_dim_iters_for_next_round(const ObDatum &target_id, const bool iter_end_available);
   void set_next_round_iter_end(const int64_t idx) { next_round_iter_idxes_[idx] = -1; }
   bool is_next_round_iter_end(const int64_t idx) const { return next_round_iter_idxes_[idx] == -1; }
 
 protected:
+  // Shared with the DaaT top-k engine, which fills the same heap and projects it the same way.
+  int project_rows_from_top_k_heap(const int64_t capacity, int64_t &count);
   enum BMWStatus{
     FIND_NEXT_PIVOT,
     EVALUATE_PIVOT_RANGE,

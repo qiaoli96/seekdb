@@ -108,6 +108,13 @@ private:
   int init_topk_limit();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
+  // Pushdown top-k runs as a straight DaaT walk plus the top-k heap (ObTextDaaTTopKIter) instead
+  // of WAND plus block max pivoting. Measured on the bench table: the block max cursors cannot be
+  // driven by a plain forward walk at all -- they need advance_to to raise their block caps and
+  // answer OB_ERR_UNEXPECTED otherwise -- so the walk runs on the plain token cursors a DaaT scan
+  // already uses. Flipping this back restores the WAND engine.
+  static constexpr bool TOPK_BLOCK_MAX_ROUTE = false;
+  bool topk_daat() const { return topk_mode_ && !TOPK_BLOCK_MAX_ROUTE; }
 private:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:
