@@ -16,6 +16,7 @@
 
 #include "ob_hipvs_adaptor.h"
 
+#include "lib/ob_errno.h"
 #include "lib/utility/ob_macro_utils.h"
 
 #include <cstring>

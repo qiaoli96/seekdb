@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "lib/ob_errno.h"
-
 #include <stdint.h>
 #include <string>
 
