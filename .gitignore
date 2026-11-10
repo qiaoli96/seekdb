@@ -1,0 +1,21 @@
+# 构建产物
+build/
+build-*/
+*.o
+*.obj
+*.exe
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# 官方公开题包副本（第三方内容，不入库；自测时从 upstream 拉）
+ref/
+
+# 抓取的题面文档
+_yuque/
+
+# 临时
+/tmp/
+*.log
+tools/daemon.json

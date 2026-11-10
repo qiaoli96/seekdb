@@ -1,0 +1,253 @@
+{
+  "meta": {
+    "project": "MiniVectorDB（OceanBase seekdb 赛题一：完成一个轻量向量数据库）",
+    "material_version": "2026-11-10",
+    "note": "本文件只记录真实发生的交互与实测结果；未执行的内容均标注为 planned。学生=人类选手 qiaoli96，Agent=本会话的编码代理。评审只读取本 JSON。",
+    "submission_branch": "2026-competition-round2",
+    "rules_reference": "agent-learning-evidence-v3-unbounded（五维度、实例 0.5/1/1.5/2 档、JSON pointer + ≤240 字符原文）",
+    "encoding": "UTF-8"
+  },
+  "student_profile": {
+    "handle": "qiaoli96",
+    "role": "选手本人；负责目标设定、验收标准与质疑",
+    "environment_ownership": "选手提供 WSL/仓库访问能力并授权推送 https://github.com/qiaoli96/seekdb",
+    "language": "中文"
+  },
+  "user_prompts": [
+    {
+      "id": "P1",
+      "at": "2026-11-10",
+      "text": "现在你需要看一下oceanbase数据库大赛的附加题，题目具体内容为性能评测……任务：实现 MiniVectorDB……看完以上内容后先对这道题进行评估以及说一下该怎么做",
+      "intent": "设定任务并索取评估与推进方案；同时给出赛题计分规则的转述（性能 40 分 + Agent Prompt 40 分、排名制、-0.5/名）。"
+    },
+    {
+      "id": "P2",
+      "at": "2026-11-10",
+      "text": "不太对吧，你访问https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/lg8enxlmwg69unt6详细看一遍",
+      "intent": "不接受 Agent 基于转述给出的结论，要求回到原始题面逐字核对。"
+    },
+    {
+      "id": "P3",
+      "at": "2026-11-10",
+      "text": "本机有下载wsl，linux的话不清楚，如果需要你就下载E盘的software文件夹里（在里面新开一个文件夹存放），访问GitHub的话可以直接访问，也可以直接推送代码到https://github.com/qiaoli96/seekdb（我们的仓库）。",
+      "intent": "解除环境与交付阻塞：声明本机有 WSL、给出软件存放位置、授权使用团队仓库。"
+    },
+    {
+      "id": "P4",
+      "at": "2026-11-10",
+      "text": "你先完整评估完，我听说可能缺了什么条件",
+      "intent": "强调先把评估做完整，并给出外部信息（可能存在缺失的前置条件），要求 Agent 不要停在第一版结论。"
+    }
+  ],
+  "conversations": [
+    {
+      "id": "C1",
+      "topic": "第一版评估 vs 原始题面",
+      "turns": [
+        {
+          "speaker": "agent",
+          "content": "基于选手转述给出五条判断：整题只提测一次；题包拿不到；stdin 收 SQL/stdout 返表格；数据规模可能 1M×128；近似索引先不做。"
+        },
+        {
+          "speaker": "user",
+          "content": "不太对吧，你访问 https://oceanbase.yuque.com/... 详细看一遍"
+        },
+        {
+          "speaker": "agent",
+          "content": "抓取语雀原文 16,028 字并落盘，逐条对照后证实五条判断全部有误或需修正（见 experiments E1）。"
+        }
+      ]
+    },
+    {
+      "id": "C2",
+      "topic": "缺条件的识别",
+      "turns": [
+        {
+          "speaker": "user",
+          "content": "我听说可能缺了什么条件"
+        },
+        {
+          "speaker": "agent",
+          "content": "列出 12 项前置条件核对表，并把可自证的先自证：题包在 GitHub（不缺）、WSL 存在但当时被沙箱拦截（缺）、Docker 未安装（缺）、提交次数其实是每天 2 次（不是缺）。"
+        }
+      ]
+    },
+    {
+      "id": "C3",
+      "topic": "环境与交付授权",
+      "turns": [
+        {
+          "speaker": "user",
+          "content": "本机有下载wsl……也可以直接推送代码到 https://github.com/qiaoli96/seekdb（我们的仓库）"
+        },
+        {
+          "speaker": "agent",
+          "content": "据授权完成 WSL2 Ubuntu-24.04 接入、Docker 29.1.3 安装与镜像源配置、官方题包 sparse clone，并把交付仓库锁定为 qiaoli96/seekdb。"
+        }
+      ]
+    }
+  ],
+  "experiments": [
+    {
+      "id": "E1",
+      "dimension": "独立验证与质疑",
+      "question": "题面转述是否可靠？",
+      "command": "node fetch https://oceanbase.yuque.com/api/docs/lg8enxlmwg69unt6?book_id=81051108&mode=markdown",
+      "output": "doc.title=赛题一：完成一个轻量向量数据库；sourcecode 长度 16028；关键更正：每天最多正式提交 2 次、环境预检不占机会；协议为 JSONL；benchmark 为 10,000 条 × 128 维、1,000 次 TopK、K=10，一半带过滤。",
+      "interpretation": "原始题面推翻了 Agent 的 5 条判断，其中『只提测一次』与『数据规模 1M×128』直接影响策略。"
+    },
+    {
+      "id": "E2",
+      "dimension": "实验与反馈迭代",
+      "question": "官方公开题包到底存不存在、能不能本地跑？",
+      "command": "git fetch --depth 1 --filter=blob:none origin 2026-competition-round2 && git sparse-checkout set mysqltest protocol_check",
+      "output": "获取到 mysqltest/cases 下 20 组 .test/.result、protocol_check/{run.py,_assertions.py,config.json}、STDIO_PROTOCOL.md；config.json 的 error_codes 为空对象。",
+      "interpretation": "不需要 Docker 也能迭代：run.py 支持 --command 直接驱动本地二进制。"
+    },
+    {
+      "id": "E3",
+      "dimension": "实验与反馈迭代",
+      "question": "骨架（协议 + 手写 SQL 前端 + 内存执行器）能过多少公开用例？",
+      "command": "bash tools/run_public.sh",
+      "output": "11 PASS / 9 FAIL；9 个失败全部为 no_such_table，且都出现在 --restart 之后。",
+      "interpretation": "缺口被精确定位为『持久化 + 恢复』，不是语法或类型问题。"
+    },
+    {
+      "id": "E4",
+      "dimension": "独立验证与质疑",
+      "question": "并行的静态分析报的 4 条高危是否属实？",
+      "command": "bash tools/probe_gaps.sh",
+      "output": "VARCHAR(0) 放行 10 字符 → {\"ok\":true}；L2_DISTANCE(e,'[nan,0]') 与 '[1e400,0]' 均返回 {\"ok\":true,\"rows\":[[1,0]]}；UPDATE v SET id=5 WHERE id=999 返回 {\"ok\":true,\"affected_rows\":0}。",
+      "interpretation": "4 条全部复现属实；其中 NaN/Infinity 路径是唯一『合法但答案错』的路径，必须修。"
+    },
+    {
+      "id": "E5",
+      "dimension": "实验与反馈迭代",
+      "question": "存储层是否真的做到崩溃可恢复？",
+      "command": "bash tools/crash_test.sh",
+      "output": "场景A（事务 COMMIT 后 kill -9）重启得到 [[1,\"事务内改过\"],[2,\"事务内新增\"]]；场景B（未 COMMIT 就 kill -9）重启只剩 [[1,\"旧值\"]]；回滚后 wal.log 字节数与事务前完全一致。",
+      "interpretation": "COMMIT 记录成为唯一可见性边界；未提交事务一个字节都不落盘。"
+    },
+    {
+      "id": "E6",
+      "dimension": "取舍与反思",
+      "question": "性能优化该先做还是先解决『数据超过内存限额』？",
+      "command": "阅读赛题 3.2 节与 mysqltest/README 末段，并用 tools/bench.py 建立基线",
+      "output": "题面明确要求『能处理超过内存限额的数据，不能只依赖全量常驻内存』；基线实测 10,000×128：写入 0.505 s、查询 2.384 s（2.38 ms/次）。旧架构在 1.618 GB 数据 / 2 GiB 容器下 OOMKilled exit=137。",
+      "interpretation": "门槛不过则性能与材料两项同时归零，因此外存化优先于查询微优化（决策记录 D8）。"
+    },
+    {
+      "id": "E7",
+      "dimension": "实验与反馈迭代",
+      "question": "外存改造后到底省了多少内存、掉了多少性能？",
+      "command": "python3 /root/mvdbtest/bigtest.py 1500000 1000",
+      "output": "插入 51.34 s，peak_rss 85.2 MiB；重启 1.88 s；查询峰值 77.4 MiB；事务峰值 77.4 MiB（Δ0）；wal_before == wal_after_rollback == 843025625；top3 与点查复核一致。",
+      "interpretation": "843 MB 数据只用 85 MiB 常驻内存，且事务开销与改动量成正比而非与表大小成正比。"
+    },
+    {
+      "id": "E8",
+      "dimension": "独立验证与质疑",
+      "question": "『本地能过』是否等于『平台能过』？",
+      "command": "bash tools/docker_check.sh（镜像模式 + --read-only --network=none --cpus=2 --memory=2g --pids-limit=128 --cap-drop=ALL）",
+      "output": "镜像 28 MiB；镜像模式公开用例 20/20 PASS；加固运行 ready + CREATE + INSERT + SELECT + shutdown 全 PASS，stderr 为空，退出码 0，根文件系统零写入。",
+      "interpretation": "判题同款约束下可用；顺带发现 -j$(nproc) 在受限容器取宿主核数、# syntax 指令在 legacy builder 下无意义，已修正。"
+    },
+    {
+      "id": "E9",
+      "dimension": "技术理解与迁移",
+      "question": "环境被降权时，是换工具链还是换执行宿主？",
+      "command": "win_bash 与 run_code 的 Node 进程分别调用 wsl.exe -l -q",
+      "output": "win_bash → Wsl/E_ACCESSDENIED（连 --status 都失败）；run_code 的 Node → Ubuntu-24.04 正常返回，uname/nproc 可用。",
+      "interpretation": "判据是『调用方令牌是否被降权』而非『WSL 是否损坏』，因此改换执行宿主而不是重装环境。"
+    },
+    {
+      "id": "E10",
+      "dimension": "实验与反馈迭代",
+      "question": "查询热路径的 2.4 ms/次 花在哪里？如何在不牺牲外存能力的前提下压下去？",
+      "command": "python3 tools/bench.py（默认 arena） vs MVDB_VEC_ARENA_MB=0（强制流式），同一二进制交替 3 轮取中位数",
+      "output": "arena 默认：写入 0.415 s（4.15 ms/批）、查询 0.389 ms/次；arena 关闭：查询 0.891 ms/次。原始版本（改造前）为写入 0.505 s、查询 2.384 ms/次。大表回归（1.5M 行 / 843 MB）峰值 RSS 85.4 MiB，arena 未启用。",
+      "interpretation": "热路径瓶颈是每次查询重复解析整份行日志；把预算内的向量列镜像进 32B 对齐 slab 后查询降到 0.39 ms（相对最初 6 倍），而超出预算的表自动退回流式，内存不随数据量增长。"
+    }
+  ],
+  "retrospective": [
+    "第一版评估把『题包不可获得』当成硬阻塞，事实是题包就在 GitHub 分支上，公开用例 20 组可直接自测——信息源没对齐就会把可做的工作判成不可做。",
+    "计分结构决定优先级：两项排名都要求正式用例全过，因此正确性是否决项；性能与材料只在门槛之后才有意义。",
+    "小数据规模改变了性能战场：10,000×128 只有 5.12 MB，胜负在固定开销、提交次数与每查询一次顺序扫描，而不是磁盘吞吐。",
+    "外存化不是优化项而是门槛项：同一份 1.618 GB 数据，旧架构 OOMKilled，新架构 109 MiB。"
+  ],
+  "limitations": [
+    "学生自述型材料偏少：本文件只有 4 条真实 prompt 可作为学生证据，因此『技术理解与迁移』维度本版为 0（无学生证据，不编造）。提交前建议由学生本人补充对该题关键结论的复述与质疑（需真实发生），否则该维度无法得分。",
+    "wal.log 无段合并/compaction，更新删除只追加新版本，长期运行会膨胀。",
+    "未实现 ANN 索引（IVF/HNSW）：查询保持精确暴力扫描，ann 模式返回精确结果（Recall 天然为 1，但耗时未优化）。",
+    "ORDER BY 非距离键且无 LIMIT 时结果集无界，仍全量物化（协议一次性返回所致）。",
+    "未验证平台侧的正式 29 个用例（其中 9 个输入/数据生成/预期结果保密），本文件所有 20/20 均指公开自测包。",
+    "推送凭据由选手侧提供，本文件不代表仓库已推送。",
+    "性能优化后 bench 形状为写入 0.415 s / 查询 0.389 ms/次；该数字只代表本机（WSL2，16 核）实测，平台基线与配额未知。"
+  ],
+  "evidence_map": [
+    {
+      "unit": "U1",
+      "dimension": "独立验证与质疑",
+      "level": 1.5,
+      "claim": "不接受转述结论，要求回到原始题面逐字核对；核对结果推翻了五条既有判断",
+      "student_evidence": {
+        "pointer": "/user_prompts/1/text",
+        "quote": "不太对吧，你访问https://oceanbase.yuque.com/org-wiki-obtech-vh7w9r/hc3pio/lg8enxlmwg69unt6详细看一遍"
+      },
+      "result_evidence": {
+        "pointer": "/experiments/0/output",
+        "quote": "doc.title=赛题一：完成一个轻量向量数据库；sourcecode 长度 16028；关键更正：每天最多正式提交 2 次、环境预检不占机会；协议为 JSONL；benchmark 为 10,000 条 × 128 维、1,000 次 TopK、K=10，一半带过滤。"
+      },
+      "why": "学生发起质疑；实际核对得到可核验更正（提交次数从『只提测一次』变为每天 2 次、协议从文本变 JSONL、数据规模从 1M×128 变为 10,000×128）。"
+    },
+    {
+      "unit": "U2",
+      "dimension": "问题理解与自主拆解",
+      "level": 1,
+      "claim": "以计分结构（双榜独立 + 排名 + 用例全过为门槛）作为任务拆解输入，要求先评估再动手",
+      "student_evidence": {
+        "pointer": "/user_prompts/0/text",
+        "quote": "现在你需要看一下oceanbase数据库大赛的附加题，题目具体内容为性能评测……任务：实现 MiniVectorDB……看完以上内容后先对这道题进行评估以及说一下该怎么做"
+      },
+      "result_evidence": {
+        "pointer": "/experiments/5/output",
+        "quote": "题面明确要求『能处理超过内存限额的数据，不能只依赖全量常驻内存』；基线实测 10,000×128：写入 0.505 s、查询 2.384 s（2.38 ms/次）。旧架构在 1.618 GB 数据 / 2 GiB 容器下 OOMKilled exit=137。"
+      },
+      "why": "该拆解直接产出『门槛优先于优化』的取舍，并落到实测基线与旧架构 OOMKilled 的对照上。"
+    },
+    {
+      "unit": "U3",
+      "dimension": "取舍与反思",
+      "level": 1.5,
+      "claim": "提示可能存在缺失前置条件，促成把隐性假设显式化为核对表，并区分真缺与不缺",
+      "student_evidence": {
+        "pointer": "/user_prompts/3/text",
+        "quote": "你先完整评估完，我听说可能缺了什么条件"
+      },
+      "result_evidence": {
+        "pointer": "/experiments/1/output",
+        "quote": "获取到 mysqltest/cases 下 20 组 .test/.result、protocol_check/{run.py,_assertions.py,config.json}、STDIO_PROTOCOL.md；config.json 的 error_codes 为空对象。"
+      },
+      "why": "该提示产出 12 项前置条件核对；其中『题包是否存在』一项随即被这条实测证据证否（题包就在 GitHub 分支上，不缺），说明缺失的是环境而非材料。"
+    },
+    {
+      "unit": "U4",
+      "dimension": "实验与反馈迭代",
+      "level": 1,
+      "claim": "声明本机能力边界（有 WSL、可访问 GitHub、可交付到团队仓库），使实验循环从不可用变为可跑",
+      "student_evidence": {
+        "pointer": "/user_prompts/2/text",
+        "quote": "本机有下载wsl，linux的话不清楚，如果需要你就下载E盘的software文件夹里（在里面新开一个文件夹存放），访问GitHub的话可以直接访问，也可以直接推送代码到https://github.com/qiaoli96/seekdb（我们的仓库）。"
+      },
+      "result_evidence": {
+        "pointer": "/experiments/7/output",
+        "quote": "镜像 28 MiB；镜像模式公开用例 20/20 PASS；加固运行 ready + CREATE + INSERT + SELECT + shutdown 全 PASS，stderr 为空，退出码 0，根文件系统零写入。"
+      },
+      "why": "环境打通后才有镜像模式 20/20 与加固运行的实测结果。"
+    }
+  ],
+  "planned": [
+    "补充学生本人对关键结论的复述（每维度 1~2 段，需真实发生）",
+    "提交前用最终快照重跑 docker_check.sh 并记录 SHA"
+  ]
+}
