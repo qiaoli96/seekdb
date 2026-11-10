@@ -64,8 +64,8 @@ int ObIKArbitrator::process(TokenizeContext &ctx)
                                     judge_result))) {
         } else if (OB_FAIL(add_chain(judge_result))) {
         } else {
-          // add best chain and delete origin chain
-          OB_DELETEx(ObIKTokenChain, &alloc_, chain_need_arbitrate);
+          // add the best chain; the origin chain is dropped without an explicit
+          // destructor call -- the arena is reset at the end of the batch
         }
 
         // start a new chain
@@ -112,6 +112,7 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
   int ret = OB_SUCCESS;
 
   int64_t char_len = 0;
+  int64_t chain_cursor = 0;
   ObIKTokenChain *chain = nullptr;
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
     ObFTCharUtil::CharType type;
@@ -126,9 +127,7 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                          type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
+    } else if (OB_ISNULL(chain = find_chain(chain_cursor, current))) {
       if (!keep_single()) {
         // skip single word
       } else {
@@ -254,8 +253,7 @@ int ObIKArbitrator::optimize(TokenizeContext &ctx,
     }
   }
 
-  // any way, free option
-  OB_DELETEx(ObIKTokenChain, &alloc_, option);
+  // option is not destructed explicitly; the arena is reset per batch
 
   if (OB_FAIL(ret)) {
     OB_DELETEx(ObIKTokenChain, &alloc_, best);
@@ -302,14 +300,53 @@ int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
 
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
+  // one chain needs at least one token, so the number of candidate tokens of
+  // this batch is an upper bound of the number of chains and sizing the array
+  // once here keeps add_chain allocation-free.
+  const int64_t max_chains = ctx.token_list().tokens().size();
+  if (max_chains > 0 && OB_FAIL(ensure_chain_capacity(max_chains))) {
   }
   return ret;
 }
 
-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
+int ObIKArbitrator::ensure_chain_capacity(const int64_t need)
+{
+  int ret = OB_SUCCESS;
+
+  if (need > chain_cap_) {
+    int64_t cap = chain_cap_ > 0 ? chain_cap_ : 16;
+    while (cap < need) {
+      cap *= 2;
+    }
+    ObIKTokenChain **buf = static_cast<ObIKTokenChain **>(
+        alloc_.alloc(cap * static_cast<int64_t>(sizeof(ObIKTokenChain *))));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("alloc memory failed", K(ret), K(cap));
+    } else {
+      if (chain_cnt_ > 0) {
+        MEMCPY(buf, chains_, chain_cnt_ * static_cast<int64_t>(sizeof(ObIKTokenChain *)));
+      }
+      chains_ = buf;
+      chain_cap_ = cap;
+    }
+  }
+  return ret;
+}
+
+ObIKTokenChain *ObIKArbitrator::find_chain(int64_t &cursor, const int64_t offset) const
+{
+  while (cursor < chain_cnt_ && chains_[cursor]->min_offset() < offset) {
+    ++cursor;
+  }
+  return (cursor < chain_cnt_ && chains_[cursor]->min_offset() == offset) ? chains_[cursor]
+                                                                        : nullptr;
+}
+
+ObIKArbitrator::ObIKArbitrator()
+    : alloc_(lib::ObMemAttr("IK Arbitrator")), chains_(nullptr), chain_cnt_(0), chain_cap_(0)
+{
+}
 
 int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
 {
@@ -318,14 +355,18 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else if (OB_FAIL(ensure_chain_capacity(chain_cnt_ + 1))) {
+  } else {
+    chains_[chain_cnt_++] = chain;
   }
   return ret;
 }
 
 ObIKArbitrator::~ObIKArbitrator()
 {
-  chains_.destroy();
+  chains_ = nullptr;
+  chain_cnt_ = 0;
+  chain_cap_ = 0;
   alloc_.reset();
 }
 } // namespace storage

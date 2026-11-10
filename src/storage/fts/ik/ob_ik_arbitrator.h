@@ -18,7 +18,6 @@
 #define _OCEANBASE_STORAGE_FTS_IK_OB_IK_ARBITRATOR_H_
 
 #include "lib/allocator/page_arena.h"
-#include "lib/hash/ob_hashmap.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/fts/ik/ob_ik_token.h"
 
@@ -60,8 +59,27 @@ private:
   bool keep_single() const { return true; }
 
 private:
+  int ensure_chain_capacity(const int64_t need);
+
+  ObIKTokenChain *find_chain(int64_t &cursor, const int64_t offset) const;
+
+private:
+  // Chains are appended in ascending min_offset order and are looked up with a
+  // monotonic cursor instead of a hash lookup:
+  //   * the batch's candidate tokens are popped from ctx.token_list(), which is
+  //     ordered by (offset asc, length desc);
+  //   * a chain is closed exactly when the next token does not overlap it, and
+  //     that token then opens the following chain, so the following chain's
+  //     min_offset is >= the closed chain's max_offset_ > its min_offset.
+  // Hence min_offset strictly increases along the array, which makes the cursor
+  // walk in output_result equivalent to the previous per-offset hash lookup
+  // (a hit at offset iff some chain has min_offset == offset).
+  // It also replaces the per-batch ObHashMap (create + one hash insert per chain
+  // + destroy) with a single arena allocation and sequential access.
   ObArenaAllocator alloc_;
-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+  ObIKTokenChain **chains_;
+  int64_t chain_cnt_;
+  int64_t chain_cap_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);
