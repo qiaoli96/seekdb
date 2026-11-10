@@ -17,6 +17,7 @@
 #include "object/ob_object.h"
 #define USING_LOG_PREFIX STORAGE_FTS
 
+
 #include "share/rc/ob_server_runtime.h"
 #include "storage/fts/ob_fts_stop_word.h"
 #include "storage/fts/ob_fts_parser_helper.h"
@@ -164,15 +165,41 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    static const bool fast_off = nullptr != ::getenv("OB_AW_FAST_OFF")
+                                || nullptr != ::getenv("OB_AW_CD_OFF");
+    static const bool copy_always = nullptr != ::getenv("OB_AW_COPY_ALWAYS");
+    const ObString src_str = src.get_word().get_string();
+    // Only an ASCII upper case byte can be rewritten by the case conversion of this collation.
+    // A word with none of them is therefore byte identical after the conversion, so the copy and
+    // the per character walk are both avoidable.
+    bool may_change = false;
+    for (int64_t i = 0; !may_change && i < src_str.length(); ++i) {
+      const unsigned char c = static_cast<unsigned char>(src_str.ptr()[i]);
+      may_change = c >= 'A' && c <= 'Z';
+    }
+    if (!may_change && !fast_off) {
+      if (copy_always) {
+        ObString dst_str;
+        if (OB_FAIL(ob_write_string(allocator_, src_str, dst_str))) {
+        } else {
+          ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+          dst = tmp;
+        }
+      } else {
+        ObFTWord tmp(src_str.length(), src_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;
