@@ -23,14 +23,19 @@
 #include <strings.h>
 #include <map>
 #include "vsag/vsag.h"
-#include "vsag/constants.h"
-#include "vsag/binaryset.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
 #include "vsag/search_param.h"
 #include "vsag/index.h"
 #include "vsag/options.h"
 #include "vsag/factory.h"
+#if defined(SEEKDB_WITH_HIPVS)
+// Only the GPU build path reads the hnswlib bytes out of a vsag BinarySet, so
+// these headers stay out of the default build: the installed vsag SDK does not
+// have to provide them.
+#include "vsag/constants.h"
+#include "vsag/binaryset.h"
+#endif
 #include "lib/ob_errno.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/utility/ob_print_utils.h"

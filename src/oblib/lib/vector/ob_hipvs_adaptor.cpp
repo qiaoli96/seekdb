@@ -153,11 +153,14 @@ int build_hnsw_index(const HipvsBuildParam &param, std::string &index_file)
     hnsw_params->num_threads = param.num_threads_;
 
     memset(&dataset, 0, sizeof(dataset));
+    // DLPack keeps the shape and the strides in arrays the caller owns.
+    int64_t shape[2] = {param.count_, static_cast<int64_t>(param.dim_)};
+    int64_t strides[2] = {static_cast<int64_t>(param.dim_), 1};
     dataset.dl_tensor.data = const_cast<float *>(param.vectors_);
     dataset.dl_tensor.device = {kDLCPU, 0};
     dataset.dl_tensor.ndim = 2;
-    dataset.dl_tensor.shape = {param.count_, static_cast<int64_t>(param.dim_)};
-    dataset.dl_tensor.strides = {param.dim_, 1};
+    dataset.dl_tensor.shape = shape;
+    dataset.dl_tensor.strides = strides;
     dataset.dl_tensor.dtype = {kDLFloat, 32, 1};
     dataset.dl_tensor.byte_offset = 0;
 
