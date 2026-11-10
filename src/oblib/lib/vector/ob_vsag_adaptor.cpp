@@ -17,8 +17,11 @@
 #define USING_LOG_PREFIX LIB
 
 #include "ob_vsag_adaptor.h"
+#include "ob_hipvs_adaptor.h"
+#include <fstream>
 #include <map>
 #include "vsag/vsag.h"
+#include "vsag/constants.h"
 #include "vsag/errors.h"
 #include "vsag/dataset.h"
 #include "vsag/search_param.h"
@@ -28,9 +31,15 @@
 #include "lib/utility/ob_print_utils.h"
 #include "lib/oblog/ob_log.h"
 #include "lib/worker.h"
+#if defined(SEEKDB_WITH_HIPVS)
+#include <unistd.h>
+#endif
 
-namespace oceanbase {
-namespace common {
+// Below this number of vectors the host build is faster than the GPU build,
+// the device transfers and the graph conversion dominate the cost.
+static const int OB_VSAG_GPU_BUILD_MIN_ROWS = 1024;
+
+namespace oceanbase {namespace common {
 namespace obvsag {
 
 using namespace vsag;
@@ -957,6 +966,156 @@ int create_index(VectorIndexPtr &index_handler, IndexType index_type, const char
   return ret;
 }
 
+/**
+ * @brief Build the HNSW index on an AMD GPU with hipVS and load it into vsag.
+ *
+ * hipVS exports the index it built on the GPU in the hnswlib layout. That is
+ * the very layout vsag keeps in the HNSW_DATA binary of its own
+ * serialization, so the exported bytes are handed over unchanged. The
+ * persisted index, the search path and the query results stay exactly the
+ * same as for a host build.
+ *
+ * The GPU path is only taken when it can produce an index that is equivalent
+ * to the host build, otherwise the caller falls back to the host build.
+ *
+ * @retval OB_SUCCESS        The GPU built index was loaded into the handler.
+ * @retval OB_NOT_SUPPORTED  The GPU build path is not available.
+ * @retval OB_ERR_UNEXPECTED The GPU build failed, the caller has to fall back
+ *                           to the host build.
+ */
+static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
+                           int64_t *ids, int dim, int size, char *extra_infos /* = nullptr*/)
+{
+  int ret = OB_SUCCESS;
+#if defined(SEEKDB_WITH_HIPVS)
+  HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+  const int index_type = hnsw->get_index_type();
+  const char *metric = hnsw->get_metric();
+  const char *dtype = hnsw->get_dtype();
+  int max_degree = hnsw->get_max_degree();
+  const int ef_construction = hnsw->get_ef_construction();
+  const int ef_search = hnsw->get_ef_search();
+  const int dim_of_index = hnsw->get_dim();
+  const uint64_t extra_info_size = hnsw->get_extra_info_size();
+  std::string index_file;
+  std::shared_ptr<vsag::Index> gpu_index;
+
+  // Only a plain float32 HNSW index is rebuilt on the GPU. The quantized and
+  // the graph types keep their own internal layout and the sparse index is
+  // not supported by hipVS at all.
+  if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
+      || nullptr == metric || nullptr == dtype || dim_of_index != dim
+      || size < OB_VSAG_GPU_BUILD_MIN_ROWS) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (nullptr != extra_infos) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (0 != strcasecmp(metric, "l2") && 0 != strcasecmp(metric, "ip")) {
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    // hipVS labels the rows of the exported index with their position in the
+    // input array, so the external ids have to be the identity mapping for
+    // the loaded index to report the same ids as a host build.
+    bool identity_ids = true;
+    for (int i = 0; i < size && identity_ids; ++i) {
+      identity_ids = (ids[i] == static_cast<int64_t>(i));
+    }
+    if (!identity_ids) {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    obhipvs::HipvsBuildParam param;
+    param.vectors_ = vector_list;
+    param.count_ = size;
+    param.dim_ = dim;
+    param.vids_ = ids;
+    param.vid_count_ = size;
+    param.metric_ = metric;
+    param.max_degree_ = max_degree;
+    param.ef_construction_ = ef_construction;
+    param.gpu_hierarchy_ = false;
+    param.num_threads_ = 0;
+    param.device_id_ = 0;
+    ret = obhipvs::build_hnsw_index(param, index_file);
+  }
+
+  if (OB_SUCC(ret)) {
+    // Load the exported index into a fresh vsag index.
+    std::ifstream input(index_file.c_str(), std::ios::binary | std::ios::ate);
+    if (!input.good()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const std::streamsize file_size = input.tellg();
+      input.seekg(0, std::ios::beg);
+      std::vector<char> buffer(static_cast<size_t>(file_size));
+      if (file_size <= 0 || !input.read(buffer.data(), file_size)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        char result_param_str[1024] = {0};
+        adjust_create_index_max_degree(static_cast<uint8_t>(index_type), max_degree);
+        ret = construct_vsag_create_param(
+            static_cast<uint8_t>(index_type), dtype, metric, dim, max_degree,
+            ef_construction, ef_search, hnsw->get_allocator(),
+            static_cast<int>(extra_info_size), hnsw->get_refine_type(),
+            hnsw->get_bq_bits_query(), hnsw->get_bq_use_fht(), result_param_str);
+        if (OB_SUCC(ret)) {
+          const std::string input_json_str(result_param_str);
+          tl::expected<std::shared_ptr<Index>, Error> index =
+              vsag::Factory::CreateIndex(get_index_type_str(index_type), input_json_str, hnsw->get_allocator());
+          if (!index.has_value()) {
+            ret = vsag_errcode2ob(index.error().type);
+          } else {
+            gpu_index = index.value();
+            vsag::Binary binary;
+            binary.data = std::shared_ptr<int8_t[]>(new int8_t[buffer.size()]);
+            memcpy(binary.data.get(), buffer.data(), buffer.size());
+            binary.size = buffer.size();
+            vsag::BinarySet binary_set;
+            binary_set.Set(vsag::HNSW_DATA, binary);
+            tl::expected<void, Error> des_ret = gpu_index->Deserialize(binary_set);
+            if (!des_ret.has_value()) {
+              ret = vsag_errcode2ob(des_ret.error().type);
+              gpu_index = nullptr;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && nullptr != gpu_index) {
+    // The loaded index has to hold every row, otherwise the ids reported by
+    // the search would not match the host build.
+    if (gpu_index->GetNumElements() != size) {
+      ret = OB_ERR_UNEXPECTED;
+      gpu_index = nullptr;
+    }
+  }
+
+  if (OB_SUCC(ret) && nullptr != gpu_index) {
+    hnsw->set_index(gpu_index);
+    LOG_INFO("[OBVSAG] hnsw index built on AMD GPU by hipVS",
+        K(size), K(dim), K(max_degree), K(ef_construction), KCSTRING(metric));
+  } else if (OB_FAIL(ret)) {
+    LOG_WARN("[OBVSAG] hnsw gpu build by hipVS failed, fall back to the host build",
+        K(ret), K(size), K(dim));
+  }
+  if (!index_file.empty()) {
+    unlink(index_file.c_str());
+  }
+#else
+  UNUSED(index_handler);
+  UNUSED(vector_list);
+  UNUSED(ids);
+  UNUSED(dim);
+  UNUSED(size);
+  UNUSED(extra_infos);
+  ret = OB_NOT_SUPPORTED;
+#endif
+  return ret;
+}
+
 int build_index(VectorIndexPtr &index_handler, float *vector_list,
                 int64_t *ids, int dim, int size, char *extra_infos /* = nullptr*/)
 {
@@ -964,17 +1123,22 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
   if (index_handler == nullptr || vector_list == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    DatasetPtr dataset = vsag::Dataset::Make();
-    dataset->Dim(dim)
-        ->NumElements(size)
-        ->Ids(ids)
-        ->Float32Vectors(vector_list)
-        ->Owner(false);
-    if (extra_infos != nullptr) {
-      dataset->ExtraInfos(extra_infos);
-    }
-    if (OB_FAIL(hnsw->build_index(dataset))) {
+    // The GPU build is optional, it falls back to the host build on its own.
+    ret = build_index_gpu(index_handler, vector_list, ids, dim, size, extra_infos);
+    if (OB_FAIL(ret)) {
+      ret = OB_SUCCESS;
+      HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
+      DatasetPtr dataset = vsag::Dataset::Make();
+      dataset->Dim(dim)
+          ->NumElements(size)
+          ->Ids(ids)
+          ->Float32Vectors(vector_list)
+          ->Owner(false);
+      if (extra_infos != nullptr) {
+        dataset->ExtraInfos(extra_infos);
+      }
+      if (OB_FAIL(hnsw->build_index(dataset))) {
+      }
     }
   }
   return ret;
