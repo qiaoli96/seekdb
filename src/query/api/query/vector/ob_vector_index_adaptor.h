@@ -752,6 +752,13 @@ public:
   int init_hnswsq_mem_data();
   int check_snap_hnswsq_index();
   int build_hnswsq_index(ObVectorIndexParam *param);
+  // one shot bulk build of the snapshot index, shared by the hnsw+sq/bq types and the plain hnsw type
+  int build_snap_index(ObVectorIndexParam *param, bool is_hnswsq);
+  // accumulate the rows of a plain hnsw snapshot build, the index is built in one shot when the build is over
+  int add_hnsw_snap_rows(ObVectorIndexParam *param, float *vectors, int64_t *vids, char *extra_info_buf, int num);
+  // the bulk build buffer is full, materialize the index with the rows accumulated so far
+  int flush_hnsw_snap_buffer(ObVectorIndexParam *param);
+  int get_hnsw_bulk_build_buffer_limit(int64_t &limit);
   bool is_mem_data_init_atomic(ObVectorIndexRecordType type);
   int try_init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX) {
     int ret = OB_SUCCESS;

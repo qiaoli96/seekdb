@@ -39,6 +39,12 @@ namespace oceanbase
 namespace share
 {
 
+// Upper bound of the transient buffer that holds the rows of a plain hnsw bulk
+// build. The bulk build needs every vector of the table in memory at once, so
+// the buffer is bounded: once the limit is reached the build falls back to the
+// incremental add path, the index stays correct, it is just not bulk built.
+static constexpr int64_t VEC_INDEX_HNSW_BULK_BUILD_MAX_BUFFER_SIZE = 512LL * 1024 * 1024;
+
 ObVectorIndexInfo::ObVectorIndexInfo()
   : rowkey_vid_table_id_(common::OB_INVALID_ID),
     vid_rowkey_table_id_(common::OB_INVALID_ID),
@@ -1691,8 +1697,23 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
   } else if (OB_FAIL(get_extra_info_actual_size(extra_info_actual_size))) {
   } else {
     if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
-        param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH ||
-        param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
+        param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH) {
+      // The rows are accumulated and the index is built in one shot when the
+      // build is over, a bulk build is much faster than one add per row.
+      if (OB_FAIL(init_hnswsq_mem_data())) {
+      } else if (num == 0 || OB_ISNULL(vectors)) {
+        // do nothing
+      } else if (OB_ISNULL(vids)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        char* extra_info_buf = nullptr;
+        if (OB_NOT_NULL(extra_objs) && extra_column_count > 0 && param->extra_info_actual_size_ > 0 &&
+            OB_FAIL(ObVecExtraInfo::extra_infos_to_buf(tmp_allocator, extra_objs, extra_column_count,
+                                                       param->extra_info_actual_size_, num, extra_info_buf))) {
+        } else if (OB_FAIL(add_hnsw_snap_rows(param, vectors, vids, extra_info_buf, num))) {
+        }
+      }
+    } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
       if (OB_FAIL(try_init_mem_data(VIRT_SNAP))) {
       } else if (num == 0 || OB_ISNULL(vectors)) {
         // do nothing
@@ -1796,7 +1817,130 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
   return ret;
 }
 
+int ObPluginVectorIndexAdaptor::get_hnsw_bulk_build_buffer_limit(int64_t &limit)
+{
+  int ret = OB_SUCCESS;
+  // The bulk build holds all the vectors of the table in memory at once, so the
+  // buffer that keeps them is bounded. Never take more than a quarter of the
+  // vector memory budget of the server for the buffer of a single tablet.
+  limit = VEC_INDEX_HNSW_BULK_BUILD_MAX_BUFFER_SIZE;
+  int64_t mem_limit = 0;
+  if (OB_SUCC(ObPluginVectorIndexHelper::get_vector_memory_limit_size(mem_limit)) && mem_limit > 0) {
+    limit = MIN(limit, mem_limit / 4);
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::add_hnsw_snap_rows(ObVectorIndexParam *param,
+                                                   float *vectors,
+                                                   int64_t *vids,
+                                                   char *extra_info_buf,
+                                                   int num)
+{
+  INIT_SUCC(ret);
+  TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+  if (OB_NOT_NULL(ATOMIC_LOAD(&(snap_data_->index_)))) {
+    // The snapshot index is already materialized, the row has to be added to it.
+    lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
+    lib::ObLightBacktraceGuard light_backtrace_guard(false);
+    if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, param->dim_, extra_info_buf, num))) {
+    }
+  } else {
+    // first: write into cache
+    if (OB_ISNULL(snap_data_->vid_array_) || OB_ISNULL(snap_data_->vec_array_) ||
+        (OB_NOT_NULL(extra_info_buf) && OB_ISNULL(snap_data_->extra_info_buf_))) {
+      // snap_data_->vid_array_ may be released by other thread.
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (int i = 0; OB_SUCC(ret) && i < num; i++) {
+        if (OB_FAIL(snap_data_->vid_array_->push_back(vids[i]))) {
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < static_cast<int64_t>(num) * param->dim_; i++) {
+        if (OB_FAIL(snap_data_->vec_array_->push_back(vectors[i]))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(extra_info_buf)) {
+        if (OB_FAIL(snap_data_->extra_info_buf_->append(extra_info_buf, num * param->extra_info_actual_size_))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        const int64_t row_count = snap_data_->vid_array_->count();
+        const int64_t used = row_count * (sizeof(int64_t) + param->dim_ * sizeof(float)
+                                          + param->extra_info_actual_size_);
+        int64_t limit = 0;
+        if (OB_FAIL(get_hnsw_bulk_build_buffer_limit(limit))) {
+        } else if (used > limit) {
+          // second: the buffer is full, the bulk build is not possible anymore
+          if (OB_FAIL(flush_hnsw_snap_buffer(param))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::flush_hnsw_snap_buffer(ObVectorIndexParam *param)
+{
+  INIT_SUCC(ret);
+  const char* const DATATYPE_FLOAT32 = "float32";
+  ObVecIdxVidArray *vid_array = snap_data_->vid_array_;
+  ObVecIdxVecArray *vec_array = snap_data_->vec_array_;
+  ObVecExtraInfoBuffer *extra_info_buf = snap_data_->extra_info_buf_;
+  if (OB_ISNULL(vid_array) || OB_ISNULL(vec_array) || OB_ISNULL(extra_info_buf)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!snap_data_->mem_ctx_->is_inited() &&
+             OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
+  } else {
+    lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
+    lib::ObLightBacktraceGuard light_backtrace_guard(false);
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(obvectorutil::create_index(snap_data_->index_,
+                                                  param->type_,
+                                                  DATATYPE_FLOAT32,
+                                                  VEC_INDEX_ALGTH[param->dist_algorithm_],
+                                                  param->dim_,
+                                                  param->m_,
+                                                  param->ef_construction_,
+                                                  param->ef_search_,
+                                                  snap_data_->mem_ctx_,
+                                                  param->extra_info_actual_size_,
+                                                  param->refine_type_,
+                                                  param->bq_bits_query_,
+                                                  param->bq_use_fht_))) {
+    } else if (vid_array->count() > 0 &&
+               OB_FAIL(obvectorutil::add_index(snap_data_->index_,
+                                               vec_array->get_data(),
+                                               vid_array->get_data(),
+                                               param->dim_,
+                                               extra_info_buf->ptr(),
+                                               vid_array->count()))) {
+    } else {
+      LOG_INFO("hnsw bulk build buffer is full, fall back to the incremental add path",
+               K(ret), K(param->dim_), K(vid_array->count()));
+    }
+    if (OB_SUCC(ret)) {
+      snap_data_->set_inited();
+      // The rows are in the index now, the buffer is not needed anymore.
+      free_hnswsq_array_data(snap_data_, get_allocator());
+    }
+    if (OB_FAIL(ret)) {
+      free_memdata_resource(VIRT_SNAP, snap_data_, get_allocator());
+      if (snap_data_->mem_ctx_->is_inited()) {
+        snap_data_->mem_ctx_->~ObVsagMemContext();
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
+{
+  return build_snap_index(param, true /* is_hnswsq */);
+}
+
+int ObPluginVectorIndexAdaptor::build_snap_index(ObVectorIndexParam *param, bool is_hnswsq)
 {
   INIT_SUCC(ret);
   const char* const DATATYPE_FLOAT32 = "float32";
@@ -1806,7 +1950,8 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
   if (OB_ISNULL(ATOMIC_LOAD(&(snap_data_->index_)))) {
     if (OB_NOT_NULL(ATOMIC_LOAD(&(snap_data_->index_)))) {
       // do nothing
-    } else if (OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
+    } else if (!snap_data_->mem_ctx_->is_inited() &&
+               OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
     } else {
       LOG_INFO("HgraphIndex build hnswsq index success", K(ret), K(param->dim_), K(vid_array->count()));
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
@@ -1825,7 +1970,8 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
                                              param->refine_type_,
                                              param->bq_bits_query_,
                                              param->bq_use_fht_))) {
-      } else if (OB_FAIL(obvectorutil::build_index(snap_data_->index_,
+      } else if (vid_array->count() > 0 &&
+                 OB_FAIL(obvectorutil::build_index(snap_data_->index_,
                                                    vec_array->get_data(),
                                                    vid_array->get_data(),
                                                    param->dim_,
@@ -1834,7 +1980,9 @@ int ObPluginVectorIndexAdaptor::build_hnswsq_index(ObVectorIndexParam *param)
       }
       if (OB_SUCC(ret)) {
         snap_data_->set_inited();
-        snap_data_->has_build_sq_ = true;
+        if (is_hnswsq) {
+          snap_data_->has_build_sq_ = true;
+        }
         free_hnswsq_array_data(snap_data_, get_allocator());
       }
       if (OB_FAIL(ret)) {
@@ -2011,7 +2159,25 @@ int ObPluginVectorIndexAdaptor::check_snap_hnswsq_index()
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_ISNULL(param = static_cast<ObVectorIndexParam*>(algo_data_))) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (param->type_ == VIAT_HNSW || param->type_ == VIAT_HGRAPH || snap_data_->has_build_sq_ || param->type_ == VIAT_IPIVF) {
+  } else if (param->type_ == VIAT_IPIVF) {
+    // do nothing
+  } else if (param->type_ == VIAT_HNSW || param->type_ == VIAT_HGRAPH) {
+    // The rows of a plain hnsw snapshot build were accumulated while the index
+    // was built, now that the build is over the index can be created and built
+    // in one shot.
+    TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+    if (OB_NOT_NULL(ATOMIC_LOAD(&(snap_data_->index_)))) {
+      /* The index is already materialized, the bulk build buffer overflowed and
+         the build fell back to the incremental add path, never build it twice. */
+      free_hnswsq_array_data(snap_data_, get_allocator());
+    } else if (!snap_data_->is_inited()) {
+      // No row was accumulated, there is no index to build.
+    } else if (OB_ISNULL(snap_data_->vid_array_) || OB_ISNULL(snap_data_->vec_array_) ||
+               OB_ISNULL(snap_data_->extra_info_buf_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(build_snap_index(param, false /* is_hnswsq */))) {
+    }
+  } else if (snap_data_->has_build_sq_) {
     // do nothing
   } else if (OB_ISNULL(snap_data_->index_)) {
     TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
