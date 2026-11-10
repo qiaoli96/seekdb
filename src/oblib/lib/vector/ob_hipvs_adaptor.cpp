@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#include "oblib/lib/vector/ob_hipvs_adaptor.h"
+#include "ob_hipvs_adaptor.h"
 
-#include "oblib/lib/utility/ob_macro_utils.h"
+#include "lib/utility/ob_macro_utils.h"
 
 #include <cstring>
+#include <strings.h>
 
 #if defined(SEEKDB_WITH_HIPVS)
 #include <cstdio>

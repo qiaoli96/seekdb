@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "oblib/common/ob_errno.h"
+#include "lib/ob_errno.h"
 
 #include <stdint.h>
 #include <string>

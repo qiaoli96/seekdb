@@ -19,6 +19,7 @@
 #include "ob_vsag_adaptor.h"
 #include "ob_hipvs_adaptor.h"
 #include <fstream>
+#include <cstring>
 #include <map>
 #include "vsag/vsag.h"
 #include "vsag/constants.h"
@@ -1053,7 +1054,7 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
         ret = OB_ERR_UNEXPECTED;
       } else {
         char result_param_str[1024] = {0};
-        adjust_create_index_max_degree(static_cast<uint8_t>(index_type), max_degree);
+        adjust_create_index_max_degree(static_cast<IndexType>(index_type), max_degree);
         ret = construct_vsag_create_param(
             static_cast<uint8_t>(index_type), dtype, metric, dim, max_degree,
             ef_construction, ef_search, hnsw->get_allocator(),
@@ -1062,7 +1063,7 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
         if (OB_SUCC(ret)) {
           const std::string input_json_str(result_param_str);
           tl::expected<std::shared_ptr<Index>, Error> index =
-              vsag::Factory::CreateIndex(get_index_type_str(index_type), input_json_str, hnsw->get_allocator());
+              vsag::Factory::CreateIndex(get_index_type_str(static_cast<uint8_t>(index_type)), input_json_str, hnsw->get_allocator());
           if (!index.has_value()) {
             ret = vsag_errcode2ob(index.error().type);
           } else {
