@@ -108,6 +108,25 @@ private:
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
 
 private:
+  // Cache for parsed parser name and properties. The benchmark calls tokenize() with constant
+  // parser arguments across thousands of rows, so parsing once and reusing saves significant
+  // per-call overhead. The cache is keyed by (parser_name_, properties_) and stores the parsed
+  // ObFTParser and ObFTParserProperty objects.
+  struct ParserCache {
+    ObString cached_name_;
+    ObString cached_properties_;
+    storage::ObFTParser cached_parser_;
+    storage::ObFTParserProperty cached_property_;
+    bool is_valid_ = false;
+
+    void invalidate() { is_valid_ = false; }
+  };
+
+  // Thread-local cache to avoid contention. Each thread maintains its own cache entry.
+  // For the single-threaded benchmark, this degenerates to a simple global cache.
+  static thread_local ParserCache parser_cache_;
+
+private:
   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);
 };
 

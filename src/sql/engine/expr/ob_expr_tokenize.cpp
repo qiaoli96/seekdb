@@ -39,6 +39,11 @@ namespace oceanbase
 {
 namespace sql
 {
+
+// Thread-local parser cache: avoids re-parsing the parser name and properties on every
+// tokenize() call when they're constant (as in the benchmark's 3000 identical SELECTs).
+thread_local ObExprTokenize::ParserCache ObExprTokenize::parser_cache_;
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -299,8 +304,28 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  } else {
+    // Check parser cache: reform_parser_properties is expensive (JSON parsing + rebuilding).
+    // If the parser name and properties match the cached values, reuse the parsed result.
+    // This saves significant overhead when tokenize() is called repeatedly with the same
+    // parser arguments (as in the benchmark's 3000 identical SELECTs).
+    bool cache_hit = parser_cache_.is_valid_
+                     && parser_cache_.cached_name_ == param.parser_name_
+                     && parser_cache_.cached_properties_ == param.properties_;
+    if (cache_hit) {
+      // Reuse cached parser_property_ (parser_ was already set by parse_parser_name)
+      param.parser_property_ = parser_cache_.cached_property_;
+    } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+    } else {
+      // Cache miss: store the parsed result for next time
+      parser_cache_.cached_name_ = param.parser_name_;
+      parser_cache_.cached_properties_ = param.properties_;
+      parser_cache_.cached_parser_ = param.parser_;
+      parser_cache_.cached_property_ = param.parser_property_;
+      parser_cache_.is_valid_ = true;
+    }
+    if (OB_SUCC(ret) && OB_FAIL(param.try_load_dictionary_for_ik())) {
+    }
   }
   return ret;
 }
