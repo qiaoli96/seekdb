@@ -790,33 +790,31 @@ int ObSRDaaTIterImpl::batch_do_one_merge_round(int64_t &count)
   } else if (0 == batch_active_cnt_) {
     ret = OB_ITER_END;
   } else {
-    int64_t min_dim = batch_active_[0];
+    const int64_t min_dim = batch_active_[0];
     const ObDatum *min_id = &batch_views_[min_dim].ids_[batch_cur_[min_dim]].get_datum();
+    int64_t matching_dims[FAST_MERGE_MAX_DIMS] = {min_dim};
+    int64_t matching_count = 1;
     for (int64_t i = 1; OB_SUCC(ret) && i < batch_active_cnt_; ++i) {
       const int64_t dim = batch_active_[i];
       const ObDatum *id = &batch_views_[dim].ids_[batch_cur_[dim]].get_datum();
       int64_t cmp_ret = 0;
       if (OB_FAIL(merge_cmp_.cmp_datum(*id, *min_id, cmp_ret))) {
       } else if (cmp_ret < 0) {
-        min_dim = dim;
         min_id = id;
+        matching_dims[0] = dim;
+        matching_count = 1;
+      } else if (0 == cmp_ret) {
+        matching_dims[matching_count++] = dim;
       }
     }
     // Collect every dimension carrying this id -- the run of equal ids -- ascending by
     // dimension index, then advance past the consumed rows.
-    for (int64_t i = 0; OB_SUCC(ret) && i < batch_active_cnt_; ++i) {
-      const int64_t dim = batch_active_[i];
-      const ObDatum *id = &batch_views_[dim].ids_[batch_cur_[dim]].get_datum();
-      int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*id, *min_id, cmp_ret))) {
-      } else if (0 != cmp_ret) {
-      } else {
-        double score = batch_views_[dim].scores_[batch_cur_[dim]];
-        ++batch_cur_[dim];
-        if (OB_NOT_NULL(iter_param_->dim_weights_)
-            && FALSE_IT(score = score * iter_param_->field_boost_ * iter_param_->dim_weights_->at(dim))) {
-        } else if (OB_FAIL(relevance_collector_->collect_one_dim(dim, score))) {
-        }
+    for (int64_t i = 0; OB_SUCC(ret) && i < matching_count; ++i) {
+      const int64_t dim = matching_dims[i];
+      double score = batch_views_[dim].scores_[batch_cur_[dim]++];
+      if (OB_NOT_NULL(iter_param_->dim_weights_)
+          && FALSE_IT(score = score * iter_param_->field_boost_ * iter_param_->dim_weights_->at(dim))) {
+      } else if (OB_FAIL(relevance_collector_->collect_one_dim(dim, score))) {
       }
     }
     if (OB_SUCC(ret)) {
