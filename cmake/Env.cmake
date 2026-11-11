@@ -14,6 +14,20 @@ ob_define(DEP_3RD_DIR "${CMAKE_SOURCE_DIR}/deps/3rd")
 ob_define(DEVTOOLS_DIR "${CMAKE_SOURCE_DIR}/deps/3rd/usr/local/oceanbase/devtools")
 ob_define(DEP_DIR "${CMAKE_SOURCE_DIR}/deps/3rd/usr/local/oceanbase/deps/devel")
 
+# The AMD hipVS GPU stack is optional.  OB_HIPVS_DIR points at the hipVS SDK
+# prefix and ROCM_PATH at the ROCm installation prefix; both may also come
+# from the environment (SEEKDB_HIPVS_DIR and ROCM_PATH).  An empty value means
+# "not configured": cmake/HipVS.cmake then searches the standard locations and
+# keeps the build host only when it finds nothing.
+ob_define(OB_HIPVS_DIR "")
+ob_define(ROCM_PATH "")
+if(NOT OB_HIPVS_DIR AND DEFINED ENV{SEEKDB_HIPVS_DIR})
+  set(OB_HIPVS_DIR "$ENV{SEEKDB_HIPVS_DIR}")
+endif()
+if(NOT ROCM_PATH AND DEFINED ENV{ROCM_PATH})
+  set(ROCM_PATH "$ENV{ROCM_PATH}")
+endif()
+
 # Deprecated no-op retained for compatibility with existing build invocations.
 ob_define(BUILD_EMBED_MODE OFF)
 if(BUILD_EMBED_MODE)

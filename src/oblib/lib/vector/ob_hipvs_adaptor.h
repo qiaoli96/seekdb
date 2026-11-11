@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 namespace oceanbase {
 namespace common {
@@ -28,9 +29,8 @@ namespace obhipvs {
  *
  * hipVS is the AMD (ROCm) port of the RAPIDS cuVS vector search library. It
  * builds the kNN graph of an HNSW index on an AMD Radeon GPU and exports the
- * result in the hnswlib binary layout, which the seekdb vector index backend
- * loads through vsag. The vectors stay on the host, hipVS copies them to the
- * device internally.
+ * result in the hnswlib binary layout. The vectors stay on the host, hipVS
+ * copies them to the device internally.
  */
 struct HipvsBuildParam
 {
@@ -79,6 +79,16 @@ struct HipvsDeviceInfo
 bool is_compiled_with_hipvs();
 
 /**
+ * @brief Whether the GPU build path is enabled at run time.
+ *
+ * The GPU build path is compiled in when the AMD stack was found at build
+ * time. It can be turned off again at run time with the environment variable
+ * SEEKDB_HNSW_GPU_BUILD=0, so that one and the same binary can be used to
+ * measure the host build for comparison.
+ */
+bool is_gpu_build_enabled();
+
+/**
  * @brief Query the AMD GPUs visible to the current process.
  *
  * @param[out] info  Filled on success.
@@ -102,6 +112,33 @@ int get_device_info(HipvsDeviceInfo &info);
  *                           to the host build path.
  */
 int build_hnsw_index(const HipvsBuildParam &param, std::string &index_file);
+
+/**
+ * @brief Convert an index file exported by hipVS into the binary vsag loads.
+ *
+ * hipVS exports the index in the hnswlib layout. vsag reads the same layout,
+ * with two additions: three counters of the product quantizer are written
+ * between the header and the data, and the distance of every node to the
+ * closest product quantizer centroid is written behind the data. An index
+ * that does not use the product quantizer has zeroes in both places, so the
+ * conversion copies the header, writes the three zeroes, copies the rest of
+ * the file and writes the zero distances behind it.
+ *
+ * The external ids are written into the labels of the level 0 data, because
+ * hipVS labels the rows with their position in the input array while vsag
+ * reports the label of a hit to the caller.
+ *
+ * @param[in]  hnswlib_file  Path of the index file exported by hipVS.
+ * @param[in]  vids          External ids of the rows, one per row.
+ * @param[in]  vid_count     Number of external ids.
+ * @param[out] vsag_data     The binary that vsag loads.
+ * @retval OB_SUCCESS        The file was converted.
+ * @retval OB_ERR_UNEXPECTED The file is not an index of the expected shape.
+ */
+int convert_hnswlib_to_vsag_data(const std::string &hnswlib_file,
+                                 const int64_t *vids,
+                                 int64_t vid_count,
+                                 std::vector<char> &vsag_data);
 
 } // namespace obhipvs
 } // namespace common

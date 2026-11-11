@@ -2,6 +2,10 @@ add_library(oblib_base INTERFACE)
 add_library(oblib_base_without_pass INTERFACE)
 add_library(oblib_pass INTERFACE)
 
+# Detect the optional AMD hipVS GPU stack.  cmake/HipVS.cmake is a no-op when
+# the stack is absent, so the default build keeps its host only behaviour.
+include("${CMAKE_SOURCE_DIR}/cmake/HipVS.cmake")
+
 get_property(EASY_INCLUDE_DIRS GLOBAL PROPERTY "EASY_INCLUDE_DIRS" )
 
 if(OB_MACOS27)
@@ -237,6 +241,34 @@ target_compile_features(oblib_base INTERFACE cxx_std_11)
 if(OB_HAVE_BUNDLED_JEMALLOC)
   target_compile_definitions(oblib_base_without_pass
     INTERFACE OB_HAVE_BUNDLED_JEMALLOC=1)
+endif()
+
+if(OB_HIPVS_ENABLED)
+  # The AMD hipVS GPU stack was found, the GPU accelerated HNSW build path is
+  # compiled in.  The macro is an oblib wide capability, exactly like
+  # OB_HAVE_BUNDLED_JEMALLOC above: oblib_lib owns ob_hipvs_adaptor.cpp and
+  # ob_vsag_adaptor.cpp through the generated Unity inventory and inherits the
+  # definition through its public link to oblib_base.
+  target_compile_definitions(oblib_base_without_pass
+    INTERFACE SEEKDB_WITH_HIPVS=1 __HIP_PLATFORM_AMD__)
+  # The hipVS and the ROCm headers are third party headers: they are added as
+  # SYSTEM include directories, after the regular ones, so that they neither
+  # shadow the headers oblib already resolves nor trip the -Werror policy of
+  # the project with warnings of their own.
+  target_include_directories(oblib_base_without_pass
+    SYSTEM INTERFACE ${OB_HIPVS_INCLUDE_DIRS})
+  # libhipvs and the ROCm runtime are shared objects, the final binary has to
+  # find them at run time.
+  set(ob_hipvs_link_options "")
+  foreach(ob_hipvs_rpath_dir IN LISTS OB_HIPVS_RPATH_DIRS)
+    list(APPEND ob_hipvs_link_options "-Wl,-rpath,${ob_hipvs_rpath_dir}")
+  endforeach()
+  if(ob_hipvs_link_options)
+    target_link_options(oblib_base_without_pass
+      INTERFACE ${ob_hipvs_link_options})
+  endif()
+  unset(ob_hipvs_link_options)
+  unset(ob_hipvs_rpath_dir)
 endif()
 
 set(_LIB_PATH "${DEP_DIR}/lib64/")

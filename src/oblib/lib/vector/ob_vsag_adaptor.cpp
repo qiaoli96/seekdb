@@ -1013,14 +1013,21 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
   // Only a plain float32 HNSW index is rebuilt on the GPU. The quantized and
   // the graph types keep their own internal layout and the sparse index is
   // not supported by hipVS at all.
-  if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
+  // The GPU build path can be turned off at run time, then the host build is
+  // used and the very same binary can be used for the comparison.
+  if (!obhipvs::is_gpu_build_enabled()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: turned off at run time");
+  } else if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
       || nullptr == metric || nullptr == dtype || dim_of_index != dim
       || size < OB_VSAG_GPU_BUILD_MIN_ROWS) {
     ret = OB_NOT_SUPPORTED;
-  } else if (nullptr != extra_infos) {
-    ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: unsupported index shape",
+        K(index_type), K(extra_info_size), KCSTRING(metric), KCSTRING(dtype),
+        K(dim_of_index), K(dim), K(size), K(OB_VSAG_GPU_BUILD_MIN_ROWS));
   } else if (0 != strcasecmp(metric, "l2") && 0 != strcasecmp(metric, "ip")) {
     ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: unsupported metric", KCSTRING(metric));
   } else {
     // hipVS labels the rows of the exported index with their position in the
     // input array, so the external ids have to be the identity mapping for
@@ -1031,6 +1038,13 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
     }
     if (!identity_ids) {
       ret = OB_NOT_SUPPORTED;
+      for (int i = 0; i < size; ++i) {
+        if (ids[i] != static_cast<int64_t>(i)) {
+          LOG_INFO("[OBVSAG] hnsw gpu build skipped: non identity ids",
+              K(i), K(ids[i]), K(size));
+          break;
+        }
+      }
     }
   }
 
@@ -1052,42 +1066,39 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
 
   if (OB_SUCC(ret)) {
     // Load the exported index into a fresh vsag index.
-    std::ifstream input(index_file.c_str(), std::ios::binary | std::ios::ate);
-    if (!input.good()) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      const std::streamsize file_size = input.tellg();
-      input.seekg(0, std::ios::beg);
-      std::vector<char> buffer(static_cast<size_t>(file_size));
-      if (file_size <= 0 || !input.read(buffer.data(), file_size)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        char result_param_str[1024] = {0};
-        adjust_create_index_max_degree(static_cast<IndexType>(index_type), max_degree);
-        ret = construct_vsag_create_param(
-            static_cast<uint8_t>(index_type), dtype, metric, dim, max_degree,
-            ef_construction, ef_search, hnsw->get_allocator(),
-            static_cast<int>(extra_info_size), hnsw->get_refine_type(),
-            hnsw->get_bq_bits_query(), hnsw->get_bq_use_fht(), result_param_str);
-        if (OB_SUCC(ret)) {
-          const std::string input_json_str(result_param_str);
-          tl::expected<std::shared_ptr<Index>, Error> index =
-              vsag::Factory::CreateIndex(get_index_type_str(static_cast<uint8_t>(index_type)), input_json_str, hnsw->get_allocator());
-          if (!index.has_value()) {
-            ret = vsag_errcode2ob(index.error().type);
-          } else {
-            gpu_index = index.value();
-            vsag::Binary binary;
-            binary.data = std::shared_ptr<int8_t[]>(new int8_t[buffer.size()]);
-            memcpy(binary.data.get(), buffer.data(), buffer.size());
-            binary.size = buffer.size();
-            vsag::BinarySet binary_set;
-            binary_set.Set(vsag::HNSW_DATA, binary);
-            tl::expected<void, Error> des_ret = gpu_index->Deserialize(binary_set);
-            if (!des_ret.has_value()) {
-              ret = vsag_errcode2ob(des_ret.error().type);
-              gpu_index = nullptr;
-            }
+    //
+    // hipVS exports the index with hnswlib's saveIndex(), while vsag expects
+    // its own container: the same header and payload, but with a product
+    // quantization header in front and the per element centroid distances at
+    // the end. The converter splices the two byte layouts together.
+    std::vector<char> buffer;
+    ret = obhipvs::convert_hipvs_index_to_vsag(index_file, buffer);
+    if (OB_SUCC(ret)) {
+      char result_param_str[1024] = {0};
+      adjust_create_index_max_degree(static_cast<IndexType>(index_type), max_degree);
+      ret = construct_vsag_create_param(
+          static_cast<uint8_t>(index_type), dtype, metric, dim, max_degree,
+          ef_construction, ef_search, hnsw->get_allocator(),
+          static_cast<int>(extra_info_size), hnsw->get_refine_type(),
+          hnsw->get_bq_bits_query(), hnsw->get_bq_use_fht(), result_param_str);
+      if (OB_SUCC(ret)) {
+        const std::string input_json_str(result_param_str);
+        tl::expected<std::shared_ptr<Index>, Error> index =
+            vsag::Factory::CreateIndex(get_index_type_str(static_cast<uint8_t>(index_type)), input_json_str, hnsw->get_allocator());
+        if (!index.has_value()) {
+          ret = vsag_errcode2ob(index.error().type);
+        } else {
+          gpu_index = index.value();
+          vsag::Binary binary;
+          binary.data = std::shared_ptr<int8_t[]>(new int8_t[buffer.size()]);
+          memcpy(binary.data.get(), buffer.data(), buffer.size());
+          binary.size = buffer.size();
+          vsag::BinarySet binary_set;
+          binary_set.Set(vsag::HNSW_DATA, binary);
+          tl::expected<void, Error> des_ret = gpu_index->Deserialize(binary_set);
+          if (!des_ret.has_value()) {
+            ret = vsag_errcode2ob(des_ret.error().type);
+            gpu_index = nullptr;
           }
         }
       }
