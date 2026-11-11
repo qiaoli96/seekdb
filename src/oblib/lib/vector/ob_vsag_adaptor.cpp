@@ -1017,14 +1017,17 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
   // used and the very same binary can be used for the comparison.
   if (!obhipvs::is_gpu_build_enabled()) {
     ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: turned off at run time");
   } else if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
       || nullptr == metric || nullptr == dtype || dim_of_index != dim
       || size < OB_VSAG_GPU_BUILD_MIN_ROWS) {
     ret = OB_NOT_SUPPORTED;
-  } else if (nullptr != extra_infos) {
-    ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: unsupported index shape",
+        K(index_type), K(extra_info_size), KCSTRING(metric), KCSTRING(dtype),
+        K(dim_of_index), K(dim), K(size), K(OB_VSAG_GPU_BUILD_MIN_ROWS));
   } else if (0 != strcasecmp(metric, "l2") && 0 != strcasecmp(metric, "ip")) {
     ret = OB_NOT_SUPPORTED;
+    LOG_INFO("[OBVSAG] hnsw gpu build skipped: unsupported metric", KCSTRING(metric));
   } else {
     // hipVS labels the rows of the exported index with their position in the
     // input array, so the external ids have to be the identity mapping for
@@ -1035,6 +1038,13 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
     }
     if (!identity_ids) {
       ret = OB_NOT_SUPPORTED;
+      for (int i = 0; i < size; ++i) {
+        if (ids[i] != static_cast<int64_t>(i)) {
+          LOG_INFO("[OBVSAG] hnsw gpu build skipped: non identity ids",
+              K(i), K(ids[i]), K(size));
+          break;
+        }
+      }
     }
   }
 

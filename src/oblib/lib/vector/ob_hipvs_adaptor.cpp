@@ -50,15 +50,16 @@ bool is_compiled_with_hipvs()
 
 bool is_gpu_build_enabled()
 {
+  // The GPU build path is opt in. The hipVS build path is compiled in when the
+  // AMD stack is present, but it is only taken when the operator explicitly
+  // asks for it: an unusable stack then can never change the behaviour of a
+  // deployment that did not ask for it.
   const char *env = getenv("SEEKDB_HNSW_GPU_BUILD");
-  if (nullptr != env) {
-    const bool off = (0 == strcasecmp(env, "0") || 0 == strcasecmp(env, "false")
-                      || 0 == strcasecmp(env, "off") || 0 == strcasecmp(env, "no"));
-    if (off) {
-      return false;
-    }
+  if (nullptr == env) {
+    return false;
   }
-  return true;
+  return (0 == strcasecmp(env, "1") || 0 == strcasecmp(env, "true")
+          || 0 == strcasecmp(env, "on") || 0 == strcasecmp(env, "yes"));
 }
 
 namespace {
@@ -121,7 +122,7 @@ int build_hnsw_index(const HipvsBuildParam &param, std::string &index_file)
 {
   int ret = OB_SUCCESS;
   cuvsDistanceType metric = L2Expanded;
-  cuvsResources_t resources = nullptr;
+  cuvsResources_t resources = 0;
   cuvsCagraIndexParams_t cagra_params = nullptr;
   cuvsCagraIndex_t cagra_index = nullptr;
   cuvsHnswIndexParams_t hnsw_params = nullptr;
@@ -201,7 +202,7 @@ int build_hnsw_index(const HipvsBuildParam &param, std::string &index_file)
   if (nullptr != cagra_params) {
     cuvsCagraIndexParamsDestroy(cagra_params);
   }
-  if (nullptr != resources) {
+  if (0 != resources) {
     cuvsResourcesDestroy(resources);
   }
   if (!tmp_file.empty()) {
