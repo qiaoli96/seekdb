@@ -44,6 +44,10 @@ namespace sql
 // tokenize() call when they're constant (as in the benchmark's 3000 identical SELECTs).
 thread_local ObExprTokenize::ParserCache ObExprTokenize::parser_cache_;
 
+// Thread-local tokenize state: avoids re-allocating the ObFTWordMap hash buckets on every call.
+// The helper is lightweight to re-init, but the word map allocation is not.
+thread_local ObExprTokenize::TokenizeState ObExprTokenize::tokenize_state_;
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -162,54 +166,78 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       ObString &bin_result)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
-  storage::ObFTWordMap token_map;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
-                                                      param.parser_,
-                                                      param.parser_property_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-  } else if (
-      (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
-                     param.meta_,
-                     param.fulltext_.ptr(),
-                     param.fulltext_.length(),
-                     doc_len,
-                     token_map))) {
   } else {
-    switch (param.output_mode_) {
-    case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_bin(token_map, bin_result))) {
-      } else if (!tokenize_bin_selfcheck()) {
+    // Reuse thread-local state to avoid re-allocating the word map on every call.
+    // The helper is re-initialized (cheap), but the word map is reused via clear() instead of
+    // being destroyed and recreated (expensive).
+    TokenizeState &state = tokenize_state_;
+    storage::ObFTParseHelper &tokenize_helper = state.helper_;
+    storage::ObFTWordMap &token_map = state.word_map_;
+
+    if (!state.is_inited_) {
+      // First call: create the word map with a reasonable initial capacity
+      if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
       } else {
-        ObIJsonBase *ref = nullptr;
-        ObString ref_bin;
-        if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, ref))) {
-        } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(ref, ref_bin, &allocator))) {
-        } else if (ref_bin.length() == bin_result.length()
-                   && 0 == MEMCMP(ref_bin.ptr(), bin_result.ptr(), ref_bin.length())) {
-        } else {
-          tokenize_dump_bin_mismatch(ref_bin, bin_result, token_map,
-                                     static_cast<int>(param.output_mode_));
-          bin_result = ref_bin;
+        state.is_inited_ = true;
+      }
+    } else if (OB_UNLIKELY(token_map.bucket_count() < ft_word_bkt_cnt)) {
+      // Text is longer than previous calls: grow the map
+      token_map.clear();
+      if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+      }
+    } else {
+      // Reuse existing map: just clear it
+      token_map.clear();
+    }
+
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
+                                                   param.parser_,
+                                                   param.parser_property_))) {
+      } else if (
+          (0 != param.fulltext_.length())
+          && OB_FAIL(tokenize_helper.segment(
+                         param.meta_,
+                         param.fulltext_.ptr(),
+                         param.fulltext_.length(),
+                         doc_len,
+                         token_map))) {
+      } else {
+        switch (param.output_mode_) {
+        case TokenizeParam::OUTPUT_MODE::DEFAULT: {
+          if (OB_FAIL(tokenize_helper.make_token_array_bin(token_map, bin_result))) {
+          } else if (!tokenize_bin_selfcheck()) {
+          } else {
+            ObIJsonBase *ref = nullptr;
+            ObString ref_bin;
+            if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, ref))) {
+            } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(ref, ref_bin, &allocator))) {
+            } else if (ref_bin.length() == bin_result.length()
+                       && 0 == MEMCMP(ref_bin.ptr(), bin_result.ptr(), ref_bin.length())) {
+            } else {
+              tokenize_dump_bin_mismatch(ref_bin, bin_result, token_map,
+                                         static_cast<int>(param.output_mode_));
+              bin_result = ref_bin;
+            }
+          }
+          break;
+        }
+        case TokenizeParam::OUTPUT_MODE::ALL: {
+          if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+          } else {
+            // pass
+          }
+          break;
+        }
+        default:
+          ret = OB_INVALID_ARGUMENT;
         }
       }
-      break;
-    }
-    case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
-      } else {
-        // pass
-      }
-      break;
-    }
-    default:
-      ret = OB_INVALID_ARGUMENT;
     }
   }
   return ret;

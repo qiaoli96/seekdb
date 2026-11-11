@@ -122,9 +122,21 @@ private:
     void invalidate() { is_valid_ = false; }
   };
 
-  // Thread-local cache to avoid contention. Each thread maintains its own cache entry.
-  // For the single-threaded benchmark, this degenerates to a simple global cache.
+  // Thread-local parser cache: avoids re-parsing the parser name and properties on every
+  // tokenize() call when they're constant (as in the benchmark's 3000 identical SELECTs).
   static thread_local ParserCache parser_cache_;
+
+  // Thread-local parse helper and word map: avoids re-allocating the hash map buckets on every
+  // call. The helper is re-initialized with the current parser, and the word map is reused
+  // (cleared) instead of recreated.
+  struct TokenizeState {
+    storage::ObFTParseHelper helper_;
+    storage::ObFTWordMap word_map_;
+    bool is_inited_ = false;
+
+    TokenizeState() : word_map_("FTWordMap") {}
+  };
+  static thread_local TokenizeState tokenize_state_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);
