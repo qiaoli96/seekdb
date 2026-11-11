@@ -1698,9 +1698,7 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
   } else {
     if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH) {
-      // The rows are accumulated and the index is built in one shot when the
-      // build is over, a bulk build is much faster than one add per row.
-      if (OB_FAIL(init_hnswsq_mem_data())) {
+      if (OB_FAIL(try_init_mem_data(VIRT_SNAP))) {
       } else if (num == 0 || OB_ISNULL(vectors)) {
         // do nothing
       } else if (OB_ISNULL(vids)) {
@@ -1710,7 +1708,11 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
         if (OB_NOT_NULL(extra_objs) && extra_column_count > 0 && param->extra_info_actual_size_ > 0 &&
             OB_FAIL(ObVecExtraInfo::extra_infos_to_buf(tmp_allocator, extra_objs, extra_column_count,
                                                        param->extra_info_actual_size_, num, extra_info_buf))) {
-        } else if (OB_FAIL(add_hnsw_snap_rows(param, vectors, vids, extra_info_buf, num))) {
+        } else {
+          lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
+          lib::ObLightBacktraceGuard light_backtrace_guard(false);
+          if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
+          }
         }
       }
     } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
