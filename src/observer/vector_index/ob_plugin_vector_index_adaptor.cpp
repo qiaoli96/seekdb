@@ -1845,6 +1845,13 @@ int ObPluginVectorIndexAdaptor::add_hnsw_snap_rows(ObVectorIndexParam *param,
     lib::ObLightBacktraceGuard light_backtrace_guard(false);
     if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, param->dim_, extra_info_buf, num))) {
     }
+  } else if (param->extra_info_actual_size_ > 0 && OB_ISNULL(extra_info_buf)) {
+    /* The row does not carry the extra info of the index, it cannot be
+       accumulated, the index is materialized and the row is added to it
+       directly, exactly like the incremental add path does. */
+    if (OB_FAIL(flush_hnsw_snap_buffer(param))) {
+    } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, param->dim_, extra_info_buf, num))) {
+    }
   } else {
     // first: write into cache
     if (OB_ISNULL(snap_data_->vid_array_) || OB_ISNULL(snap_data_->vec_array_) ||
@@ -1866,8 +1873,10 @@ int ObPluginVectorIndexAdaptor::add_hnsw_snap_rows(ObVectorIndexParam *param,
       }
       if (OB_SUCC(ret)) {
         const int64_t row_count = snap_data_->vid_array_->count();
-        const int64_t used = row_count * (sizeof(int64_t) + param->dim_ * sizeof(float)
-                                          + param->extra_info_actual_size_);
+        const int64_t row_bytes = static_cast<int64_t>(sizeof(int64_t))
+                                  + param->dim_ * static_cast<int64_t>(sizeof(float))
+                                  + param->extra_info_actual_size_;
+        const int64_t used = row_count * row_bytes;
         int64_t limit = 0;
         if (OB_FAIL(get_hnsw_bulk_build_buffer_limit(limit))) {
         } else if (used > limit) {
@@ -1917,7 +1926,7 @@ int ObPluginVectorIndexAdaptor::flush_hnsw_snap_buffer(ObVectorIndexParam *param
                                                extra_info_buf->ptr(),
                                                vid_array->count()))) {
     } else {
-      LOG_INFO("hnsw bulk build buffer is full, fall back to the incremental add path",
+      LOG_INFO("hnsw bulk build is aborted, fall back to the incremental add path",
                K(ret), K(param->dim_), K(vid_array->count()));
     }
     if (OB_SUCC(ret)) {
@@ -1953,7 +1962,7 @@ int ObPluginVectorIndexAdaptor::build_snap_index(ObVectorIndexParam *param, bool
     } else if (!snap_data_->mem_ctx_->is_inited() &&
                OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
     } else {
-      LOG_INFO("HgraphIndex build hnswsq index success", K(ret), K(param->dim_), K(vid_array->count()));
+      LOG_INFO("HgraphIndex build snapshot index by bulk build success", K(ret), K(param->type_), K(param->dim_), K(vid_array->count()));
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr("VIndexVsagADP"));
       lib::ObLightBacktraceGuard light_backtrace_guard(false);
       if (OB_FAIL(ret)) {

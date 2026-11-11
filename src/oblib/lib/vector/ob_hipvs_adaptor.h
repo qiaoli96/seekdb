@@ -79,6 +79,16 @@ struct HipvsDeviceInfo
 bool is_compiled_with_hipvs();
 
 /**
+ * @brief Whether the GPU build path is enabled at run time.
+ *
+ * The GPU build path is compiled in when the AMD stack was found at build
+ * time. It can be turned off again at run time with the environment variable
+ * SEEKDB_HNSW_GPU_BUILD=0, so that one and the same binary can be used to
+ * measure the host build for comparison.
+ */
+bool is_gpu_build_enabled();
+
+/**
  * @brief Query the AMD GPUs visible to the current process.
  *
  * @param[out] info  Filled on success.

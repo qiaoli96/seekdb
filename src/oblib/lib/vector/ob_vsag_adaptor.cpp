@@ -1013,7 +1013,11 @@ static int build_index_gpu(VectorIndexPtr &index_handler, float *vector_list,
   // Only a plain float32 HNSW index is rebuilt on the GPU. The quantized and
   // the graph types keep their own internal layout and the sparse index is
   // not supported by hipVS at all.
-  if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
+  // The GPU build path can be turned off at run time, then the host build is
+  // used and the very same binary can be used for the comparison.
+  if (!obhipvs::is_gpu_build_enabled()) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (IndexType::HNSW_TYPE != index_type || extra_info_size != 0
       || nullptr == metric || nullptr == dtype || dim_of_index != dim
       || size < OB_VSAG_GPU_BUILD_MIN_ROWS) {
     ret = OB_NOT_SUPPORTED;

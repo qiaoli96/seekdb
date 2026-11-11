@@ -146,3 +146,11 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
   endif()
 endif()
+
+# The AMD hipVS GPU stack, detected by cmake/HipVS.cmake.  libhipvs and the
+# ROCm runtime are linked the same way the vsag library is linked: on
+# oblib_lib, which the oblib static library and through it the final seekdb
+# binary inherit.
+if(OB_HIPVS_ENABLED)
+  target_link_libraries(oblib_lib PUBLIC ${OB_HIPVS_LIBRARIES})
+endif()

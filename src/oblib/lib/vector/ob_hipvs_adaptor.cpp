@@ -48,6 +48,19 @@ bool is_compiled_with_hipvs()
 
 #if defined(SEEKDB_WITH_HIPVS)
 
+bool is_gpu_build_enabled()
+{
+  const char *env = getenv("SEEKDB_HNSW_GPU_BUILD");
+  if (nullptr != env) {
+    const bool off = (0 == strcasecmp(env, "0") || 0 == strcasecmp(env, "false")
+                      || 0 == strcasecmp(env, "off") || 0 == strcasecmp(env, "no"));
+    if (off) {
+      return false;
+    }
+  }
+  return true;
+}
+
 namespace {
 
 int map_metric(const char *metric, cuvsDistanceType &mapped)
