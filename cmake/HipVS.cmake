@@ -122,7 +122,14 @@ find_path(OB_HIPVS_INCLUDE_DIR
   HINTS ${ob_hipvs_include_dirs}
   PATHS ${ob_hipvs_include_dirs})
 find_library(OB_HIPVS_LIBRARY
-  NAMES hipvs
+  NAMES cuvs_c cuvs hipvs
+  HINTS ${ob_hipvs_lib_dirs}
+  PATHS ${ob_hipvs_lib_dirs})
+# The C API of hipVS lives in its own shared object, the C++ API in another
+# one. The GPU build path only calls the C API, but the C API object depends
+# on the C++ one, so both are linked when they are present.
+find_library(OB_HIPVS_CXX_LIBRARY
+  NAMES cuvs hipvs
   HINTS ${ob_hipvs_lib_dirs}
   PATHS ${ob_hipvs_lib_dirs})
 find_path(OB_ROCM_INCLUDE_DIR
@@ -171,6 +178,9 @@ endif()
 set(OB_HIPVS_FOUND ON)
 set(OB_HIPVS_INCLUDE_DIRS "${OB_HIPVS_INCLUDE_DIR}" "${OB_ROCM_INCLUDE_DIR}")
 set(OB_HIPVS_LIBRARIES "${OB_HIPVS_LIBRARY}" "${OB_ROCM_LIBRARY}")
+if(OB_HIPVS_CXX_LIBRARY AND NOT OB_HIPVS_CXX_LIBRARY STREQUAL OB_HIPVS_LIBRARY)
+  list(APPEND OB_HIPVS_LIBRARIES "${OB_HIPVS_CXX_LIBRARY}")
+endif()
 get_filename_component(ob_hipvs_lib_dir "${OB_HIPVS_LIBRARY}" DIRECTORY)
 get_filename_component(ob_rocm_lib_dir "${OB_ROCM_LIBRARY}" DIRECTORY)
 set(OB_HIPVS_RPATH_DIRS "${ob_hipvs_lib_dir}" "${ob_rocm_lib_dir}")
