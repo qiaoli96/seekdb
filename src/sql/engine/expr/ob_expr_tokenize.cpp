@@ -186,8 +186,9 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
         state.is_inited_ = true;
       }
     } else if (OB_UNLIKELY(token_map.bucket_count() < ft_word_bkt_cnt)) {
-      // Text is longer than previous calls: grow the map
-      token_map.clear();
+      // Text is longer than previous calls: recreate the map with more buckets,
+      // create() rejects an already created map, so release the old buckets first.
+      token_map.destroy();
       if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
       }
     } else {
@@ -196,6 +197,10 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
     }
 
     if (OB_SUCC(ret)) {
+      // The helper is thread-local and outlives one call, while init_from_parsed()
+      // rejects an already initialized helper. reset() only drops the cached parser
+      // description, so re-initializing stays cheap.
+      tokenize_helper.reset();
       if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
                                                    param.parser_,
                                                    param.parser_property_))) {
