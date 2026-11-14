@@ -134,7 +134,7 @@ private:
     storage::ObFTWordMap word_map_;
     bool is_inited_ = false;
 
-    TokenizeState() : word_map_("FTWordMap") {}
+    TokenizeState() = default;
   };
   static thread_local TokenizeState tokenize_state_;
 
