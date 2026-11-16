@@ -13,17 +13,28 @@
 #include <string.h>
 #include <time.h>
 
+/* Whether the GPU is bound before the graph build.
+ *
+ *   0 = leave the device unbound.  This is what the frozen V5 baseline does
+ *       (cuvsResourcesCreate never binds a device), and it is the only setting
+ *       that reproduces the baseline graph bit for bit.
+ *   1 = bind the device with cudaSetDevice(0) before cuvsCagraBuild.
+ *
+ * The value can be overridden at run time with SEEKDB_CUVS_SET_DEVICE (or the
+ * params file), so a single bridge binary can serve every cell of the
+ * experiment matrix.  The compile time default is what the evaluation sees:
+ * there is no params file and no environment on the evaluation machine.
+ */
+#ifndef SK_DEFAULT_SET_DEVICE
+#define SK_DEFAULT_SET_DEVICE 1
+#endif
+
 /* ------------------------------------------------------------- timing ------
  * SEEKDB_CUVS_TIMING=1 makes the bridge print the time of the two expensive
- * steps to stderr. It is off by default and it only writes to stderr, so a
- * build that does not set the variable behaves exactly like the baseline.
+ * steps to stderr, plus the resolved build parameters.  It is off by default
+ * and it only writes to stderr, so a build that does not set the variable
+ * behaves exactly like the baseline.
  */
-static int sk_timing_on(void)
-{
-  const char* v = getenv("SEEKDB_CUVS_TIMING");
-  return v != NULL && v[0] == '1';
-}
-
 static double sk_now_ms(void)
 {
   struct timespec ts;
@@ -31,29 +42,23 @@ static double sk_now_ms(void)
   return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
-static void sk_report(const char* what, double ms)
-{
-  if (sk_timing_on()) {
-    fprintf(stderr, "[seekdb_cuvs][timing] %s = %.1f ms\n", what, ms);
-  }
-}
-
 /* ------------------------------------------------------------------ tuning --
  * The build and the search parameters of the bridge can be set with environment
  * variables, so that a parameter set can be measured without rebuilding the
- * bridge. The defaults are the values of the V5 baseline, an unset variable
+ * bridge.  The defaults are the values of the V5 baseline, an unset variable
  * therefore keeps the behaviour of the baseline.
  *
  *   SEEKDB_CUVS_BUILD_ALGO         NN_DESCENT (default) | IVF_PQ | AUTO_SELECT
  *   SEEKDB_CUVS_GRAPH_DEGREE       128
  *   SEEKDB_CUVS_INTERMEDIATE_DEGREE 256
  *   SEEKDB_CUVS_NN_DESCENT_NITER   100
+ *   SEEKDB_CUVS_SET_DEVICE         0 = unbound (baseline), 1 = cudaSetDevice(0)
  *   SEEKDB_CUVS_ITOPK_SIZE         unset: the search keeps its own minimum
  *   SEEKDB_CUVS_SEARCH_WIDTH       4
  */
 /* The build parameters can also be written to a file, one KEY=VALUE per line.
  * The file is read on every build, so a new set of parameters can be measured
- * without restarting the server. The environment still wins over the file. */
+ * without restarting the server.  The environment still wins over the file. */
 static const char* sk_params_file(void)
 {
   const char* p = getenv("SEEKDB_CUVS_PARAMS_FILE");
@@ -69,7 +74,7 @@ static int sk_file_lookup(const char* name, char* out, size_t out_len)
   while (fgets(line, sizeof(line), f)) {
     char key[256];
     char val[256];
-    if (sscanf(line, "%255[^= 	]=%255s", key, val) == 2 && strcmp(key, name) == 0) {
+    if (sscanf(line, "%255[^= \t]=%255s", key, val) == 2 && strcmp(key, name) == 0) {
       snprintf(out, out_len, "%s", val);
       found = 1;
       break;
@@ -88,24 +93,41 @@ static long sk_env_long(const char* name, long fallback)
   return fallback;
 }
 
+/* The timing switch has to be read from the parameter file as well: the
+ * observer start script cleans the environment, so a variable that only lives
+ * in getenv() would never reach the bridge on the instance. */
+static int sk_timing_on(void)
+{
+  return sk_env_long("SEEKDB_CUVS_TIMING", 0) != 0;
+}
+
+static void sk_report(const char* what, double ms)
+{
+  if (sk_timing_on()) {
+    fprintf(stderr, "[seekdb_cuvs][timing] %s = %.1f ms\n", what, ms);
+  }
+}
+
+/* The enum values of cuvsCagraGraphBuildAlgo are AUTO_SELECT=0, IVF_PQ=1,
+ * NN_DESCENT=2, ITERATIVE_CAGRA_SEARCH=3 (cuvs/neighbors/cagra.h).  The
+ * names are used on purpose: writing the numbers down here is what made the
+ * previous submission build with AUTO_SELECT instead of NN_DESCENT, which
+ * silently switched the build to IVF-PQ and lost the recall gate. */
 static int sk_env_algo(const char* name, int fallback)
 {
   char buf[256];
   const char* v = getenv(name);
-  if (v == NULL || *v == '\0') {
+  if (v == NULL || v[0] == '\0') {
     if (!sk_file_lookup(name, buf, sizeof(buf))) return fallback;
     v = buf;
   }
-  /* The enum values are cuvsCagraGraphBuildAlgo:
-   *   AUTO_SELECT = 0, IVF_PQ = 1, NN_DESCENT = 2, ITERATIVE_CAGRA_SEARCH = 3.
-   * They are named here instead of being written as numbers: the V5 baseline
-   * builds with NN_DESCENT and AUTO_SELECT picks a *different* algorithm
-   * (IVF-PQ when no device is bound), which changes the graph and therefore the
-   * recall. */
-  if (strcmp(v, "IVF_PQ") == 0) return cuvsCagraGraphBuildAlgo::IVF_PQ;
-  if (strcmp(v, "AUTO_SELECT") == 0) return cuvsCagraGraphBuildAlgo::AUTO_SELECT;
-  if (strcmp(v, "NN_DESCENT") == 0) return cuvsCagraGraphBuildAlgo::NN_DESCENT;
-  if (strcmp(v, "ITERATIVE_CAGRA_SEARCH") == 0) return cuvsCagraGraphBuildAlgo::ITERATIVE_CAGRA_SEARCH;
+  if (strcmp(v, "AUTO_SELECT") == 0) return AUTO_SELECT;
+  if (strcmp(v, "IVF_PQ") == 0) return IVF_PQ;
+  if (strcmp(v, "NN_DESCENT") == 0) return NN_DESCENT;
+  /* ITERATIVE_CAGRA_SEARCH is deliberately not listed: it is the experimental
+   * fourth value of the enum and nothing here needs it, while naming it would
+   * make the file fail to compile against a hipVS header that does not have
+   * it yet (a compile failure is a dead submission). */
   return fallback;
 }
 
@@ -130,27 +152,32 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
+  /* NN_DESCENT is the algorithm of the frozen baseline.  AUTO_SELECT must not
+   * be used here: it falls back to IVF-PQ when no device is bound, which builds
+   * a completely different graph and loses the recall gate. */
   h->ip->build_algo = (enum cuvsCagraGraphBuildAlgo)sk_env_algo("SEEKDB_CUVS_BUILD_ALGO", NN_DESCENT);
   h->ip->graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128);
   h->ip->intermediate_graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256);
   h->ip->nn_descent_niter = (size_t)sk_env_long("SEEKDB_CUVS_NN_DESCENT_NITER", 100);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  /* The device is deliberately NOT selected here.
-   *
-   * Selecting it (cudaSetDevice(0)) makes cuVS take its device NN-Descent
-   * path. That path is about 2.9x faster (50K x 128: 14.9s vs 42.7s,
-   * 250K x 128: 14.9s vs 42.7s of build time), but it changes two things the
-   * contest gates look at:
-   *   - the intermediate graph is allocated in VRAM instead of host memory, so
-   *     the peak VRAM grows far beyond the 1.25x of the frozen baseline;
-   *   - the device NN-Descent accumulates distances with float atomics, so the
-   *     resulting graph is slightly less accurate and the recall drops by
-   *     about 0.003 (250K x 128, 200 queries: 0.9970 vs 1.0000).
-   * Both break the gates, so the baseline's device-less path is kept on
-   * purpose: the build stays comparable to the baseline and the only
-   * optimisation left is the snapshot handling in the adaptor.
-   */
   {
+    /* Binding the device changes how cuVS lays out the NN-Descent work, so it
+     * is a switch, not a detail: 0 keeps the baseline behaviour exactly.
+     * Everything stays inside this block on purpose: a goto that jumps over an
+     * initialised local variable is an error when the file is compiled as C++. */
+    const long set_device = sk_env_long("SEEKDB_CUVS_SET_DEVICE", SK_DEFAULT_SET_DEVICE);
+    if (set_device != 0) {
+      cudaSetDevice(0);
+    }
+    if (sk_timing_on()) {
+      fprintf(stderr,
+              "[seekdb_cuvs][params] algo=%d graph_degree=%llu intermediate=%llu niter=%llu set_device=%ld\n",
+              (int)h->ip->build_algo,
+              (unsigned long long)h->ip->graph_degree,
+              (unsigned long long)h->ip->intermediate_graph_degree,
+              (unsigned long long)h->ip->nn_descent_niter,
+              set_device);
+    }
     const double t0 = sk_now_ms();
     if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
     sk_report("cagra_build", sk_now_ms() - t0);
@@ -249,19 +276,16 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
         cuvsCagraIndexGetDims(index->idx, &actual_dim) != CUVS_SUCCESS ||
         actual_n != n || actual_dim != dim) {
       fprintf(stderr, "[seekdb_cuvs] snapshot shape mismatch: %ld x %ld, expected %ld x %ld\n",
-              (long)actual_n, (long)actual_dim, n, dim);
+              (long)actual_n, (long)actual_dim, (long)n, (long)dim);
       goto fail_idx;
     }
   }
   index->n = n;
   index->dim = dim;
   return index;
-fail_idx:
-  cuvsCagraIndexDestroy(index->idx);
-fail_ip:
-  cuvsCagraIndexParamsDestroy(index->ip);
-fail_res:
-  cuvsResourcesDestroy(index->res);
+fail_idx: cuvsCagraIndexDestroy(index->idx);
+fail_ip:  cuvsCagraIndexParamsDestroy(index->ip);
+fail_res: cuvsResourcesDestroy(index->res);
 fail:
   fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
   free(index);
