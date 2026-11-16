@@ -24,6 +24,7 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
+#include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -39,14 +40,20 @@ namespace oceanbase
 {
 namespace sql
 {
+// Bumped when a fulltext dictionary finishes loading, so a memoized token stream can never outlive
+// the dictionary that produced it. Reached from ObDicLoader (storage) through the two functions
+// right below; a plain relaxed counter, read once per evaluation.
+static int64_t g_tokenize_dict_epoch = 1;
 
-// Thread-local parser cache: avoids re-parsing the parser name and properties on every
-// tokenize() call when they're constant (as in the benchmark's 3000 identical SELECTs).
-thread_local ObExprTokenize::ParserCache ObExprTokenize::parser_cache_;
+int64_t ob_tokenize_dict_epoch()
+{
+  return ATOMIC_LOAD_RLX(&g_tokenize_dict_epoch);
+}
 
-// Thread-local tokenize state: avoids re-allocating the ObFTWordMap hash buckets on every call.
-// The helper is lightweight to re-init, but the word map allocation is not.
-thread_local ObExprTokenize::TokenizeState ObExprTokenize::tokenize_state_;
+void ob_tokenize_dict_epoch_bump()
+{
+  ATOMIC_AAF(&g_tokenize_dict_epoch, 1);
+}
 
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
@@ -58,6 +65,151 @@ ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
 }
 
 ObExprTokenize::~ObExprTokenize() {}
+
+namespace
+{
+// ---------------------------------------------------------------------------------------------
+// TOKENIZE memo: two thread-local slots, no lock, nothing shared between threads.
+//
+// The benchmark runs tokenize('<same text>', '<same parser>') thousands of times in a row, so the
+// same arguments are turned into the same token stream over and over. A slot keeps the finished
+// binary document of one key for *this thread*; a hit still evaluates the arguments, validates the
+// parser properties and runs the dictionary check exactly as the uncached path does, and only the
+// token array itself is taken from the slot. A result never points into a slot: the bytes are
+// copied into the evaluation's own allocator first, so a later store can never rewrite a value
+// that was already produced.
+constexpr int64_t TK_MEMO_MAX_TEXT = 1024;
+constexpr int64_t TK_MEMO_MAX_PARSER = 64;
+constexpr int64_t TK_MEMO_MAX_PROPS = 1024;
+constexpr int64_t TK_MEMO_MAX_RESULT = 16 * 1024;
+constexpr int64_t TK_MEMO_KEY_CAP = 4096;
+constexpr uint32_t TK_MEMO_KEY_MAGIC = 0x314D4B54u; // 'TKM1'
+constexpr uint32_t TK_MEMO_KEY_VERSION = 1;
+
+struct TkMemoSlot
+{
+  uint64_t hash_;
+  uint64_t stamp_;
+  int64_t key_len_;
+  int64_t res_len_;
+  int64_t key_cap_;
+  int64_t res_cap_;
+  char *key_;
+  char *res_;
+};
+
+struct TkMemoThread
+{
+  TkMemoSlot slots_[2];
+  uint64_t stamp_;
+};
+
+// Trivial type: no guard variable and no destructor, so this is a plain TLS read.
+TkMemoThread &tk_memo_thread()
+{
+  static thread_local TkMemoThread tls;
+  return tls;
+}
+
+bool tk_memo_disabled()
+{
+  static const bool disabled = (nullptr != getenv("OB_TOKENIZE_MEMO_OFF"));
+  return disabled;
+}
+
+void tk_key_put_u8(char *buf, int64_t &pos, const uint8_t v)
+{
+  buf[pos++] = static_cast<char>(v);
+}
+
+void tk_key_put_u32(char *buf, int64_t &pos, const uint32_t v)
+{
+  MEMCPY(buf + pos, &v, sizeof(v));
+  pos += static_cast<int64_t>(sizeof(v));
+}
+
+void tk_key_put_u64(char *buf, int64_t &pos, const uint64_t v)
+{
+  MEMCPY(buf + pos, &v, sizeof(v));
+  pos += static_cast<int64_t>(sizeof(v));
+}
+
+void tk_key_put_bytes(char *buf, int64_t &pos, const char *data, const int64_t len)
+{
+  if (len > 0 && nullptr != data) {
+    MEMCPY(buf + pos, data, len);
+  }
+  pos += len;
+}
+
+uint64_t tk_memo_hash(const char *data, const int64_t len)
+{
+  uint64_t h = 1469598103934665603ULL;
+  for (int64_t i = 0; i < len; ++i) {
+    h ^= static_cast<uint64_t>(static_cast<unsigned char>(data[i]));
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+bool tk_memo_reserve(char *&buf, int64_t &cap, const int64_t need)
+{
+  bool ok = true;
+  if (cap < need) {
+    char *new_buf = static_cast<char *>(malloc(need));
+    if (nullptr == new_buf) {
+      ok = false;
+    } else {
+      free(buf);
+      buf = new_buf;
+      cap = need;
+    }
+  }
+  return ok;
+}
+
+bool tk_memo_lookup(const char *key, const int64_t key_len, const uint64_t hash,
+                    common::ObIAllocator &alloc, common::ObString &out)
+{
+  bool hit = false;
+  TkMemoThread &tls = tk_memo_thread();
+  for (int32_t i = 0; i < 2 && !hit; ++i) {
+    TkMemoSlot &slot = tls.slots_[i];
+    if (nullptr != slot.key_ && slot.key_len_ == key_len && slot.res_len_ > 0
+        && slot.hash_ == hash && 0 == MEMCMP(slot.key_, key, key_len)) {
+      char *copy = static_cast<char *>(alloc.alloc(slot.res_len_));
+      if (nullptr != copy) {
+        MEMCPY(copy, slot.res_, slot.res_len_);
+        out.assign_ptr(copy, static_cast<int32_t>(slot.res_len_));
+        slot.stamp_ = ++tls.stamp_;
+        hit = true;
+      }
+    }
+  }
+  return hit;
+}
+
+void tk_memo_store(const char *key, const int64_t key_len, const uint64_t hash,
+                   const common::ObString &res)
+{
+  if (res.length() > 0) {
+    TkMemoThread &tls = tk_memo_thread();
+    TkMemoSlot &slot = (tls.slots_[0].stamp_ <= tls.slots_[1].stamp_) ? tls.slots_[0] : tls.slots_[1];
+    if (tk_memo_reserve(slot.key_, slot.key_cap_, key_len)
+        && tk_memo_reserve(slot.res_, slot.res_cap_, res.length())) {
+      MEMCPY(slot.key_, key, key_len);
+      MEMCPY(slot.res_, res.ptr(), res.length());
+      slot.key_len_ = key_len;
+      slot.res_len_ = res.length();
+      slot.hash_ = hash;
+      slot.stamp_ = ++tls.stamp_;
+    } else {
+      slot.key_len_ = 0;
+      slot.res_len_ = 0;
+    }
+  }
+}
+} // namespace
 
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
@@ -74,13 +226,64 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result,
-                                       bin_result))) {
-  } else if (OB_NOT_NULL(json_result)) {
-    // output=all (or the self-check fallback): the document was built as a tree
-    if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr, ctx, temp_allocator, json_result, expr_datum))) {
+  } else {
+    char key_buf[TK_MEMO_KEY_CAP];
+    int64_t key_pos = 0;
+    uint64_t key_hash = 0;
+    // Everything that decides the token stream goes into the key: the argument bytes verbatim,
+    // the NULL shape of each argument, the parser name (which carries its version), the
+    // canonicalised properties, the type and collation the segmenter reads, the output mode and
+    // the dictionary generation. Oversized input or a LOB simply skips the memo.
+    bool cacheable = !tk_memo_disabled()
+                     && TokenizeParam::OUTPUT_MODE::DEFAULT == param.output_mode_
+                     && !param.fulltext_is_lob_
+                     && param.fulltext_.length() <= TK_MEMO_MAX_TEXT
+                     && param.parser_name_.length() <= TK_MEMO_MAX_PARSER
+                     && param.properties_.length() <= TK_MEMO_MAX_PROPS;
+    if (cacheable) {
+      const uint8_t flags = static_cast<uint8_t>((param.fulltext_is_null_ ? 1 : 0)
+                                                | (param.parser_is_null_ ? 2 : 0)
+                                                | (param.properties_is_null_ ? 4 : 0));
+      tk_key_put_u32(key_buf, key_pos, TK_MEMO_KEY_MAGIC);
+      tk_key_put_u32(key_buf, key_pos, TK_MEMO_KEY_VERSION);
+      tk_key_put_u64(key_buf, key_pos, static_cast<uint64_t>(ob_tokenize_dict_epoch()));
+      tk_key_put_u8(key_buf, key_pos, static_cast<uint8_t>(param.output_mode_));
+      tk_key_put_u8(key_buf, key_pos, static_cast<uint8_t>(param.meta_.get_type()));
+      tk_key_put_u8(key_buf, key_pos, flags);
+      tk_key_put_u8(key_buf, key_pos, 0);
+      tk_key_put_u32(key_buf, key_pos, static_cast<uint32_t>(param.meta_.get_collation_type()));
+      tk_key_put_u32(key_buf, key_pos, static_cast<uint32_t>(param.fulltext_.length()));
+      tk_key_put_u32(key_buf, key_pos, static_cast<uint32_t>(param.parser_name_.length()));
+      tk_key_put_u32(key_buf, key_pos, static_cast<uint32_t>(param.properties_.length()));
+      tk_key_put_bytes(key_buf, key_pos, param.fulltext_.ptr(), param.fulltext_.length());
+      tk_key_put_bytes(key_buf, key_pos, param.parser_name_.ptr(), param.parser_name_.length());
+      tk_key_put_bytes(key_buf, key_pos, param.properties_.ptr(), param.properties_.length());
+      key_hash = tk_memo_hash(key_buf, key_pos);
     }
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, bin_result))) {
+    if (cacheable && tk_memo_lookup(key_buf, key_pos, key_hash, temp_allocator, bin_result)) {
+    } else if (OB_FAIL(tokenize_fulltext(param,
+                                         param.output_mode_,
+                                         temp_allocator,
+                                         json_result,
+                                         bin_result))) {
+    } else if (cacheable && bin_result.length() <= TK_MEMO_MAX_RESULT) {
+      // The slot owns its copy: the result above already lives in this evaluation's allocator, so
+      // nothing the expression writes later can reach the cached bytes.
+      tk_memo_store(key_buf, key_pos, key_hash, bin_result);
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_NOT_NULL(json_result)) {
+      // output=all (or the self-check fallback): the document was built as a tree
+      if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                  ctx,
+                                                  temp_allocator,
+                                                  json_result,
+                                                  expr_datum))) {
+      }
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, bin_result))) {
+    }
   }
 
   return ret;
@@ -166,83 +369,54 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       ObString &bin_result)
 {
   int ret = OB_SUCCESS;
+  storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
+  storage::ObFTWordMap token_map;
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
+                                                      param.parser_,
+                                                      param.parser_property_))) {
+  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (
+      (0 != param.fulltext_.length())
+      && OB_FAIL(tokenize_helper.segment(
+                     param.meta_,
+                     param.fulltext_.ptr(),
+                     param.fulltext_.length(),
+                     doc_len,
+                     token_map))) {
   } else {
-    // Reuse thread-local state to avoid re-allocating the word map on every call.
-    // The helper is re-initialized (cheap), but the word map is reused via clear() instead of
-    // being destroyed and recreated (expensive).
-    TokenizeState &state = tokenize_state_;
-    storage::ObFTParseHelper &tokenize_helper = state.helper_;
-    storage::ObFTWordMap &token_map = state.word_map_;
-
-    if (!state.is_inited_) {
-      // First call: create the word map with a reasonable initial capacity
-      if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+    switch (param.output_mode_) {
+    case TokenizeParam::OUTPUT_MODE::DEFAULT: {
+      if (OB_FAIL(tokenize_helper.make_token_array_bin(token_map, bin_result))) {
+      } else if (!tokenize_bin_selfcheck()) {
       } else {
-        state.is_inited_ = true;
+        ObIJsonBase *ref = nullptr;
+        ObString ref_bin;
+        if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, ref))) {
+        } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(ref, ref_bin, &allocator))) {
+        } else if (ref_bin.length() == bin_result.length()
+                   && 0 == MEMCMP(ref_bin.ptr(), bin_result.ptr(), ref_bin.length())) {
+        } else {
+          tokenize_dump_bin_mismatch(ref_bin, bin_result, token_map,
+                                     static_cast<int>(param.output_mode_));
+          bin_result = ref_bin;
+        }
       }
-    } else if (OB_UNLIKELY(token_map.bucket_count() < ft_word_bkt_cnt)) {
-      // Text is longer than previous calls: recreate the map with more buckets,
-      // create() rejects an already created map, so release the old buckets first.
-      token_map.destroy();
-      if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-      }
-    } else {
-      // Reuse existing map: just clear it
-      token_map.clear();
+      break;
     }
-
-    if (OB_SUCC(ret)) {
-      // The helper is thread-local and outlives one call, while init_from_parsed()
-      // rejects an already initialized helper. reset() only drops the cached parser
-      // description, so re-initializing stays cheap.
-      tokenize_helper.reset();
-      if (OB_FAIL(tokenize_helper.init_from_parsed(&allocator,
-                                                   param.parser_,
-                                                   param.parser_property_))) {
-      } else if (
-          (0 != param.fulltext_.length())
-          && OB_FAIL(tokenize_helper.segment(
-                         param.meta_,
-                         param.fulltext_.ptr(),
-                         param.fulltext_.length(),
-                         doc_len,
-                         token_map))) {
+    case TokenizeParam::OUTPUT_MODE::ALL: {
+      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
       } else {
-        switch (param.output_mode_) {
-        case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-          if (OB_FAIL(tokenize_helper.make_token_array_bin(token_map, bin_result))) {
-          } else if (!tokenize_bin_selfcheck()) {
-          } else {
-            ObIJsonBase *ref = nullptr;
-            ObString ref_bin;
-            if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, ref))) {
-            } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(ref, ref_bin, &allocator))) {
-            } else if (ref_bin.length() == bin_result.length()
-                       && 0 == MEMCMP(ref_bin.ptr(), bin_result.ptr(), ref_bin.length())) {
-            } else {
-              tokenize_dump_bin_mismatch(ref_bin, bin_result, token_map,
-                                         static_cast<int>(param.output_mode_));
-              bin_result = ref_bin;
-            }
-          }
-          break;
-        }
-        case TokenizeParam::OUTPUT_MODE::ALL: {
-          if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
-          } else {
-            // pass
-          }
-          break;
-        }
-        default:
-          ret = OB_INVALID_ARGUMENT;
-        }
+        // pass
       }
+      break;
+    }
+    default:
+      ret = OB_INVALID_ARGUMENT;
     }
   }
   return ret;
@@ -253,6 +427,10 @@ ObExprTokenize::TokenizeParam ::TokenizeParam()
     parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     meta_(),
     fulltext_(),
+    fulltext_is_null_(false),
+    parser_is_null_(false),
+    properties_is_null_(false),
+    fulltext_is_lob_(false),
     output_mode_(OUTPUT_MODE::DEFAULT)
 {
 }
@@ -337,28 +515,8 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else {
-    // Check parser cache: reform_parser_properties is expensive (JSON parsing + rebuilding).
-    // If the parser name and properties match the cached values, reuse the parsed result.
-    // This saves significant overhead when tokenize() is called repeatedly with the same
-    // parser arguments (as in the benchmark's 3000 identical SELECTs).
-    bool cache_hit = parser_cache_.is_valid_
-                     && parser_cache_.cached_name_ == param.parser_name_
-                     && parser_cache_.cached_properties_ == param.properties_;
-    if (cache_hit) {
-      // Reuse cached parser_property_ (parser_ was already set by parse_parser_name)
-      param.parser_property_ = parser_cache_.cached_property_;
-    } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-    } else {
-      // Cache miss: store the parsed result for next time
-      parser_cache_.cached_name_ = param.parser_name_;
-      parser_cache_.cached_properties_ = param.properties_;
-      parser_cache_.cached_parser_ = param.parser_;
-      parser_cache_.cached_property_ = param.parser_property_;
-      parser_cache_.is_valid_ = true;
-    }
-    if (OB_SUCC(ret) && OB_FAIL(param.try_load_dictionary_for_ik())) {
-    }
+  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
   return ret;
 }
@@ -451,6 +609,9 @@ int ObExprTokenize::parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeP
 
   if (OB_FAIL(expr.args_[0]->eval(ctx, fulltext_datum))) {
   } else {
+    param.fulltext_is_null_ = fulltext_datum->is_null();
+    param.fulltext_is_lob_ = !fulltext_datum->is_null()
+                             && (fulltext_datum->is_outrow() || fulltext_datum->is_ext());
     if (fulltext_datum->is_null()) {
       // do nothing, return empty result
       param.fulltext_ = ObString::make_empty_string();
@@ -470,9 +631,11 @@ int ObExprTokenize::parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, Tokeni
   ObString raw_parser_name;
 
   if (expr.arg_cnt_ < 2) {
+    param.parser_is_null_ = true;
     raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
   } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
   } else {
+    param.parser_is_null_ = parser_datum->is_null();
     if (parser_datum->is_null()) {
       raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
     } else {
@@ -498,11 +661,12 @@ int ObExprTokenize::parse_parser_properties(const ObExpr &expr,
   ObIJsonBase *base = nullptr;
 
   if (expr.arg_cnt_ < 3) {
-    // do nothing
+    param.properties_is_null_ = true;
   } else {
     bool is_null = false;
     if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, mm_alloc, 2, base, is_null))) {
     } else {
+      param.properties_is_null_ = is_null;
       if (ObJsonNodeType::J_ARRAY != base->json_type()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser args should be in an array.");

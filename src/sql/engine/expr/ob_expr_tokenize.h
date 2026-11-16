@@ -79,6 +79,13 @@ private:
     storage::ObFTParserProperty parser_property_;
     ObObjMeta meta_;
     ObString fulltext_;
+    // Shape of the arguments as they arrived. The memo key has to tell NULL from the empty string,
+    // a LOB input never enters the memo at all, and the two remaining flags keep the key free of
+    // assumptions about which argument was omitted.
+    bool fulltext_is_null_;
+    bool parser_is_null_;
+    bool properties_is_null_;
+    bool fulltext_is_lob_;
     enum OUTPUT_MODE
     {
       DEFAULT,
@@ -106,37 +113,6 @@ private:
                                ObString &bin_result);
 
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
-
-private:
-  // Cache for parsed parser name and properties. The benchmark calls tokenize() with constant
-  // parser arguments across thousands of rows, so parsing once and reusing saves significant
-  // per-call overhead. The cache is keyed by (parser_name_, properties_) and stores the parsed
-  // ObFTParser and ObFTParserProperty objects.
-  struct ParserCache {
-    ObString cached_name_;
-    ObString cached_properties_;
-    storage::ObFTParser cached_parser_;
-    storage::ObFTParserProperty cached_property_;
-    bool is_valid_ = false;
-
-    void invalidate() { is_valid_ = false; }
-  };
-
-  // Thread-local parser cache: avoids re-parsing the parser name and properties on every
-  // tokenize() call when they're constant (as in the benchmark's 3000 identical SELECTs).
-  static thread_local ParserCache parser_cache_;
-
-  // Thread-local parse helper and word map: avoids re-allocating the hash map buckets on every
-  // call. The helper is re-initialized with the current parser, and the word map is reused
-  // (cleared) instead of recreated.
-  struct TokenizeState {
-    storage::ObFTParseHelper helper_;
-    storage::ObFTWordMap word_map_;
-    bool is_inited_ = false;
-
-    TokenizeState() = default;
-  };
-  static thread_local TokenizeState tokenize_state_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);

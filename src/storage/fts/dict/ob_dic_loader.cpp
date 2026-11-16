@@ -22,6 +22,14 @@
 #include "storage/fts/dict/ob_dic_lock.h"
 namespace oceanbase
 {
+// Defined next to the TOKENIZE memo (sql/engine/expr/ob_expr_tokenize.cpp): the memo key carries
+// this generation, so a token stream cached from one dictionary can never be served after another
+// one has been loaded in the same process.
+namespace sql
+{
+int64_t ob_tokenize_dict_epoch();
+void ob_tokenize_dict_epoch_bump();
+}
 namespace storage
 {
 /**
@@ -107,6 +115,7 @@ int ObDicLoader::try_load_dictionary_in_trans(ObMySQLTransaction &trans)
       }
       if (OB_SUCC(ret)) {
         is_load_ = true;
+        sql::ob_tokenize_dict_epoch_bump();
       }
     }
   }
