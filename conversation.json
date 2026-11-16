@@ -77,6 +77,13 @@
       "record_uuid": "session-continuation",
       "role": "student",
       "content": "又执行失败了：MySQL 正式用例 — 未完成；此项为准入条件，不计排名分；性能原始分 — 评测执行失败或未完成，无有效性能成绩；Agent Prompt 原始分 — 评测执行失败或未完成，无有效 Prompt 成绩。"
+    },
+    {
+      "id": "u10",
+      "timestamp": "2026-11-16T14:12:00.000Z",
+      "record_uuid": "session-continuation",
+      "role": "student",
+      "content": "你再重复核查一遍，保证问题解决了"
     }
   ],
   "conversations": [
@@ -209,6 +216,14 @@
       "note": "上下文压缩后续写；时间戳取整分钟。此条更正 c15 的归因：数据目录问题真实存在，但不是两次失败的主因。",
       "role": "agent",
       "content": "第二次结果仍然三项全空，说明镜像构建本身就没成功。检查提交树而不是工作区：根目录 .gitignore 第 54 行忽略 `Makefile`，`git check-ignore -v minivectordb/Makefile` 命中该规则，`git archive HEAD` 里也确实没有它。平台克隆后构建上下文中没有 Makefile，Dockerfile 的 `make -C minivectordb` 立即失败，镜像从未产出——这才是两次“评测执行失败”的直接原因；本地一直有该文件，所以所有测试都通过。修复：在 minivectordb/.gitignore 加 `!Makefile` 并强制纳入版本库；Dockerfile 改为直接调用 g++ 编译三个源文件，不再依赖 Makefile。c15 中的数据目录回退仍是必要的隐患修复（判题注入的 VECTORDB_DATA_DIR 在容器内不可写）。"
+    },
+    {
+      "id": "c18",
+      "timestamp": "2026-11-16T14:24:00.000Z",
+      "record_uuid": "session-continuation",
+      "note": "独立复核轮次；时间戳取整分钟。",
+      "role": "agent",
+      "content": "按提交树重新复核：从远端分支取回 984b3641c，确认 Makefile、全部源码、Dockerfile、两份 conversation.json 都在同一提交里；用 git archive 导出干净树按 Dockerfile 命令编译，得到与本地测试完全相同的二进制（sha256 一致）。随后用 bwrap 搭建只读根文件系统（tmpfs 根 + --remount-ro /）、只把 /data 绑定为可写、并把 VECTORDB_DATA_DIR 指向不存在的宿主路径，模拟判题容器：进程输出 ready，DDL/DML/向量查询和重启复用数据全部正确，日志显示回退到 /data。又用与 Ubuntu 24.04 同系列的 g++ 13.4 重新编译同一份源码，协议 20/20、边界 44/44 通过，排除编译器版本风险。Dockerfile 的 apt 步骤再加固为“更新+安装整体失败后切换镜像源重试”。"
     }
   ],
   "experiments": [
@@ -292,6 +307,14 @@
       "tool": "git ls-tree -r HEAD minivectordb/；git check-ignore -v minivectordb/Makefile；git archive HEAD | tar -t；在 git archive 导出的干净树上按 Dockerfile 命令重新编译",
       "output": "git check-ignore: .gitignore:54:Makefile\tminivectordb/Makefile\ngit archive 文件列表: minivectordb/README.md, minivectordb/src/{common.h,db.cpp,db.h,json.h,main.cpp,parser.cpp,parser.h,serialize.h}（无 Makefile）\n直接 g++ 编译干净树: 成功生成 bin/mvd\nprotocol_check: 20/20 PASS",
       "conclusion": "根目录 .gitignore 的 Makefile 规则导致构建脚本缺失，镜像构建失败，因此三项均为“未完成”。已强制跟踪 Makefile，并让 Dockerfile 不再依赖 make。"
+    },
+    {
+      "id": "e11",
+      "question": "提交树是否自洽？只读根文件系统 + 宿主环境变量注入下能否正常启动并持久化？g++ 13 能否编译？",
+      "initiated_by": "agent（学生 u10 要求复核）",
+      "tool": "git fetch 远端分支；git archive 导出干净树并用 Dockerfile 命令编译；bwrap 只读根沙箱（--tmpfs / + --remount-ro / + 可写 /data 绑定 + 坏 VECTORDB_DATA_DIR）；apt-get download 解包 g++ 13.4 并用它编译；官方 protocol_check 与本地崩潢/边界套件",
+      "output": "remote tree: Dockerfile, agent/conversation.json, conversation.json, minivectordb/{.gitignore,Makefile,README.md,src/*}\narchive build sha256: 3538866432763c99a81e954f4517f95b17f4f3eb6c6d22434d8c09a2927d68ac（与本地一致）\nldd: libm, libc, ld-linux 仅三项\nempty env: {\"type\":\"ready\"}\nread-only sandbox: ready + DDL/DML/TopK + restart rows [[1,\"a\"]]，stderr: mvd: started data_dir=/data\nbad command path: stderr 含 unusable，回退 /data 后查询成功\nprotocol: 20/20 PASS\ncrash: ALL PASS (9 tests)\nedge: 44 checks, 0 failed\ng++ 13.4: compile PASS, protocol 20/20, edge PASS",
+      "conclusion": "提交树可独立构建；数据目录回退在只读根 + 坏环境变量下按预期工作；g++ 13 与 g++ 15 行为一致。此前平台失败的缺口（Makefile 未提交）已消除。"
     }
   ],
   "retrospective": [

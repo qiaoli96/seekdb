@@ -2,13 +2,14 @@ FROM ubuntu:24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
-    if ! apt-get update -o Acquire::Retries=3; then \
+    (apt-get update -o Acquire::Retries=3 \
+     && apt-get install -y --no-install-recommends g++) || { \
       sed -i -e 's@http://archive.ubuntu.com@http://mirrors.aliyun.com@g' \
              -e 's@http://security.ubuntu.com@http://mirrors.aliyun.com@g' \
-             /etc/apt/sources.list.d/ubuntu.sources; \
+             /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
       apt-get update -o Acquire::Retries=3; \
-    fi; \
-    apt-get install -y --no-install-recommends g++; \
+      apt-get install -y --no-install-recommends g++; \
+    }; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
