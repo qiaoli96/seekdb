@@ -49,6 +49,27 @@
       "record_uuid": "53ee6cb2-e7c5-4efe-ba86-daa922a18f7f",
       "role": "student",
       "content": "可以，需要我配合的地方到时说下"
+    },
+    {
+      "id": "u6",
+      "timestamp": "2026-11-16T13:28:00.000Z",
+      "record_uuid": "session-continuation",
+      "role": "student",
+      "content": "MySQL 正式用例 — 未完成；此项为准入条件，不计排名分。性能原始分 — 评测执行失败或未完成，无有效性能成绩；请联系评测方排查。Agent Prompt 原始分 — 评测执行失败或未完成，无有效 Prompt 成绩；请联系评测方排查。---失败了"
+    },
+    {
+      "id": "u7",
+      "timestamp": "2026-11-16T13:31:00.000Z",
+      "record_uuid": "session-continuation",
+      "role": "student",
+      "content": "你知道问题在哪儿了吗"
+    },
+    {
+      "id": "u8",
+      "timestamp": "2026-11-16T13:36:00.000Z",
+      "record_uuid": "session-continuation",
+      "role": "student",
+      "content": "行，你再优化一版吧"
     }
   ],
   "conversations": [
@@ -157,6 +178,22 @@
       "note": "本条发生在同一会话（a51ea654-…）上下文压缩后的续写阶段，时间戳取整分钟；内容为 Agent 当轮的实际汇报。",
       "role": "agent",
       "content": "大数据量测试通过：60 万行 × 128 维（数据文件 552 MB），重启就绪 0.18 s，全表 TopK 扫描 31.7 ms、过滤后 TopK 22.7 ms，重启后 RSS 47 MB。期间把向量列偏移写入快照（版本 2），避免大数据量启动时全量读堆；并补上 INSERT 列名列表支持。"
+    },
+    {
+      "id": "c15",
+      "timestamp": "2026-11-16T13:34:00.000Z",
+      "record_uuid": "session-continuation",
+      "note": "上下文压缩后续写；时间戳取整分钟，内容为 Agent 当轮的实际汇报。",
+      "role": "agent",
+      "content": "三项均为空说明容器没有进入 ready，而不是某个用例算错。逐项排除：公开协议检查 20/20 通过、依赖静态链接、conversation.json 校验通过、镜像构建步骤简单，因此重点转向判题侧启动方式。读 protocol_check/_transport.py 发现判题用 docker run --read-only 启动镜像、只在 /data 挂载可写卷，同时把宿主临时目录写进 VECTORDB_DATA_DIR。原程序数据目录优先取环境变量，于是在只读根文件系统上 mkdir 立刻失败，进程退出、ready 永远不出现——与“三项全空”完全吻合。修复：显式参数优先，环境变量仅在目录可创建时生效，否则回退 /data，并打印回退日志。"
+    },
+    {
+      "id": "c16",
+      "timestamp": "2026-11-16T13:46:00.000Z",
+      "record_uuid": "session-continuation",
+      "note": "同一轮修复后的验证汇报，时间戳取整分钟。",
+      "role": "agent",
+      "content": "修复后按 Dockerfile 相同参数（-O3、静态 libstdc++/libgcc）重新构建，四套验证全部通过：官方协议检查 20/20 PASS、kill -9 故障注入 9/9、边界语义 44/44、60 万行大数据 PASS（重启就绪 0.19 s、全表 TopK 约 63 ms、过滤 TopK 约 22 ms）。另加目录解析专项：显式参数胜过不可用的环境变量、无参数时使用环境变量、--data-dir 形式、不可写路径产生回退日志，均通过。Dockerfile 同时去掉运行阶段 apt、构建阶段加重试与镜像源回退。"
     }
   ],
   "experiments": [
@@ -224,6 +261,14 @@
       "tool": "WSL Ubuntu，JSONL 协议直连；600,000 行 × 128 维，每批 500 行 INSERT 并提交",
       "output": "INSERT 600k rows: 37.44s\ndata dir bytes before shutdown: 552494991\nfull scan time: 31.7 ms\nfiltered top5 ids: [70007, 170007, 270007, 370007, 470007] time 22.7 ms\nrestart startup: 0.18s\npeak rss after restart: 47096 KB\nLARGE DATA TEST PASS",
       "result": "通过。数据文件 552 MB 而重启后进程 RSS 47 MB，结果与重启前一致（含主键升序并列）。期间修正两点：快照装载原先逐行解析堆数据以恢复向量偏移，大数据量启动会读完整堆，已把 vec_off 写入快照（版本 2），启动 0.18 s；INSERT 增加可选列名列表。修正后协议回归 20/20、故障注入 9/9 仍通过。"
+    },
+    {
+      "id": "e9",
+      "question": "平台评测三项全空：是代码/协议问题，还是容器启动方式导致进程未能就绪？",
+      "initiated_by": "agent（学生 u8 授权再优化一版）",
+      "tool": "阅读 protocol_check/_transport.py；WSL Ubuntu 下按 Dockerfile 参数重建并跑协议/崩溃/边界/大数据四套测试 + 数据目录专项测试",
+      "output": "protocol_check: 20 PASS, no FAIL\ncrash tests: ALL PASS (9 tests)\nedge suite: 44 checks, 0 failed\nlarge data: INSERT 600k rows: 37.35s\nfull scan time: 62.9 ms\nfiltered top5 ids: [70007, 170007, 270007, 370007, 470007] time 23.3 ms\nrestart startup: 0.19s\npeak rss after restart: 46160 KB\nLARGE DATA TEST PASS\ndir tests: PASS arg wins over unusable env / PASS env used when no arg / PASS --data-dir form / PASS unusable paths produce fallback log / DIR TESTS PASS",
+      "conclusion": "判题容器以 --read-only 运行且 VECTORDB_DATA_DIR 指向容器内不存在的宿主路径；原实现环境变量优先导致启动即失败。改为“参数优先、候选目录逐个验证可写、回退 /data”后，本地全部验证保持通过，且与判题启动方式兼容。"
     }
   ],
   "retrospective": [

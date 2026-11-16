@@ -1,9 +1,12 @@
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "common.h"
 #include "db.h"
@@ -12,22 +15,34 @@
 namespace {
 
 std::string data_dir_from_args(int argc, char **argv) {
-  const char *env = std::getenv("VECTORDB_DATA_DIR");
-  if (env != nullptr && env[0] != '\0') {
-    return env;
-  }
+  std::string arg;
   for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
+    std::string value = argv[i];
     const std::string prefix = "--data-dir=";
-    if (arg.rfind(prefix, 0) == 0) {
-      return arg.substr(prefix.size());
+    if (value.rfind(prefix, 0) == 0) {
+      arg = value.substr(prefix.size());
+      break;
     }
-    if (arg == "--data-dir" && i + 1 < argc) {
-      return argv[i + 1];
+    if (value == "--data-dir" && i + 1 < argc) {
+      arg = argv[i + 1];
+      break;
+    }
+    if (value[0] != '-') {
+      arg = value;
+      break;
     }
   }
-  if (argc > 1 && argv[1][0] != '-') {
-    return argv[1];
+  const char *env = std::getenv("VECTORDB_DATA_DIR");
+  const std::string candidates[3] = {arg, (env != nullptr ? env : ""), "/data"};
+  for (const std::string &c : candidates) {
+    if (c.empty()) {
+      continue;
+    }
+    if (mkdir(c.c_str(), 0755) == 0 || errno == EEXIST) {
+      return c;
+    }
+    fprintf(stderr, "mvd: data dir %s unusable (%s), trying fallback\n", c.c_str(),
+            std::strerror(errno));
   }
   return "/data";
 }
@@ -67,6 +82,7 @@ int main(int argc, char **argv) {
   }
 
   emit("{\"type\":\"ready\"}");
+  log_line("started data_dir=" + dir);
 
   std::string line;
   while (std::getline(std::cin, line)) {
