@@ -1,0 +1,507 @@
+#include "parser.h"
+
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+
+namespace mvd {
+
+namespace {
+
+enum class TokKind { END, IDENT, INT, STR, PUNCT };
+
+struct Tok {
+  TokKind kind = TokKind::END;
+  std::string text;  // identifier (as written) / string body
+  std::string upper; // uppercased identifier, for keyword checks
+  int64_t iv = 0;
+  char punct = 0;
+};
+
+std::string upper_copy(const std::string &s) {
+  std::string out = s;
+  for (char &c : out) {
+    c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+std::vector<Tok> tokenize(const std::string &sql) {
+  std::vector<Tok> out;
+  size_t i = 0;
+  while (i < sql.size()) {
+    unsigned char c = static_cast<unsigned char>(sql[i]);
+    if (isspace(c)) {
+      ++i;
+      continue;
+    }
+    if (isalpha(c) || c == '_') {
+      size_t start = i;
+      while (i < sql.size() &&
+             (isalnum(static_cast<unsigned char>(sql[i])) || sql[i] == '_')) {
+        ++i;
+      }
+      Tok t;
+      t.kind = TokKind::IDENT;
+      t.text = sql.substr(start, i - start);
+      t.upper = upper_copy(t.text);
+      out.push_back(t);
+      continue;
+    }
+    if (isdigit(c) || (c == '-' && i + 1 < sql.size() &&
+                       isdigit(static_cast<unsigned char>(sql[i + 1])))) {
+      size_t start = i;
+      if (sql[i] == '-') {
+        ++i;
+      }
+      while (i < sql.size() && isdigit(static_cast<unsigned char>(sql[i]))) {
+        ++i;
+      }
+      std::string text = sql.substr(start, i - start);
+      errno = 0;
+      char *end = nullptr;
+      long long v = strtoll(text.c_str(), &end, 10);
+      if (errno == ERANGE || end == nullptr || *end != '\0') {
+        raise("value_out_of_range");
+      }
+      Tok t;
+      t.kind = TokKind::INT;
+      t.text = text;
+      t.iv = static_cast<int64_t>(v);
+      out.push_back(t);
+      continue;
+    }
+    if (c == '\'') {
+      ++i;
+      std::string body;
+      bool closed = false;
+      while (i < sql.size()) {
+        if (sql[i] == '\'') {
+          if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+            body += '\'';
+            i += 2;
+            continue;
+          }
+          ++i;
+          closed = true;
+          break;
+        }
+        body += sql[i++];
+      }
+      if (!closed) {
+        raise("syntax_error");
+      }
+      Tok t;
+      t.kind = TokKind::STR;
+      t.text = body;
+      out.push_back(t);
+      continue;
+    }
+    if (c == '(' || c == ')' || c == ',' || c == '=' || c == '*' || c == ';' ||
+        c == '<' || c == '>' || c == '+' || c == '-') {
+      Tok t;
+      t.kind = TokKind::PUNCT;
+      t.punct = static_cast<char>(c);
+      out.push_back(t);
+      ++i;
+      continue;
+    }
+    raise("syntax_error");
+  }
+  Tok end;
+  end.kind = TokKind::END;
+  out.push_back(end);
+  return out;
+}
+
+class Parser {
+ public:
+  explicit Parser(std::vector<Tok> toks) : toks_(std::move(toks)) {}
+
+  Stmt parse() {
+    Stmt stmt;
+    if (peek().kind == TokKind::END) {
+      raise("syntax_error");
+    }
+    if (peek_kw("CREATE")) {
+      next();
+      if (peek_kw("TABLE")) {
+        stmt.kind = StmtKind::CREATE_TABLE;
+        parse_create_table(stmt);
+      } else if (peek_kw("VECTOR")) {
+        next();
+        if (!peek_kw("INDEX")) {
+          stmt.kind = StmtKind::UNSUPPORTED;
+          return stmt;
+        }
+        next();
+        stmt.kind = StmtKind::CREATE_INDEX;
+        stmt.index_name = expect_ident();
+        expect_kw("ON");
+        stmt.table = expect_ident();
+        expect_punct('(');
+        stmt.index_col = expect_ident();
+        expect_punct(')');
+      } else {
+        stmt.kind = StmtKind::UNSUPPORTED;
+        return stmt;
+      }
+    } else if (peek_kw("INSERT")) {
+      next();
+      stmt.kind = StmtKind::INSERT;
+      parse_insert(stmt.insert);
+    } else if (peek_kw("SELECT")) {
+      next();
+      stmt.kind = StmtKind::SELECT;
+      parse_select(stmt.select);
+    } else if (peek_kw("UPDATE")) {
+      next();
+      stmt.kind = StmtKind::UPDATE;
+      parse_update(stmt.update);
+    } else if (peek_kw("DELETE")) {
+      next();
+      stmt.kind = StmtKind::DELETE;
+      parse_delete(stmt.del);
+    } else if (peek_kw("BEGIN")) {
+      next();
+      if (peek_kw("WORK") || peek_kw("TRANSACTION")) {
+        next();
+      }
+      stmt.kind = StmtKind::BEGIN;
+    } else if (peek_kw("START")) {
+      next();
+      expect_kw("TRANSACTION");
+      stmt.kind = StmtKind::BEGIN;
+    } else if (peek_kw("COMMIT")) {
+      next();
+      if (peek_kw("WORK")) {
+        next();
+      }
+      stmt.kind = StmtKind::COMMIT;
+    } else if (peek_kw("ROLLBACK")) {
+      next();
+      if (peek_kw("WORK")) {
+        next();
+      }
+      stmt.kind = StmtKind::ROLLBACK;
+    } else {
+      stmt.kind = StmtKind::UNSUPPORTED;
+      return stmt;
+    }
+
+    if (peek().kind == TokKind::PUNCT && peek().punct == ';') {
+      next();
+    }
+    if (peek().kind != TokKind::END) {
+      raise("syntax_error");
+    }
+    return stmt;
+  }
+
+ private:
+  const Tok &peek(size_t off = 0) const { return toks_[pos_ + off]; }
+  const Tok &next() { return toks_[pos_++]; }
+
+  bool peek_kw(const char *kw, size_t off = 0) const {
+    return peek(off).kind == TokKind::IDENT && peek(off).upper == kw;
+  }
+
+  void expect_kw(const char *kw) {
+    if (!peek_kw(kw)) {
+      raise("syntax_error");
+    }
+    next();
+  }
+
+  void expect_punct(char p) {
+    if (peek().kind != TokKind::PUNCT || peek().punct != p) {
+      raise("syntax_error");
+    }
+    next();
+  }
+
+  std::string expect_ident() {
+    if (peek().kind != TokKind::IDENT) {
+      raise("syntax_error");
+    }
+    return next().text;
+  }
+
+  int64_t expect_int() {
+    if (peek().kind != TokKind::INT) {
+      raise("syntax_error");
+    }
+    return next().iv;
+  }
+
+  Literal parse_literal() {
+    Literal lit;
+    if (peek().kind == TokKind::INT) {
+      lit.kind = Literal::INT;
+      lit.i = next().iv;
+    } else if (peek().kind == TokKind::STR) {
+      lit.kind = Literal::STR;
+      lit.s = next().text;
+    } else {
+      raise("syntax_error");
+    }
+    return lit;
+  }
+
+  CmpOp parse_op() {
+    if (peek().kind != TokKind::PUNCT) {
+      raise("syntax_error");
+    }
+    char c = next().punct;
+    if (c == '=') {
+      return CmpOp::EQ;
+    }
+    if (c == '<') {
+      if (peek().kind == TokKind::PUNCT && peek().punct == '=') {
+        next();
+        return CmpOp::LE;
+      }
+      return CmpOp::LT;
+    }
+    if (c == '>') {
+      if (peek().kind == TokKind::PUNCT && peek().punct == '=') {
+        next();
+        return CmpOp::GE;
+      }
+      return CmpOp::GT;
+    }
+    raise("syntax_error");
+  }
+
+  void parse_where(std::vector<Compare> &where) {
+    if (!peek_kw("WHERE")) {
+      return;
+    }
+    next();
+    while (true) {
+      Compare cmp;
+      cmp.col = expect_ident();
+      cmp.op = parse_op();
+      cmp.lit = parse_literal();
+      where.push_back(cmp);
+      if (peek_kw("AND")) {
+        next();
+        continue;
+      }
+      break;
+    }
+  }
+
+  void parse_create_table(Stmt &stmt) {
+    next();  // TABLE
+    stmt.table = expect_ident();
+    expect_punct('(');
+    std::string table_pk;
+    while (true) {
+      if (peek_kw("PRIMARY")) {
+        next();
+        expect_kw("KEY");
+        expect_punct('(');
+        table_pk = expect_ident();
+        expect_punct(')');
+      } else {
+        ColumnDef def;
+        def.name = expect_ident();
+        if (peek_kw("BIGINT")) {
+          next();
+          def.type = ColType::BIGINT;
+        } else if (peek_kw("VARCHAR")) {
+          next();
+          expect_punct('(');
+          def.type = ColType::VARCHAR;
+          def.len = expect_int();
+          expect_punct(')');
+        } else if (peek_kw("VECTOR")) {
+          next();
+          expect_punct('(');
+          def.type = ColType::VECTOR;
+          def.len = expect_int();
+          expect_punct(')');
+        } else {
+          raise("syntax_error");
+        }
+        if (peek_kw("PRIMARY")) {
+          next();
+          expect_kw("KEY");
+          def.pk = true;
+        }
+        stmt.columns.push_back(def);
+      }
+      if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+        next();
+        continue;
+      }
+      break;
+    }
+    expect_punct(')');
+    if (!table_pk.empty()) {
+      bool found = false;
+      for (ColumnDef &def : stmt.columns) {
+        if (upper_copy(def.name) == upper_copy(table_pk)) {
+          def.pk = true;
+          found = true;
+        }
+      }
+      if (!found) {
+        raise("syntax_error");
+      }
+    }
+  }
+
+  void parse_insert(InsertStmt &ins) {
+    expect_kw("INTO");
+    ins.table = expect_ident();
+    if (peek().kind == TokKind::PUNCT && peek().punct == '(') {
+      next();
+      while (true) {
+        ins.columns.push_back(expect_ident());
+        if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+          next();
+          continue;
+        }
+        break;
+      }
+      expect_punct(')');
+    }
+    expect_kw("VALUES");
+    while (true) {
+      expect_punct('(');
+      std::vector<Literal> row;
+      while (true) {
+        row.push_back(parse_literal());
+        if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+          next();
+          continue;
+        }
+        break;
+      }
+      expect_punct(')');
+      ins.rows.push_back(std::move(row));
+      if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+        next();
+        continue;
+      }
+      break;
+    }
+  }
+
+  void parse_distance(SelectItem &item) {
+    next();  // L2_DISTANCE
+    expect_punct('(');
+    item.is_distance = true;
+    item.col = expect_ident();
+    expect_punct(',');
+    if (peek().kind != TokKind::STR) {
+      raise("syntax_error");
+    }
+    item.vec_text = next().text;
+    expect_punct(')');
+  }
+
+  void parse_select(SelectStmt &sel) {
+    if (peek().kind == TokKind::PUNCT && peek().punct == '*') {
+      next();
+      sel.star = true;
+    } else {
+      while (true) {
+        SelectItem item;
+        if (peek_kw("L2_DISTANCE")) {
+          parse_distance(item);
+          if (peek_kw("AS")) {
+            next();
+            item.alias = expect_ident();
+          } else {
+            item.alias = "distance";
+          }
+        } else {
+          item.col = expect_ident();
+          if (peek_kw("AS")) {
+            next();
+            item.alias = expect_ident();
+          } else {
+            item.alias = item.col;
+          }
+        }
+        sel.items.push_back(std::move(item));
+        if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+          next();
+          continue;
+        }
+        break;
+      }
+    }
+    expect_kw("FROM");
+    sel.table = expect_ident();
+    parse_where(sel.where);
+    if (peek_kw("ORDER")) {
+      next();
+      expect_kw("BY");
+      if (peek_kw("L2_DISTANCE")) {
+        SelectItem item;
+        parse_distance(item);
+        sel.order_kind = SelectStmt::ORDER_DISTANCE;
+        sel.order_col = "distance";
+        sel.order_vec = item.vec_text;
+        sel.order_vec_col = item.col;
+      } else {
+        sel.order_kind = SelectStmt::ORDER_COLUMN;
+        sel.order_col = expect_ident();
+      }
+      if (peek_kw("ASC")) {
+        next();
+      } else if (peek_kw("DESC")) {
+        next();
+        sel.order_desc = true;
+      }
+    }
+    if (peek_kw("LIMIT")) {
+      next();
+      sel.has_limit = true;
+      sel.limit = expect_int();
+      if (sel.limit < 0) {
+        raise("syntax_error");
+      }
+    }
+  }
+
+  void parse_update(UpdateStmt &upd) {
+    upd.table = expect_ident();
+    expect_kw("SET");
+    while (true) {
+      SetItem item;
+      item.col = expect_ident();
+      expect_punct('=');
+      item.lit = parse_literal();
+      upd.sets.push_back(std::move(item));
+      if (peek().kind == TokKind::PUNCT && peek().punct == ',') {
+        next();
+        continue;
+      }
+      break;
+    }
+    parse_where(upd.where);
+  }
+
+  void parse_delete(DeleteStmt &del) {
+    expect_kw("FROM");
+    del.table = expect_ident();
+    parse_where(del.where);
+  }
+
+  std::vector<Tok> toks_;
+  size_t pos_ = 0;
+};
+
+}  // namespace
+
+Stmt parse_statement(const std::string &sql) {
+  Parser p(tokenize(sql));
+  return p.parse();
+}
+
+}  // namespace mvd
