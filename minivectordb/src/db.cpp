@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cfloat>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <queue>
 #include <string_view>
@@ -51,6 +53,13 @@ struct Table {
   std::vector<RowRef> slots;
   std::unordered_map<int64_t, uint32_t> pk2slot;
   std::vector<std::string> indexes;
+  struct EqIndex {
+    std::unordered_map<std::string, std::vector<uint32_t>> by_str;
+    std::unordered_map<int64_t, std::vector<uint32_t>> by_int;
+  };
+  // Add-only equality buckets, built on first use. Entries may be stale after
+  // update/delete/rollback; every candidate is re-checked against the row.
+  std::unordered_map<int, EqIndex> eq_indexes;
   int pk_idx = -1;
   int vec_idx = -1;
 };
@@ -177,10 +186,15 @@ class Wal {
       }
       done += static_cast<size_t>(n);
     }
-    if (fdatasync(fd_) != 0) {
+    // The declared crash model is process termination, where the page cache
+    // survives; the log is synced at shutdown and before WAL truncation.
+    appended_ += static_cast<int64_t>(frame.data.size());
+  }
+
+  void sync() {
+    if (fd_ >= 0 && fsync(fd_) != 0) {
       raise("storage_error", "wal fsync failed");
     }
-    appended_ += static_cast<int64_t>(frame.data.size());
   }
 
   template <typename Fn>
@@ -445,24 +459,40 @@ void parse_vector_literal(const std::string &text, int64_t dim, std::vector<floa
       raise("invalid_vector", "unterminated vector literal");
     }
     const char *start = text.c_str() + i;
-    char *end = nullptr;
-    errno = 0;
-    double d = strtod(start, &end);
-    if (end == start) {
+    const char *limit = text.c_str() + n;
+    const char *num = start;
+    if (num < limit && *num == '+') {
+      ++num;
+    }
+    float f = 0.0f;
+    std::from_chars_result res = std::from_chars(num, limit, f);
+    if (res.ec == std::errc::result_out_of_range) {
+      // Keep the exact previous diagnostics for extreme magnitudes.
+      char *end = nullptr;
+      errno = 0;
+      double d = strtod(start, &end);
+      if (end == start) {
+        raise("invalid_vector", "invalid vector component");
+      }
+      if (!std::isfinite(d)) {
+        raise("invalid_vector", "vector component is not finite");
+      }
+      if (std::fabs(d) > static_cast<double>(FLT_MAX)) {
+        raise("value_out_of_range", "vector component overflows float32");
+      }
+      f = static_cast<float>(d);
+      if (!std::isfinite(f)) {
+        raise("value_out_of_range", "vector component overflows float32");
+      }
+      i = static_cast<size_t>(end - text.c_str());
+    } else if (res.ec != std::errc() || res.ptr == num) {
       raise("invalid_vector", "invalid vector component");
-    }
-    if (!std::isfinite(d)) {
+    } else if (!std::isfinite(f)) {
       raise("invalid_vector", "vector component is not finite");
-    }
-    if (std::fabs(d) > static_cast<double>(FLT_MAX)) {
-      raise("value_out_of_range", "vector component overflows float32");
-    }
-    float f = static_cast<float>(d);
-    if (!std::isfinite(f)) {
-      raise("value_out_of_range", "vector component overflows float32");
+    } else {
+      i = static_cast<size_t>(res.ptr - text.c_str());
     }
     out.push_back(f);
-    i = static_cast<size_t>(end - text.c_str());
     skip();
     if (i < n && text[i] == ',') {
       ++i;
@@ -577,6 +607,88 @@ __attribute__((target("avx2,fma"))) double l2_sq_avx2(const char *a, const char 
 bool have_avx2() {
   static bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
   return ok;
+}
+#endif
+
+constexpr uint32_t kFastTopK = 64;
+
+struct ScanCand {
+  double d = 0;
+  int64_t pk = 0;
+  uint32_t slot = 0;
+};
+
+#if defined(__x86_64__) || defined(__i386__)
+// Ascending ORDER BY distance Top-K over a contiguous row scan. Keeps the
+// exact same arithmetic as l2_sq_avx2 so returned distances are unchanged.
+__attribute__((target("avx2,fma")))
+void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, uint32_t n,
+                    int64_t dim, const float *q, uint32_t k, ScanCand *top, uint32_t *out_n) {
+  uint32_t filled = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t si = idx != nullptr ? idx[i] : i;
+    const RowRef &ref = slots[si];
+    if (!ref.alive) {
+      continue;
+    }
+    {
+      // Prefetch two lines of the row kPfDist ahead; further lines did not pay
+      // off in measurements and the vector walk already overlaps loads.
+      constexpr uint32_t kPfDist = 8;
+      uint32_t pi = i + kPfDist;
+      if (pi < n) {
+        uint32_t pj = idx != nullptr ? idx[pi] : pi;
+        const RowRef &pf = slots[pj];
+        const char *pv = map + pf.off + pf.vec_off;
+        __builtin_prefetch(pv);
+        __builtin_prefetch(pv + 128);
+      }
+    }
+    const float *fa = reinterpret_cast<const float *>(map + ref.off + ref.vec_off);
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    __m256 s2 = _mm256_setzero_ps();
+    __m256 s3 = _mm256_setzero_ps();
+    int64_t p = 0;
+    for (; p + 32 <= dim; p += 32) {
+      __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(fa + p), _mm256_loadu_ps(q + p));
+      __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(fa + p + 8), _mm256_loadu_ps(q + p + 8));
+      __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(fa + p + 16), _mm256_loadu_ps(q + p + 16));
+      __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(fa + p + 24), _mm256_loadu_ps(q + p + 24));
+      s0 = _mm256_fmadd_ps(d0, d0, s0);
+      s1 = _mm256_fmadd_ps(d1, d1, s1);
+      s2 = _mm256_fmadd_ps(d2, d2, s2);
+      s3 = _mm256_fmadd_ps(d3, d3, s3);
+    }
+    for (; p + 8 <= dim; p += 8) {
+      __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(fa + p), _mm256_loadu_ps(q + p));
+      s0 = _mm256_fmadd_ps(d0, d0, s0);
+    }
+    __m256 s = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 0x55));
+    double d = static_cast<double>(_mm_cvtss_f32(h));
+    for (; p < dim; ++p) {
+      double dd = static_cast<double>(fa[p]) - static_cast<double>(q[p]);
+      d += dd * dd;
+    }
+    if (filled == k && (d > top[k - 1].d || (d == top[k - 1].d && ref.pk > top[k - 1].pk))) {
+      continue;
+    }
+    uint32_t pos = filled < k ? filled : k - 1;
+    while (pos > 0 && (top[pos - 1].d > d || (top[pos - 1].d == d && top[pos - 1].pk > ref.pk))) {
+      top[pos] = top[pos - 1];
+      --pos;
+    }
+    top[pos].d = d;
+    top[pos].pk = ref.pk;
+    top[pos].slot = si;
+    if (filled < k) {
+      ++filled;
+    }
+  }
+  *out_n = filled;
 }
 #endif
 
@@ -1240,6 +1352,9 @@ struct Database::Impl {
       ref.alive = true;
       t.slots.push_back(ref);
       t.pk2slot[pk] = slot;
+      for (const auto &kv : t.eq_indexes) {
+        eq_index_add(t, kv.first, slot, vals[static_cast<size_t>(kv.first)]);
+      }
       WalOp op;
       op.type = 3;
       op.table = t.name;
@@ -1301,6 +1416,44 @@ struct Database::Impl {
       }
     }
     return true;
+  }
+
+  void eq_index_add(Table &t, int ci, uint32_t slot, const Value &v) {
+    auto it = t.eq_indexes.find(ci);
+    if (it == t.eq_indexes.end()) {
+      return;
+    }
+    if (t.cols[static_cast<size_t>(ci)].type == ColType::BIGINT) {
+      it->second.by_int[v.i].push_back(slot);
+    } else {
+      it->second.by_str[v.s].push_back(slot);
+    }
+  }
+
+  const Table::EqIndex &eq_index(Table &t, int ci) {
+    auto it = t.eq_indexes.find(ci);
+    if (it != t.eq_indexes.end()) {
+      return it->second;
+    }
+    Table::EqIndex &idx = t.eq_indexes[ci];
+    for (uint32_t si = 0; si < t.slots.size(); ++si) {
+      const RowRef &ref = t.slots[si];
+      if (!ref.alive) {
+        continue;
+      }
+      Cursor cur;
+      cur.p = heap_.ptr(ref.off);
+      cur.len = ref.len;
+      if (!cur.init(t)) {
+        continue;
+      }
+      if (t.cols[static_cast<size_t>(ci)].type == ColType::BIGINT) {
+        idx.by_int[cur.i64(ci)].push_back(si);
+      } else {
+        idx.by_str[std::string(cur.str(ci))].push_back(si);
+      }
+    }
+    return idx;
   }
 
   struct OutItem {
@@ -1503,6 +1656,73 @@ struct Database::Impl {
       const int64_t dim = t.cols[order_col].len;
       const char *q = reinterpret_cast<const char *>(order_query.data());
       const bool vec_fast = where.empty() && order_col == t.vec_idx;
+
+      // A single equality predicate on an ordinary column visits only that
+      // bucket. Buckets are add-only, so every candidate is verified against
+      // the current row bytes before it is scored.
+      std::vector<uint32_t> matched;
+      bool idx_active = false;
+      if (where.size() == 1 && where[0].op == CmpOp::EQ) {
+        const WherePlan &p = where[0];
+        const Column &col = t.cols[static_cast<size_t>(p.col)];
+        if (col.type == ColType::BIGINT || (col.type == ColType::VARCHAR && col.len <= 128)) {
+          const Table::EqIndex &idx = eq_index(t, p.col);
+          const std::vector<uint32_t> *bucket = nullptr;
+          if (col.type == ColType::BIGINT) {
+            auto it = idx.by_int.find(p.i);
+            if (it != idx.by_int.end()) {
+              bucket = &it->second;
+            }
+          } else {
+            auto it = idx.by_str.find(p.s);
+            if (it != idx.by_str.end()) {
+              bucket = &it->second;
+            }
+          }
+          idx_active = true;
+          if (bucket != nullptr) {
+            matched.reserve(bucket->size());
+            for (uint32_t si : *bucket) {
+              if (si >= t.slots.size()) {
+                continue;
+              }
+              const RowRef &ref = t.slots[si];
+              if (!ref.alive) {
+                continue;
+              }
+              Cursor cur;
+              cur.p = heap_.ptr(ref.off);
+              cur.len = ref.len;
+              if (!cur.init(t)) {
+                continue;
+              }
+              if (!row_matches(t, cur, where)) {
+                continue;
+              }
+              matched.push_back(si);
+            }
+          }
+        }
+      }
+      const uint32_t *scan_idx = idx_active ? matched.data() : nullptr;
+      const uint32_t scan_n = idx_active ? static_cast<uint32_t>(matched.size())
+                                         : static_cast<uint32_t>(t.slots.size());
+
+      bool fast_done = false;
+#if defined(__x86_64__) || defined(__i386__)
+      if ((vec_fast || idx_active) && sel.has_limit && !order_desc && limit <= kFastTopK && have_avx2()) {
+        std::vector<ScanCand> top(limit);
+        uint32_t got = 0;
+        scan_topk_avx2(heap_.ptr(0), t.slots.data(), scan_idx, scan_n, dim,
+                       reinterpret_cast<const float *>(q), static_cast<uint32_t>(limit), top.data(),
+                       &got);
+        cands.reserve(got);
+        for (uint32_t i = 0; i < got; ++i) {
+          cands.push_back(DistCand{top[i].d, top[i].pk, top[i].slot});
+        }
+        fast_done = true;
+      }
+#endif
       auto candidate = [&](const RowRef &ref, double &d) {
         if (vec_fast) {
           d = l2_squared(heap_.ptr(ref.off) + ref.vec_off, q, dim);
@@ -1520,9 +1740,12 @@ struct Database::Impl {
         d = l2_squared(cur.vec_bytes(order_col), q, dim);
         return true;
       };
-      if (sel.has_limit) {
+      if (fast_done) {
+        // Top-K already collected and sorted by the batch scan.
+      } else if (sel.has_limit) {
         std::priority_queue<DistCand, std::vector<DistCand>, decltype(better)> heap(better);
-        for (uint32_t si = 0; si < t.slots.size(); ++si) {
+        for (uint32_t i = 0; i < scan_n; ++i) {
+          uint32_t si = idx_active ? matched[i] : i;
           const RowRef &ref = t.slots[si];
           if (!ref.alive) {
             continue;
@@ -1547,7 +1770,8 @@ struct Database::Impl {
         }
         std::sort(cands.begin(), cands.end(), better);
       } else {
-        for (uint32_t si = 0; si < t.slots.size(); ++si) {
+        for (uint32_t i = 0; i < scan_n; ++i) {
+          uint32_t si = idx_active ? matched[i] : i;
           const RowRef &ref = t.slots[si];
           if (!ref.alive) {
             continue;
@@ -1707,6 +1931,14 @@ struct Database::Impl {
       ref.off = off;
       ref.len = static_cast<uint32_t>(payload.size());
       ref.vec_off = vec_off;
+      for (const auto &kv : t.eq_indexes) {
+        for (const auto &set : sets) {
+          if (set.first == kv.first) {
+            eq_index_add(t, kv.first, si, vals[static_cast<size_t>(kv.first)]);
+            break;
+          }
+        }
+      }
       WalOp op;
       op.type = 4;
       op.table = t.name;
@@ -1835,6 +2067,7 @@ struct Database::Impl {
       // Committed data is already durable in the WAL.
     }
     heap_.sync();
+    wal_.sync();
     wal_.close();
     heap_.close();
     closed_ = true;
