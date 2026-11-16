@@ -52,8 +52,9 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  int64_t fulltext_len,
                                  bool is_smart)
     : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
-      result_list_(allocator)
+      next_char_len_(0), next_char_type_(ObFTCharUtil::CharType::USELESS), next_unicode_(0),
+      handle_size_(0), is_smart_(is_smart), alloc_(allocator), char_info_(nullptr),
+      token_list_(allocator), result_list_(allocator)
 {
 }
 
@@ -63,7 +64,18 @@ int TokenizeContext::init()
 
   if (OB_ISNULL(fulltext_) || fulltext_len_ <= 0) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(prepare_next_char())) {
+  } else if (fulltext_len_ <= CHAR_INFO_CAP) {
+    // The per-char cache is only a speedup; longer texts are classified on the fly.
+    if (OB_ISNULL(char_info_ = static_cast<CharInfo *>(
+                      alloc_.alloc(sizeof(CharInfo) * static_cast<size_t>(fulltext_len_))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMSET(char_info_, 0xFF, sizeof(CharInfo) * static_cast<size_t>(fulltext_len_));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(prepare_next_char())) {
+    }
   }
   return ret;
 }
@@ -106,10 +118,65 @@ int TokenizeContext::prepare_next_char()
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {
+  } else if (OB_UNLIKELY(next_char_len_ <= 0 || next_char_len_ > UINT8_MAX)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Unexpected char length", K(ret), K(cursor_), K(next_char_len_));
   } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
                                                        fulltext_ + cursor_,
-                                                       next_char_len_,
-                                                       next_char_type_))) {
+                                                       static_cast<uint8_t>(next_char_len_),
+                                                       next_char_type_,
+                                                       next_unicode_))) {
+    LOG_WARN("Failed to classify char", K(ret), K(cursor_), K(next_char_len_));
+  } else if (OB_NOT_NULL(char_info_)) {
+    CharInfo &info = char_info_[cursor_];
+    info.char_len_ = static_cast<uint8_t>(next_char_len_);
+    info.type_ = static_cast<int8_t>(next_char_type_);
+    info.unicode_ = static_cast<uint32_t>(next_unicode_);
+  }
+  return ret;
+}
+
+int TokenizeContext::get_char_info(const int64_t cursor,
+                                   int64_t &char_len,
+                                   ObFTCharUtil::CharType &type,
+                                   ob_wc_t &unicode)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(cursor < 0 || cursor >= fulltext_len_)) {
+    ret = OB_ITER_END;
+  } else {
+    CharInfo *info = OB_ISNULL(char_info_) ? nullptr : &char_info_[cursor];
+    if (OB_ISNULL(info) || 0xFF == info->char_len_) {
+      int64_t len = 0;
+      ObFTCharUtil::CharType char_type = ObFTCharUtil::CharType::USELESS;
+      ob_wc_t decoded = 0;
+      if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
+                                              fulltext_ + cursor,
+                                              fulltext_len_ - cursor,
+                                              len))) {
+      } else if (OB_UNLIKELY(len <= 0 || len > UINT8_MAX)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected char length", K(ret), K(cursor), K(len));
+      } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
+                                                           fulltext_ + cursor,
+                                                           static_cast<uint8_t>(len),
+                                                           char_type,
+                                                           decoded))) {
+      } else {
+        char_len = len;
+        type = char_type;
+        unicode = decoded;
+        if (OB_NOT_NULL(info)) {
+          info->char_len_ = static_cast<uint8_t>(len);
+          info->type_ = static_cast<int8_t>(char_type);
+          info->unicode_ = static_cast<uint32_t>(decoded);
+        }
+      }
+    } else {
+      char_len = info->char_len_;
+      type = static_cast<ObFTCharUtil::CharType>(info->type_);
+      unicode = info->unicode_;
+    }
   }
   return ret;
 }

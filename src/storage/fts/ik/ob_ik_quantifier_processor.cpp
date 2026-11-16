@@ -49,10 +49,13 @@ int ObIKQuantifierProcessor::process_CN_number(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
   bool is_cn_number = false;
+  UNUSED(ch);
+  UNUSED(char_len);
 
-  if (ObFTCharUtil::CharType::CHINESE == type
-      && OB_FAIL(ObFTCharUtil::check_cn_number(ctx.collation(), ch, char_len, is_cn_number))) {
-  } else if (start_ == -1 && end_ == -1) {
+  if (ObFTCharUtil::CharType::CHINESE == type) {
+    is_cn_number = ObFTCharUtil::is_cn_number(ctx.current_char_unicode());
+  }
+  if (start_ == -1 && end_ == -1) {
     if (is_cn_number) {
       start_ = ctx.get_cursor();
       end_ = ctx.get_end_cursor();

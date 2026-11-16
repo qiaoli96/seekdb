@@ -141,41 +141,54 @@ bool ObUnicodeBlockUtils::is_convertable_fullwidth(const ob_wc_t unicode)
   return FW_SPACE || FW_OHTER;
 }
 
-ob_wc_t ObUnicodeBlockUtils::get_unicode_from_u8(const char *input, const uint8_t char_len)
-{
-  ob_wc_t unicode = 0;
-  const unsigned char *ustart = reinterpret_cast<const unsigned char *>(input);
-  const unsigned char *uend = reinterpret_cast<const unsigned char *>(&input[char_len]);
-  int code_size = common::ob_charset_decode_unicode<common::CHARSET_UTF8MB4>(ustart, uend, unicode);
-  return unicode;
-}
-
-#define OB_IK_GET_NUMBER_UNICODE(str) get_unicode_from_u8(str, sizeof(str))
 bool ObUnicodeBlockUtils::is_unicode_cn_number(ob_wc_t unicode)
 {
   // Chinese numerical characters: "一二两三四五六七八九十零壹贰叁肆伍陆柒捌玖拾百千万亿拾佰仟萬億兆卅廿"
-  static const ob_wc_t cn_number_array[] = {
-      OB_IK_GET_NUMBER_UNICODE("一"), OB_IK_GET_NUMBER_UNICODE("二"),
-      OB_IK_GET_NUMBER_UNICODE("两"), OB_IK_GET_NUMBER_UNICODE("三"),
-      OB_IK_GET_NUMBER_UNICODE("四"), OB_IK_GET_NUMBER_UNICODE("五"),
-      OB_IK_GET_NUMBER_UNICODE("六"), OB_IK_GET_NUMBER_UNICODE("七"),
-      OB_IK_GET_NUMBER_UNICODE("八"), OB_IK_GET_NUMBER_UNICODE("九"),
-      OB_IK_GET_NUMBER_UNICODE("十"), OB_IK_GET_NUMBER_UNICODE("零"),
-      OB_IK_GET_NUMBER_UNICODE("壹"), OB_IK_GET_NUMBER_UNICODE("贰"),
-      OB_IK_GET_NUMBER_UNICODE("叁"), OB_IK_GET_NUMBER_UNICODE("肆"),
-      OB_IK_GET_NUMBER_UNICODE("伍"), OB_IK_GET_NUMBER_UNICODE("陆"),
-      OB_IK_GET_NUMBER_UNICODE("柒"), OB_IK_GET_NUMBER_UNICODE("捌"),
-      OB_IK_GET_NUMBER_UNICODE("玖"), OB_IK_GET_NUMBER_UNICODE("拾"),
-      OB_IK_GET_NUMBER_UNICODE("百"), OB_IK_GET_NUMBER_UNICODE("千"),
-      OB_IK_GET_NUMBER_UNICODE("万"), OB_IK_GET_NUMBER_UNICODE("亿"),
-      OB_IK_GET_NUMBER_UNICODE("拾"), OB_IK_GET_NUMBER_UNICODE("佰"),
-      OB_IK_GET_NUMBER_UNICODE("仟"), OB_IK_GET_NUMBER_UNICODE("萬"),
-      OB_IK_GET_NUMBER_UNICODE("億"), OB_IK_GET_NUMBER_UNICODE("兆"),
-      OB_IK_GET_NUMBER_UNICODE("卅"), OB_IK_GET_NUMBER_UNICODE("廿"),
+  static constexpr ob_wc_t CN_NUMBER[] = {
+      0x4E00, // 一
+      0x4E03, // 七
+      0x4E07, // 万
+      0x4E09, // 三
+      0x4E24, // 两
+      0x4E5D, // 九
+      0x4E8C, // 二
+      0x4E94, // 五
+      0x4EBF, // 亿
+      0x4EDF, // 仟
+      0x4F0D, // 伍
+      0x4F70, // 佰
+      0x5104, // 億
+      0x5146, // 兆
+      0x516B, // 八
+      0x516D, // 六
+      0x5341, // 十
+      0x5343, // 千
+      0x5345, // 卅
+      0x53C1, // 叁
+      0x56DB, // 四
+      0x58F9, // 壹
+      0x5EFF, // 廿
+      0x62FE, // 拾
+      0x634C, // 捌
+      0x67D2, // 柒
+      0x7396, // 玖
+      0x767E, // 百
+      0x8086, // 肆
+      0x842C, // 萬
+      0x8D30, // 贰
+      0x9646, // 陆
+      0x96F6, // 零
   };
-  for (int i = 0; i < sizeof(cn_number_array) / sizeof(cn_number_array[0]); i++) {
-    if (unicode == cn_number_array[i]) {
+  int64_t left = 0;
+  int64_t right = static_cast<int64_t>(ARRAYSIZEOF(CN_NUMBER)) - 1;
+  while (left <= right) {
+    const int64_t mid = left + (right - left) / 2;
+    if (CN_NUMBER[mid] == unicode) {
       return true;
+    } else if (CN_NUMBER[mid] < unicode) {
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
   }
   return false;

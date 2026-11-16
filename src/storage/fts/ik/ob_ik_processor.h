@@ -47,6 +47,13 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  ob_wc_t current_char_unicode() const { return next_unicode_; }
+
+  // Classification of the character starting at `cursor`, computed on first use and then cached.
+  int get_char_info(const int64_t cursor,
+                    int64_t &char_len,
+                    ObFTCharUtil::CharType &type,
+                    ob_wc_t &unicode);
 
   int step_next();
 
@@ -74,6 +81,17 @@ public:
   int32_t handle_size() const { return handle_size_; }
 
 private:
+  // texts longer than this are classified on the fly instead of being cached
+  static constexpr int64_t CHAR_INFO_CAP = 8192;
+
+  struct CharInfo
+  {
+    uint32_t unicode_; // decoded code point
+    uint8_t char_len_; // byte length, 0xFF until the char has been classified
+    int8_t type_;      // ObFTCharUtil::CharType, -1 until the char has been classified
+  };
+
+private:
   int prepare_next_char();
 
   ObCollationType coll_type_;
@@ -83,9 +101,13 @@ private:
   int64_t cursor_;
   int64_t next_char_len_;
   ObFTCharUtil::CharType next_char_type_;
+  ob_wc_t next_unicode_;
 
   uint32_t handle_size_;
   bool is_smart_;
+
+  ObIAllocator &alloc_;
+  CharInfo *char_info_;
 
   ObFTSortList token_list_;
   ObList<ObIKToken, ObIAllocator> result_list_;

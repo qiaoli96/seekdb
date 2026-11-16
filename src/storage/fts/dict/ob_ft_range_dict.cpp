@@ -395,12 +395,23 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (0 >= ft_bin_strcmp(range_dicts_[i].start_.get_word(), single_word)
-        && 0 <= ft_bin_strcmp(range_dicts_[i].end_.get_word(), single_word)) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  // ranges are built from a sorted key stream, so they ascend and never overlap:
+  // find the last range whose start word is <= single_word and check its end.
+  int64_t left = 0;
+  int64_t right = range_dicts_.size() - 1;
+  int64_t candidate = -1;
+  while (left <= right) {
+    const int64_t mid = left + (right - left) / 2;
+    if (0 >= ft_bin_strcmp(range_dicts_[mid].start_.get_word(), single_word)) {
+      candidate = mid;
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
+  }
+  if (candidate >= 0 && 0 <= ft_bin_strcmp(range_dicts_[candidate].end_.get_word(), single_word)) {
+    dict = range_dicts_[candidate].dict_;
+    found = true;
   }
   if (!found) {
     // not found, dis match
