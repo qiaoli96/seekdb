@@ -347,6 +347,36 @@ static inline int64_t ftdw_pack_len(const ObFTWordMap &ft_word_map)
   return need;
 }
 
+// The DDL row producer runs this once per (document, aux table) on a PX worker thread. The map is
+// drained before each call returns, so a single per-thread map can serve every document: its
+// buckets, and the nodes its allocator has already seen, survive instead of being rebuilt per doc.
+namespace
+{
+struct FtWordMapCache
+{
+  storage::ObFTWordMap map_;
+  bool inited_ = false;
+};
+
+thread_local FtWordMapCache g_ft_word_map_cache;
+
+int ensure_ft_word_map(storage::ObFTWordMap &map, FtWordMapCache &cache, const int64_t bucket_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (!cache.inited_) {
+    if (OB_FAIL(map.create(bucket_cnt, common::ObMemAttr("FTWordMap")))) {
+    } else {
+      cache.inited_ = true;
+    }
+  } else if (OB_UNLIKELY(map.bucket_count() < bucket_cnt)) {
+    map.destroy();
+    if (OB_FAIL(map.create(bucket_cnt, common::ObMemAttr("FTWordMap")))) {
+    }
+  }
+  return ret;
+}
+} // namespace
+
 /*static*/ int ObDASDomainUtils::generate_fulltext_word_rows(common::ObIAllocator &allocator,
                                                              storage::ObFTParseHelper *helper,
                                                              const common::ObObjMeta &ft_obj_meta,
@@ -359,16 +389,18 @@ static inline int64_t ftdw_pack_len(const ObFTWordMap &ft_word_map)
   int ret = OB_SUCCESS;
   static int64_t FT_WORD_DOC_COL_CNT = 4;
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
-  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
+  // The builder tokenizes with word boundaries, so roughly one word per 4 bytes; the previous
+  // /10 estimate made the map grow and rehash on almost every document.
+  const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 4, 8), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
-  ObFTWordMap ft_word_map;
+  ObFTWordMap &ft_word_map = g_ft_word_map_cache.map_;
   void *rows_buf = nullptr;
   blocksstable::ObDatumRow *rows = nullptr;
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ft_word_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+  } else if (OB_FAIL(ensure_ft_word_map(ft_word_map, g_ft_word_map_cache, ft_word_bkt_cnt))) {
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
                                                  ft_obj_meta,
