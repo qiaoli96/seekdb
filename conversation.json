@@ -70,6 +70,13 @@
       "record_uuid": "session-continuation",
       "role": "student",
       "content": "行，你再优化一版吧"
+    },
+    {
+      "id": "u9",
+      "timestamp": "2026-11-16T13:58:00.000Z",
+      "record_uuid": "session-continuation",
+      "role": "student",
+      "content": "又执行失败了：MySQL 正式用例 — 未完成；此项为准入条件，不计排名分；性能原始分 — 评测执行失败或未完成，无有效性能成绩；Agent Prompt 原始分 — 评测执行失败或未完成，无有效 Prompt 成绩。"
     }
   ],
   "conversations": [
@@ -194,6 +201,14 @@
       "note": "同一轮修复后的验证汇报，时间戳取整分钟。",
       "role": "agent",
       "content": "修复后按 Dockerfile 相同参数（-O3、静态 libstdc++/libgcc）重新构建，四套验证全部通过：官方协议检查 20/20 PASS、kill -9 故障注入 9/9、边界语义 44/44、60 万行大数据 PASS（重启就绪 0.19 s、全表 TopK 约 63 ms、过滤 TopK 约 22 ms）。另加目录解析专项：显式参数胜过不可用的环境变量、无参数时使用环境变量、--data-dir 形式、不可写路径产生回退日志，均通过。Dockerfile 同时去掉运行阶段 apt、构建阶段加重试与镜像源回退。"
+    },
+    {
+      "id": "c17",
+      "timestamp": "2026-11-16T14:06:00.000Z",
+      "record_uuid": "session-continuation",
+      "note": "上下文压缩后续写；时间戳取整分钟。此条更正 c15 的归因：数据目录问题真实存在，但不是两次失败的主因。",
+      "role": "agent",
+      "content": "第二次结果仍然三项全空，说明镜像构建本身就没成功。检查提交树而不是工作区：根目录 .gitignore 第 54 行忽略 `Makefile`，`git check-ignore -v minivectordb/Makefile` 命中该规则，`git archive HEAD` 里也确实没有它。平台克隆后构建上下文中没有 Makefile，Dockerfile 的 `make -C minivectordb` 立即失败，镜像从未产出——这才是两次“评测执行失败”的直接原因；本地一直有该文件，所以所有测试都通过。修复：在 minivectordb/.gitignore 加 `!Makefile` 并强制纳入版本库；Dockerfile 改为直接调用 g++ 编译三个源文件，不再依赖 Makefile。c15 中的数据目录回退仍是必要的隐患修复（判题注入的 VECTORDB_DATA_DIR 在容器内不可写）。"
     }
   ],
   "experiments": [
@@ -269,6 +284,14 @@
       "tool": "阅读 protocol_check/_transport.py；WSL Ubuntu 下按 Dockerfile 参数重建并跑协议/崩溃/边界/大数据四套测试 + 数据目录专项测试",
       "output": "protocol_check: 20 PASS, no FAIL\ncrash tests: ALL PASS (9 tests)\nedge suite: 44 checks, 0 failed\nlarge data: INSERT 600k rows: 37.35s\nfull scan time: 62.9 ms\nfiltered top5 ids: [70007, 170007, 270007, 370007, 470007] time 23.3 ms\nrestart startup: 0.19s\npeak rss after restart: 46160 KB\nLARGE DATA TEST PASS\ndir tests: PASS arg wins over unusable env / PASS env used when no arg / PASS --data-dir form / PASS unusable paths produce fallback log / DIR TESTS PASS",
       "conclusion": "判题容器以 --read-only 运行且 VECTORDB_DATA_DIR 指向容器内不存在的宿主路径；原实现环境变量优先导致启动即失败。改为“参数优先、候选目录逐个验证可写、回退 /data”后，本地全部验证保持通过，且与判题启动方式兼容。"
+    },
+    {
+      "id": "e10",
+      "question": "本地全部通过，为什么平台两次都返回“评测执行失败”，镜像里到底缺了什么？",
+      "initiated_by": "agent（学生 u9 报告第二次失败）",
+      "tool": "git ls-tree -r HEAD minivectordb/；git check-ignore -v minivectordb/Makefile；git archive HEAD | tar -t；在 git archive 导出的干净树上按 Dockerfile 命令重新编译",
+      "output": "git check-ignore: .gitignore:54:Makefile\tminivectordb/Makefile\ngit archive 文件列表: minivectordb/README.md, minivectordb/src/{common.h,db.cpp,db.h,json.h,main.cpp,parser.cpp,parser.h,serialize.h}（无 Makefile）\n直接 g++ 编译干净树: 成功生成 bin/mvd\nprotocol_check: 20/20 PASS",
+      "conclusion": "根目录 .gitignore 的 Makefile 规则导致构建脚本缺失，镜像构建失败，因此三项均为“未完成”。已强制跟踪 Makefile，并让 Dockerfile 不再依赖 make。"
     }
   ],
   "retrospective": [
