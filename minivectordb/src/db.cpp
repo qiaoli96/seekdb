@@ -550,19 +550,27 @@ bool parse_component_fast(const char **pp, const char *end, float *out) {
   if (dot && k1 == 1 && k2 >= 1 && k2 <= 9) {
     // Corpus shape ("-0.5792649"): SWAR-convert the fraction eight digits at a
     // time, padding the load with '0' so the terminator never reaches the value.
+    // The mantissa is scaled to a fixed exponent instead of being divided back
+    // down: (double)(mant * 10^(8-k2)) / 1e8 rounds the same rational number as
+    // (double)mant / 10^k2, and it keeps the 64-bit divide off the hot path.
     uint64_t raw;
     memcpy(&raw, d + 2, 8);
     uint64_t dmask = k2 >= 8 ? ~0ull : ((1ull << (8 * k2)) - 1);
     uint64_t v = ((raw & dmask) | (0x3030303030303030ull & ~dmask)) - 0x3030303030303030ull;
     uint64_t lo = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FFull;
     uint64_t hi = (lo * 100 + (lo >> 16)) & 0x0000FFFF0000FFFFull;
-    uint64_t frac = (((hi & 0xFFFFull) * 10000ull) + (hi >> 32)) /
-                    static_cast<uint64_t>(kPow10d[8 - (k2 < 8 ? k2 : 8)]);
-    if (k2 == 9) {
-      frac = frac * 10 + static_cast<uint64_t>(d[10] - '0');
+    uint64_t frac8 = (hi & 0xFFFFFFFFull) * 10000ull + (hi >> 32);
+    uint64_t mant;
+    double div;
+    if (k2 <= 8) {
+      mant = static_cast<uint64_t>(d[0] - '0') * 100000000ull + frac8;
+      div = 1e8;
+    } else {
+      mant = static_cast<uint64_t>(d[0] - '0') * 1000000000ull + frac8 * 10 +
+             static_cast<uint64_t>(d[10] - '0');
+      div = 1e9;
     }
-    uint64_t mant = static_cast<uint64_t>(d[0] - '0') * static_cast<uint64_t>(kPow10d[k2]) + frac;
-    value = static_cast<double>(mant) / kPow10d[k2];
+    value = static_cast<double>(mant) / div;
   } else {
     uint64_t mant = 0;
     for (uint32_t j = 0; j < k1; ++j) {
