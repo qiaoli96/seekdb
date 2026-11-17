@@ -354,7 +354,10 @@ bool RowStore::arena_store_refs(uint32_t rowid, int64_t pk,
     else if (c.tag != 0 && c.tag != 4) return true;
   }
   const size_t len = arena_tail_off_ + tail;
-  if (len > kArenaChunk) return true;             // 单行超过 slab：不镜像
+  if (len > kArenaChunk) {                        // 单行比 slab 还大：镜像装不下，整体退回流式路径
+    arena_disable();
+    return false;
+  }
 
   // 索引会按行号/记录数增长，一起计入预算
   const size_t idx_after = static_cast<size_t>(rowid + 1) * (sizeof(uint64_t) + sizeof(uint32_t)) +

@@ -809,8 +809,23 @@ bool Engine::arena_refresh(Table& t, std::string& err) {
   bool malformed = false;
   PayloadView pv;
   t.store.arena_begin_build();
+  // 建镜像的这一遍是顺序读：它把整份日志拉进页缓存（10k 行 ≈ 6.3 MB），建完之后查询只碰 arena，
+  // 不可能再读日志。所以边扫边把读过的区间丢出页缓存：缓存水位不随日志长度上涨，
+  // 建表→写入→查询这一整条链的峰值只叠「一份 arena」而不是「arena + 整份日志」。
+  // 丢了以后不会被重读回填（日志此后只由 arena 服务），所以不像「提交后驱逐」那样白付 I/O。
+  // 读缓冲与丢弃步长一起决定「建镜像时页缓存/匿名内存多出多少」：都用 256 KiB，
+  // 于是建到哪里、哪里就不在内存里，峰值≈一份 arena + 一个 256 KiB 的窗口。
+  constexpr size_t kBuildChunk = size_t{256} << 10;
+  // 前提：日志基本只装着这一张表。多表共用一份日志时，兄弟表的记录也在扫描范围里，
+  // 丢掉它们的页缓存会让兄弟表（尤其是不建 arena 的大表）退化成每次查询读盘 —— 那不做。
+  const bool cache_droppable = scan_end <= t.store.arena_budget() + kBuildChunk;
+  uint64_t cache_dropped = 0;
   const bool ok = storage_.scan([&](const Storage::View& v) -> bool {
     if (v.offset >= scan_end) return false;
+    if (cache_droppable && v.offset >= cache_dropped + kBuildChunk) {
+      storage_.drop_page_cache(cache_dropped, v.offset - cache_dropped);
+      cache_dropped = v.offset;
+    }
     if (!Storage::decode_payload(v.payload, v.payload_len, pv)) {
       malformed = true;
       return false;
@@ -832,13 +847,19 @@ bool Engine::arena_refresh(Table& t, std::string& err) {
       return false;
     }
     return true;
-  }, err);
+  }, err, kBuildChunk);
   t.store.arena_finish_build();
-  if (over_budget) return true;      // 已关闭，退回流程式路径
+  if (over_budget) return true;      // 已关闭，退回流程式路径（此时不丢尾部缓存：之后还要流式扫日志）
   if (!ok) return false;             // 读错误
   if (malformed) {
     t.store.arena_disable();         // 结构异常：镜像不可信，整个退回（与流式路径同语义）
     return true;
+  }
+  // 镜像已覆盖全表且有效：日志在这之后不再被读，尾部剩下的页缓存也丢掉
+  // （顺序读会读进预分配的零区尾部，所以一直丢到物理末尾）。
+  if (cache_droppable && t.store.arena_ready()) {
+    const uint64_t log_end = storage_.physical_end() > scan_end ? storage_.physical_end() : scan_end;
+    if (log_end > cache_dropped) storage_.drop_page_cache(cache_dropped, log_end - cache_dropped);
   }
   return true;
 }

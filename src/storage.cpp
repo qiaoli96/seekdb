@@ -432,7 +432,10 @@ constexpr size_t kCatalogHeader = 24;
 constexpr size_t kRecPrefix = 17;  // u32 len + u32 crc + u64 txn + u8 type
 constexpr size_t kScanChunk = 1u << 20;  // 顺序扫描读缓冲（大块少 syscall）
 constexpr uint32_t kMaxPayload = 64u * 1024u * 1024u;
-constexpr uint64_t kPreallocStep = 4u * 1024u * 1024u;  // WAL 预分配步长
+// WAL 预分配步长。1 MiB 由步长扫描选出：fdatasync 的元数据代价在 ≥1 MiB 处已摊薄到
+// 平台期（256 KiB 0.193 s / 1 MiB 0.183 s / 4 MiB 0.177 s），而预分配尾部浪费随步长线性增长
+// （写盘 11.82 / 12.29 / 14.39 MB，同一 5.6 MB 数据），1 MiB 是「耗时曲线拐点 + 浪费最小」的交点。
+constexpr uint64_t kPreallocStep = 1u * 1024u * 1024u;
 constexpr uint16_t kFormatVersion = 1;
 constexpr uint16_t kEndianMark = 0x0102;
 constexpr uint8_t kRecInsert = 1;
@@ -974,14 +977,15 @@ bool Storage::replay(std::vector<Mutation>& out, std::string& err) {
 }
 
 // ---- 顺序扫描（不校验 CRC，供执行器流式扫描与写入定位使用）----
-bool Storage::scan(const std::function<bool(const View&)>& sink, std::string& err) {
+bool Storage::scan(const std::function<bool(const View&)>& sink, std::string& err,
+                   size_t read_chunk) {
   err.clear();
   if (wal_fd_ < 0) {
     err = "storage: not open";
     return false;
   }
   if (file_size_ <= kWalHeader) return true;
-  WalReader rd(wal_fd_, kWalHeader, kScanChunk);
+  WalReader rd(wal_fd_, kWalHeader, read_chunk ? read_chunk : kScanChunk);
   while (true) {
     if (!rd.ensure(kRecPrefix)) break;
     const uint32_t len = le_u32(rd.data());
@@ -1011,6 +1015,22 @@ bool Storage::scan(const std::function<bool(const View&)>& sink, std::string& er
     return false;
   }
   return true;
+}
+
+// ---- 页缓存管理：顺序扫描到过的区间丢出缓存，扫描期间缓存水位不跟着文件涨 ----
+void Storage::drop_page_cache(uint64_t off, uint64_t len) {
+#if defined(__linux__)
+  if (wal_fd_ < 0 || len == 0) return;
+  constexpr uint64_t kPage = 4096;
+  const uint64_t lo = off & ~(kPage - 1);
+  const uint64_t hi = (off + len + kPage - 1) & ~(kPage - 1);
+  if (hi <= lo) return;
+  ::posix_fadvise(wal_fd_, static_cast<off_t>(lo), static_cast<off_t>(hi - lo),
+                  POSIX_FADV_DONTNEED);
+#else
+  (void)off;
+  (void)len;
+#endif
 }
 
 // ---- 校验 CRC 的事务分组回放（恢复用）----

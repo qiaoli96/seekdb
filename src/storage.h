@@ -88,12 +88,21 @@ class Storage {
   bool rollback_to(uint64_t size, std::string& err);  // 丢弃未落地的尾部（语句失败/事务回滚）
   uint64_t file_end() const { return file_size_ + pending_.size(); }
   uint64_t file_size() const { return file_size_; }
+  // 已预分配到的物理长度（含尾部真实零区）：顺序扫描会连这段一起读进页缓存。
+  uint64_t physical_end() const { return alloc_end_; }
 
   // ---- 随机读与顺序扫描 ----
   bool read_payload(uint64_t offset, uint32_t len, std::vector<unsigned char>& out,
                     std::string& err);
   // 单遍顺序扫描（不校验 CRC）：把文件里的全部记录按顺序交给 sink，sink 返回 false 即停止。
-  bool scan(const std::function<bool(const View&)>& sink, std::string& err);
+  // read_chunk 是顺序读缓冲字节数（0 = 默认 1 MiB）；看一遍就走的小扫描用小块，
+  // 读缓冲本身是匿名内存，块越大峰值越高。
+  bool scan(const std::function<bool(const View&)>& sink, std::string& err, size_t read_chunk = 0);
+  // 丢弃 wal.log 在 [off, off+len) 的页缓存副本（posix_fadvise DONTNEED；不改文件、不发 I/O）。
+  // 只用在「这份字节已经读进调用方缓冲、之后只靠 arena 访问」的顺序扫描上：
+  // 于是扫描期间页缓存不需要跟着整份日志涨到满。
+  void drop_page_cache(uint64_t off, uint64_t len);
+
   // 校验 CRC 的事务分组回放：只回放已提交事务，committed_end 为最后一个已提交边界。
   bool replay_groups(GroupSink& sink, uint64_t* committed_end, std::string& err);
   bool truncate(uint64_t size, std::string& err);

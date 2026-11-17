@@ -99,7 +99,8 @@ const main = async () => {
 
   if (existing) {
     console.log(`分支已存在（tip ${existing.object.sha}），以 force=false 更新 …`);
-    await api("PATCH", `/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH}`, { sha: commit.sha, force: false });
+    const force = process.env.GH_FORCE === "1";
+    await api("PATCH", `/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH}`, { sha: commit.sha, force });
   } else {
     console.log("创建新分支 …");
     await api("POST", `/repos/${OWNER}/${REPO}/git/refs`, { ref: `refs/heads/${BRANCH}`, sha: commit.sha });

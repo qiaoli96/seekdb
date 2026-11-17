@@ -210,7 +210,7 @@ class RowStore {
     uint32_t n = 0;
   };
 
-  static constexpr size_t kArenaChunkShift = 20;               // 1 MiB / slab
+  static constexpr size_t kArenaChunkShift = 18;               // 256 KiB / slab：尾块浪费从 ≤1 MiB 降到 ≤256 KiB
   static constexpr size_t kArenaChunk = size_t{1} << kArenaChunkShift;
   static constexpr uint64_t kNoRec = ~static_cast<uint64_t>(0);
   unsigned char* arena_base(uint64_t off) const {
