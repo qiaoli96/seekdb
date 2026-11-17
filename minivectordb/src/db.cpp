@@ -107,6 +107,17 @@ class Heap {
   }
 
   int64_t append(const char *data, uint32_t n) {
+    char *dst = reserve(n);
+    if (n > 0) {
+      memcpy(dst, data, n);
+    }
+    return commit(n);
+  }
+
+  // Rows are encoded straight into the arena so the payload is written once:
+  // reserve() returns where the caller should write n payload bytes, commit()
+  // publishes them and returns the reader-facing offset.
+  char *reserve(uint32_t n) {
     size_t need = static_cast<size_t>(size_) + 4 + n;
     if (need > map_len_) {
       size_t target = map_len_ ? map_len_ * 2 : (1u << 20);
@@ -115,12 +126,12 @@ class Heap {
       }
       map_to(target);
     }
-    char *dst = map_ + size_;
+    return map_ + size_ + 4;
+  }
+
+  int64_t commit(uint32_t n) {
     uint32_t nlen = n;
-    memcpy(dst, &nlen, 4);
-    if (n > 0) {
-      memcpy(dst + 4, data, n);
-    }
+    memcpy(map_ + size_, &nlen, 4);
     int64_t off = size_ + 4;
     size_ += static_cast<int64_t>(4 + n);
     return off;
@@ -412,6 +423,48 @@ std::string encode_row(const Table &t, const std::vector<Value> &vals, uint32_t 
   std::string out;
   encode_row_into(t, vals, out, vec_off);
   return out;
+}
+
+size_t row_payload_size(const std::vector<Value> &vals) {
+  size_t n = 0;
+  for (const Value &v : vals) {
+    switch (v.type) {
+      case ColType::BIGINT: n += 8; break;
+      case ColType::VARCHAR: n += 4 + v.s.size(); break;
+      case ColType::VECTOR: n += v.v.size() * 4; break;
+    }
+  }
+  return n;
+}
+
+void encode_row_raw(const Table &t, const std::vector<Value> &vals, char *dst,
+                    uint32_t *vec_off) {
+  char *p = dst;
+  for (size_t i = 0; i < t.cols.size(); ++i) {
+    if (t.cols[i].type == ColType::VECTOR && vec_off != nullptr) {
+      *vec_off = static_cast<uint32_t>(p - dst);
+    }
+    const Value &v = vals[i];
+    switch (v.type) {
+      case ColType::BIGINT:
+        memcpy(p, &v.i, 8);
+        p += 8;
+        break;
+      case ColType::VARCHAR: {
+        uint32_t n = static_cast<uint32_t>(v.s.size());
+        memcpy(p, &n, 4);
+        memcpy(p + 4, v.s.data(), n);
+        p += 4 + n;
+        break;
+      }
+      case ColType::VECTOR: {
+        size_t n = v.v.size() * 4;
+        memcpy(p, v.v.data(), n);
+        p += n;
+        break;
+      }
+    }
+  }
 }
 
 std::vector<Value> decode_row(const Table &t, const char *p, uint32_t len) {
@@ -715,6 +768,21 @@ void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, u
 // handshake costs more than the scan it would parallelize.
 constexpr uint32_t kParScanMin = 256;
 
+// Rough amount of work one slice must carry for splitting to pay off.
+constexpr uint32_t kScanRowsPerThread = 128;
+constexpr uint32_t kDecodeRowsPerThread = 8;
+
+int active_threads(int n, uint32_t total, uint32_t per_thread) {
+  uint32_t a = (total + per_thread - 1) / per_thread;
+  if (a < 1) {
+    a = 1;
+  }
+  if (a > static_cast<uint32_t>(n)) {
+    a = static_cast<uint32_t>(n);
+  }
+  return static_cast<int>(a);
+}
+
 // How many threads the scan may use. Workers are only started when the scan
 // first exceeds kParScanMin, so a single-core or quota-limited run pays
 // nothing.
@@ -806,10 +874,16 @@ class ScanPool {
 
   int size() const { return n_; }
 
-  void run(Fn fn, void *ctx, uint32_t total) {
+  void run(Fn fn, void *ctx, uint32_t total) { run(fn, ctx, total, n_); }
+
+  // active <= size() lets band-limited callers (small scans, short INSERT
+  // batches) use fewer slices: every worker still acknowledges the generation,
+  // but the ones past `active` get an empty range.
+  void run(Fn fn, void *ctx, uint32_t total, int active) {
     fn_ = fn;
     ctx_ = ctx;
     total_ = total;
+    active_ = active < 1 ? 1 : (active > n_ ? n_ : active);
     done_.store(0, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lk(m_);
@@ -827,15 +901,18 @@ class ScanPool {
 #endif
     }
     std::unique_lock<std::mutex> lk(m_);
+    waiting_.store(true, std::memory_order_seq_cst);
     done_cv_.wait(lk, [&] { return done_.load(std::memory_order_acquire) >= need; });
+    waiting_.store(false, std::memory_order_relaxed);
   }
 
  private:
   void run_slice(int tid) {
-    const uint32_t step = (total_ + static_cast<uint32_t>(n_) - 1) / static_cast<uint32_t>(n_);
+    const uint32_t step = (total_ + static_cast<uint32_t>(active_) - 1) /
+                          static_cast<uint32_t>(active_);
     const uint32_t lo = static_cast<uint32_t>(tid) * step;
-    const uint32_t hi = lo + step < total_ ? lo + step : total_;
-    if (lo < hi) {
+    const uint32_t hi = (lo < total_ && lo + step < total_) ? lo + step : total_;
+    if (lo < hi && tid < active_) {
       fn_(ctx_, tid, lo, hi);
     }
   }
@@ -867,13 +944,16 @@ class ScanPool {
       }
       seen = g;
       run_slice(tid);
-      {
-        // Same rule in the other direction: the completion count is published
-        // under the mutex so the waiting caller cannot miss it.
-        std::lock_guard<std::mutex> lk(m_);
-        done_.fetch_add(1, std::memory_order_release);
+      // Publish the completion and only reach for the mutex when the caller is
+      // actually parked; the seq_cst pair with `waiting_` closes the lost
+      // wakeup without serializing every acknowledgement.
+      done_.fetch_add(1, std::memory_order_seq_cst);
+      if (waiting_.load(std::memory_order_seq_cst)) {
+        {
+          std::lock_guard<std::mutex> lk(m_);
+        }
+        done_cv_.notify_all();
       }
-      done_cv_.notify_one();
     }
   }
 
@@ -883,11 +963,13 @@ class ScanPool {
   Fn fn_ = nullptr;
   void *ctx_ = nullptr;
   uint32_t total_ = 0;
+  int active_ = 1;
   std::mutex m_;
   std::condition_variable cv_;
   std::condition_variable done_cv_;
   std::atomic<uint64_t> gen_{0};
   std::atomic<bool> stop_{false};
+  std::atomic<bool> waiting_{false};
   std::atomic<uint32_t> done_{0};
   std::vector<std::thread> threads_;
 };
@@ -1602,9 +1684,7 @@ struct Database::Impl {
         pos.push_back(static_cast<size_t>(ci));
       }
     }
-    std::unordered_set<int64_t> seen;
-    int pk_idx = t.pk_idx;
-    bool all_columns = ins.columns.empty() || pos.size() == ncols;
+    int pk_idx = t.pk_idx;    bool all_columns = ins.columns.empty() || pos.size() == ncols;
     int vec_k = -1;
     for (size_t k = 0; k < pos.size(); ++k) {
       if (t.cols[pos[k]].type == ColType::VECTOR) {
@@ -1623,7 +1703,9 @@ struct Database::Impl {
         job.out = vec_prep_.data();
         job.lit_index = static_cast<size_t>(vec_k);
         job.dim = t.cols[pos[static_cast<size_t>(vec_k)]].len;
-        pool->run(vec_prep_fn, &job, static_cast<uint32_t>(ins.rows.size()));
+        pool->run(vec_prep_fn, &job, static_cast<uint32_t>(ins.rows.size()),
+                  active_threads(pool->size(), static_cast<uint32_t>(ins.rows.size()),
+                                 kDecodeRowsPerThread));
         prep = true;
       }
     }
@@ -1631,13 +1713,6 @@ struct Database::Impl {
     for (size_t ci = 0; ci < ncols; ++ci) {
       vals[ci].type = t.cols[ci].type;
     }
-    std::string payload;
-    size_t reserve_hint = 64;
-    for (const Column &col : t.cols) {
-      reserve_hint += col.type == ColType::VECTOR ? static_cast<size_t>(col.len) * 4
-                                                  : static_cast<size_t>(col.len) + 8;
-    }
-    payload.reserve(reserve_hint);
     ExecResult res;
     res.kind = ExecResult::MODIFIED;
     res.affected_rows = 0;
@@ -1703,21 +1778,24 @@ struct Database::Impl {
         }
       }
       int64_t pk = vals[pk_idx].i;
-      if (t.pk2slot.count(pk) || !seen.insert(pk).second) {
+      auto slot_it = t.pk2slot.find(pk);
+      if (slot_it != t.pk2slot.end()) {
         raise("duplicate_key", "duplicate primary key");
       }
       uint32_t vec_off = 0;
-      encode_row_into(t, vals, payload, &vec_off);
-      int64_t off = heap_.append(payload.data(), static_cast<uint32_t>(payload.size()));
+      uint32_t plen = static_cast<uint32_t>(row_payload_size(vals));
+      char *row = heap_.reserve(plen);
+      encode_row_raw(t, vals, row, &vec_off);
+      int64_t off = heap_.commit(plen);
       uint32_t slot = static_cast<uint32_t>(t.slots.size());
       RowRef ref;
       ref.pk = pk;
       ref.off = off;
-      ref.len = static_cast<uint32_t>(payload.size());
+      ref.len = plen;
       ref.vec_off = vec_off;
       ref.alive = true;
       t.slots.push_back(ref);
-      t.pk2slot[pk] = slot;
+      t.pk2slot.emplace_hint(slot_it, pk, slot);
       for (const auto &kv : t.eq_indexes) {
         eq_index_add(t, kv.first, slot, vals[static_cast<size_t>(kv.first)], off);
       }
@@ -2109,7 +2187,8 @@ struct Database::Impl {
           const size_t nt = static_cast<size_t>(pool->size());
           ps.top.resize(nt);
           ps.got.assign(nt, 0);
-          pool->run(par_scan_fn, &ps, scan_n);
+          pool->run(par_scan_fn, &ps, scan_n,
+                    active_threads(pool->size(), scan_n, kScanRowsPerThread));
           size_t total = 0;
           for (size_t i = 0; i < nt; ++i) {
             total += ps.got[i];
