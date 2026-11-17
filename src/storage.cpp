@@ -8,6 +8,10 @@
 // 提交 = 整批记录 + COMMIT 记录一次 write + 恰好一次 fdatasync。
 // 恢复 = 从头扫描：长度越界 / CRC 不匹配 / 记录不完整 → 立刻停止并丢弃尾部；
 //        没有 COMMIT 收尾的事务整段丢弃（replay_groups 会先 abort_group 再截断文件）。
+// 预分配：WAL 尾部按 kPreallocStep 步长预先写成真实零字节，append 因此总是落在
+//        「已分配且已写过」的区间里 —— fdatasync 只需刷数据页，不必顺带提交块分配 /
+//        extent 转换 / i_size 增长的元数据事务。记录格式与提交语义完全不变；文件关闭时
+//        把预分配尾部裁回逻辑长度，磁盘上的文件与不预分配时逐字节一致。
 // 流式写：append 只入内存缓冲，flush 落地（不 fsync），commit 追加 COMMIT + fdatasync。
 //        事务内每条语句 flush 一次，因此事务内也能读到自己的写；语句失败/事务回滚用
 //        rollback_to 把文件截回语句/事务起点，未提交字节不会留在已提交区域里。
@@ -161,6 +165,36 @@ bool read_exact(int fd, void* data, size_t n) {
     }
     if (r == 0) return false;
     off += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+bool read_exact_at(int fd, void* data, size_t n, uint64_t off) {
+  char* p = static_cast<char*>(data);
+  size_t done = 0;
+  while (done < n) {
+    int r = p_pread(fd, p + done, n - done, static_cast<int64_t>(off + done));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (r == 0) return false;
+    done += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+// 预分配区用真实零字节填满（而不是留洞）：块从「已分配未写」变成「已写」，
+// 后续 append 落在这段区间里就不再触发分配 / extent 转换 / i_size 增长。
+bool fill_zeros(int fd, uint64_t off, uint64_t len) {
+  static const std::vector<char> kZero(64u * 1024u, 0);
+  const char* z = kZero.data();
+  const size_t zn = kZero.size();
+  while (len > 0) {
+    const size_t take = len < zn ? static_cast<size_t>(len) : zn;
+    if (!write_all_at(fd, z, take, off)) return false;
+    off += take;
+    len -= take;
   }
   return true;
 }
@@ -398,6 +432,7 @@ constexpr size_t kCatalogHeader = 24;
 constexpr size_t kRecPrefix = 17;  // u32 len + u32 crc + u64 txn + u8 type
 constexpr size_t kScanChunk = 1u << 20;  // 顺序扫描读缓冲（大块少 syscall）
 constexpr uint32_t kMaxPayload = 64u * 1024u * 1024u;
+constexpr uint64_t kPreallocStep = 4u * 1024u * 1024u;  // WAL 预分配步长
 constexpr uint16_t kFormatVersion = 1;
 constexpr uint16_t kEndianMark = 0x0102;
 constexpr uint8_t kRecInsert = 1;
@@ -627,6 +662,15 @@ bool decode_schema(Cur& cur, Schema& s) {
   return true;
 }
 
+// 只关心「最后一个已提交边界」时的空回放接收器（用于尾部归位）。
+class SilentSink : public Storage::GroupSink {
+ public:
+  void begin_group(uint64_t) override {}
+  void record(const Storage::View&) override {}
+  void commit_group() override {}
+  void abort_group() override {}
+};
+
 }  // namespace
 
 // ==================================================================== Storage
@@ -688,16 +732,67 @@ bool Storage::open(const std::string& dir, std::string& err) {
   txn_seq_ = 0;
   bytes_written_ = 0;
   file_size_ = static_cast<uint64_t>(end);
+  alloc_end_ = file_size_;
   pending_base_ = file_size_;
   pending_.clear();
+  if (!reconcile_tail(err)) {
+    p_close(wal_fd_);
+    wal_fd_ = -1;
+    return false;
+  }
   return true;
 }
 
 void Storage::close() {
   if (wal_fd_ >= 0) {
+    // 预分配尾部不含任何记录：关闭时裁回逻辑长度，文件内容与不预分配时逐字节一致。
+    if (alloc_end_ > file_size_) p_ftruncate(wal_fd_, file_size_);
     p_close(wal_fd_);
     wal_fd_ = -1;
   }
+  alloc_end_ = file_size_;
+}
+
+// 物理长度可能大于逻辑长度，只有「预分配零区」会造成这种差额。
+// 廉价判据：文件正好以一条合法的 COMMIT 记录收尾 ⇒ 物理长度就是逻辑长度（无零区）。
+// 该判据只会误判成「需要重扫」，不会漏判：真实零区的末 17 字节全是 0，永远不满足
+// 「payload_len == 0 且 type == COMMIT 且 CRC 自洽」。判据只决定要不要扫，
+// 逻辑长度最终由重扫（长度 + CRC + 事务边界）给出。
+bool Storage::reconcile_tail(std::string& err) {
+  if (file_size_ <= kWalHeader + kRecPrefix) return true;
+  unsigned char rec[kRecPrefix];
+  if (!read_exact_at(wal_fd_, rec, kRecPrefix, file_size_ - kRecPrefix)) return true;
+  const bool clean_end = rec[16] == kRecCommit && le_u32(rec) == 0 &&
+                         crc32(0, rec + 8, 9) == le_u32(rec + 4);
+  if (clean_end) return true;
+  SilentSink sink;
+  uint64_t committed = kWalHeader;
+  if (!replay_groups(sink, &committed, err)) return false;
+  if (committed >= file_size_) return true;
+  if (!p_ftruncate(wal_fd_, committed)) {
+    err = "storage: cannot truncate '" + wal_path_ + "': " + std::string(std::strerror(errno));
+    return false;
+  }
+  file_size_ = committed;
+  alloc_end_ = committed;
+  pending_base_ = committed;
+  return true;
+}
+
+bool Storage::ensure_capacity(uint64_t need_end, std::string& err) {
+  if (need_end <= alloc_end_) return true;
+  const uint64_t base = alloc_end_ < file_size_ ? file_size_ : alloc_end_;
+  uint64_t target = base + kPreallocStep;
+  if (target < need_end) {
+    const uint64_t lack = need_end - base;
+    target = base + ((lack + kPreallocStep - 1) / kPreallocStep) * kPreallocStep;
+  }
+  if (!fill_zeros(wal_fd_, base, target - base)) {
+    err = "storage: wal preallocate failed: " + std::string(std::strerror(errno));
+    return false;
+  }
+  alloc_end_ = target;
+  return true;
 }
 
 bool Storage::commit_batch(const std::vector<Mutation>& muts, std::string& err) {
@@ -744,11 +839,20 @@ bool Storage::write_pending(std::string& err) {
   }
   const uint64_t base = file_size_;
   const size_t n = pending_.size();
+  if (!ensure_capacity(base + n, err)) {
+    p_ftruncate(wal_fd_, base);   // 尽力回滚半条事务
+    pending_.clear();
+    file_size_ = base;
+    alloc_end_ = base;
+    pending_base_ = base;
+    return false;
+  }
   if (!write_all_at(wal_fd_, pending_.data(), n, base)) {
     err = "storage: wal write failed: " + std::string(std::strerror(errno));
     p_ftruncate(wal_fd_, base);   // 尽力回滚半条事务
     pending_.clear();
     file_size_ = base;
+    alloc_end_ = base;
     pending_base_ = base;
     return false;
   }
@@ -783,6 +887,7 @@ bool Storage::commit(uint64_t txn, std::string& err) {
     err = "storage: fdatasync failed: " + std::string(std::strerror(errno));
     p_ftruncate(wal_fd_, base);
     file_size_ = base;
+    alloc_end_ = base;
     pending_base_ = base;
     return false;
   }
@@ -807,6 +912,7 @@ bool Storage::rollback_to(uint64_t size, std::string& err) {
     return false;
   }
   file_size_ = size;
+  alloc_end_ = size;
   pending_base_ = size;
   return true;
 }
@@ -824,6 +930,7 @@ bool Storage::truncate(uint64_t size, std::string& err) {
     return false;
   }
   file_size_ = size;
+  alloc_end_ = size;
   pending_base_ = size;
   return true;
 }

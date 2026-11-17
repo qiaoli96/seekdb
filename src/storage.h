@@ -38,6 +38,9 @@ struct PayloadView {
 //   /data/catalog.dat  表定义（每次 CREATE TABLE 覆写）
 //   /data/wal.log      append-only 行日志；每条记录 = [u32 len][u32 crc32][u64 txn][u8 type][payload]
 //                      事务以 type=COMMIT 收尾；COMMIT 之前 fdatasync 一次。
+//                      尾部按步长预分配成真实零字节（未写区域读出来就是 0，与留洞不可区分），
+//                      于是 fdatasync 只刷数据页；崩溃遗留的零区尾部由长度/CRC 校验识别为
+//                      无效尾部并截断，正常关闭则把尾部裁回逻辑长度。
 // 行内容只落这一份：执行器把 wal.log 同时当作行存储，内存里只保留槽位/存活位/pk 索引，
 // 因此数据量可以超过内存限额。崩溃恢复：从头顺序重放，遇到长度/CRC 不合法或尾部截断即停止；
 // 无 COMMIT 收尾的事务整段丢弃，随后把文件截到最后一个已提交边界。
@@ -103,13 +106,20 @@ class Storage {
 
  private:
   bool write_pending(std::string& err);
+  // 预分配：把 [alloc_end_, need_end) 这段尾部按步长扩到位并写成真实零字节，
+  // 使后续记录落在「已分配且已写过」的区间里 —— fdatasync 不再需要提交
+  // 块分配 / extent 转换 / i_size 增长这类元数据事务，只需刷数据页。
+  bool ensure_capacity(uint64_t need_end, std::string& err);
+  // 崩溃后物理长度可能大于逻辑长度（尾部是预分配零区）：精确重扫求逻辑长度。
+  bool reconcile_tail(std::string& err);
 
   std::string dir_;
   std::string wal_path_;
   std::string catalog_path_;
   uint64_t txn_seq_ = 0;
   uint64_t bytes_written_ = 0;
-  uint64_t file_size_ = 0;      // 已落地的字节数
+  uint64_t file_size_ = 0;      // 已落地的字节数（逻辑长度）
+  uint64_t alloc_end_ = 0;      // 已预分配到的物理长度，恒 >= file_size_，区间内是真实零字节
   uint64_t pending_base_ = 0;   // 缓冲起点 == 缓冲为空时的 file_size_
   int wal_fd_ = -1;
   std::vector<char> pending_;          // 尚未落地的记录
