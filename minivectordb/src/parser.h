@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common.h"
@@ -31,7 +32,9 @@ struct ColumnDef {
 struct Literal {
   enum Kind { INT, STR } kind = INT;
   int64_t i = 0;
-  std::string s;
+  // Points into the statement text (or Stmt::arena for unescaped literals);
+  // the statement string must outlive the Stmt.
+  std::string_view s;
 };
 
 enum class CmpOp { EQ, NE, LT, LE, GT, GE };
@@ -44,9 +47,9 @@ struct Compare {
 
 struct SelectItem {
   bool is_distance = false;
-  std::string col;       // projected column or vector column for distance
-  std::string alias;     // output name
-  std::string vec_text;  // distance query vector literal
+  std::string col;         // projected column or vector column for distance
+  std::string_view vec_text;  // distance query vector literal
+  std::string alias;       // output name
 };
 
 struct SelectStmt {
@@ -56,7 +59,7 @@ struct SelectStmt {
   std::vector<Compare> where;
   enum OrderKind { ORDER_NONE, ORDER_COLUMN, ORDER_DISTANCE } order_kind = ORDER_NONE;
   std::string order_col;   // column name, or select alias
-  std::string order_vec;   // vector literal when ordering by a distance expression
+  std::string_view order_vec;  // vector literal when ordering by a distance expression
   std::string order_vec_col;  // vector column for ORDER BY L2_DISTANCE(...)
   bool order_desc = false;
   bool has_limit = false;
@@ -95,6 +98,9 @@ struct Stmt {
   UpdateStmt update;
   DeleteStmt del;
   SelectStmt select;
+  // Owns the unescaped bytes referenced by string literals that contained
+  // doubled quotes; views into it stay valid as long as this Stmt lives.
+  std::vector<char> arena;
 };
 
 Stmt parse_statement(const std::string &sql);

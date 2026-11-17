@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mvd {
@@ -35,7 +36,7 @@ struct Error {
   throw Error{code, message};
 }
 
-inline int64_t utf8_length(const std::string &s) {
+inline int64_t utf8_length(std::string_view s) {
   int64_t n = 0;
   for (unsigned char c : s) {
     if ((c & 0xC0) != 0x80) {

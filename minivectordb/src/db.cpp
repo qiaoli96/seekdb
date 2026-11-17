@@ -582,7 +582,7 @@ bool parse_component_fast(const char **pp, const char *end, float *out) {
 }
 #endif
 
-void parse_vector_literal(const std::string &text, int64_t dim, std::vector<float> &out) {
+void parse_vector_literal(std::string_view text, int64_t dim, std::vector<float> &out) {
   out.clear();
   if (out.capacity() < static_cast<size_t>(dim)) {
     out.reserve(static_cast<size_t>(dim));
@@ -616,8 +616,8 @@ void parse_vector_literal(const std::string &text, int64_t dim, std::vector<floa
     if (i >= n) {
       raise("invalid_vector", "unterminated vector literal");
     }
-    const char *start = text.c_str() + i;
-    const char *limit = text.c_str() + n;
+    const char *start = text.data() + i;
+    const char *limit = text.data() + n;
     const char *num = start;
     if (num < limit && *num == '+') {
       ++num;
@@ -627,17 +627,18 @@ void parse_vector_literal(const std::string &text, int64_t dim, std::vector<floa
 #if defined(__x86_64__) || defined(__i386__)
     parsed_fast = parse_component_fast(&num, limit, &f);
     if (parsed_fast) {
-      i = static_cast<size_t>(num - text.c_str());
+      i = static_cast<size_t>(num - text.data());
     }
 #endif
     if (!parsed_fast) {
       std::from_chars_result res = std::from_chars(num, limit, f);
       if (res.ec == std::errc::result_out_of_range) {
         // Keep the exact previous diagnostics for extreme magnitudes.
+        std::string tail(text.substr(i));
         char *end = nullptr;
         errno = 0;
-        double d = strtod(start, &end);
-        if (end == start) {
+        double d = strtod(tail.c_str(), &end);
+        if (end == tail.c_str()) {
           raise("invalid_vector", "invalid vector component");
         }
         if (!std::isfinite(d)) {
@@ -650,13 +651,13 @@ void parse_vector_literal(const std::string &text, int64_t dim, std::vector<floa
         if (!std::isfinite(f)) {
           raise("value_out_of_range", "vector component overflows float32");
         }
-        i = static_cast<size_t>(end - text.c_str());
+        i += static_cast<size_t>(end - tail.c_str());
       } else if (res.ec != std::errc() || res.ptr == num) {
         raise("invalid_vector", "invalid vector component");
       } else if (!std::isfinite(f)) {
         raise("invalid_vector", "vector component is not finite");
       } else {
-        i = static_cast<size_t>(res.ptr - text.c_str());
+        i = static_cast<size_t>(res.ptr - text.data());
       }
     }
     out.push_back(f);

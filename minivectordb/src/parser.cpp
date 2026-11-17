@@ -36,7 +36,7 @@ bool iequals(const std::string &a, const std::string &b) {
 
 struct TokenList {
   std::vector<Tok> toks;
-  std::string arena;  // owns unescaped string bodies referenced by toks
+  std::vector<char> arena;  // owns unescaped string bodies referenced by toks
 };
 
 TokenList tokenize(const std::string &sql) {
@@ -145,6 +145,8 @@ TokenList tokenize(const std::string &sql) {
 class Parser {
  public:
   explicit Parser(TokenList toks) : toks_(std::move(toks.toks)), arena_(std::move(toks.arena)) {}
+
+  std::vector<char> &arena() { return arena_; }
 
   Stmt parse() {
     Stmt stmt;
@@ -282,7 +284,7 @@ class Parser {
       lit.i = next().iv;
     } else if (peek().kind == TokKind::STR) {
       lit.kind = Literal::STR;
-      lit.s = std::string(next().text);
+      lit.s = next().text;
     } else {
       raise("syntax_error");
     }
@@ -450,7 +452,7 @@ class Parser {
     if (peek().kind != TokKind::STR) {
       raise("syntax_error");
     }
-    item.vec_text = std::string(next().text);
+    item.vec_text = next().text;
     expect_punct(')');
   }
 
@@ -545,15 +547,19 @@ class Parser {
   }
 
   std::vector<Tok> toks_;
-  std::string arena_;
+  std::vector<char> arena_;
   size_t pos_ = 0;
 };
 
 }  // namespace
 
 Stmt parse_statement(const std::string &sql) {
-  Parser p(tokenize(sql));
-  return p.parse();
+  TokenList toks = tokenize(sql);
+  Parser p(std::move(toks));
+  Stmt stmt = p.parse();
+  // The vector move keeps the buffer address, so every view into it stays valid.
+  stmt.arena = std::move(p.arena());
+  return stmt;
 }
 
 }  // namespace mvd
