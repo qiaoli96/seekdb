@@ -1,3 +1,0 @@
-CREATE TABLE docs (id BIGINT PRIMARY KEY, content VARCHAR(16));
-SELECT id FROM docs;
-DELETE FROM docs WHERE id = 1;

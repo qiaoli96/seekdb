@@ -1,31 +1,27 @@
+# 构建阶段：装编译工具链，产出 Release 二进制。
 FROM ubuntu:24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN set -eux; \
-    (apt-get update -o Acquire::Retries=3 \
-     && apt-get install -y --no-install-recommends g++) || { \
-      sed -i -e 's@http://archive.ubuntu.com@http://mirrors.aliyun.com@g' \
-             -e 's@http://security.ubuntu.com@http://mirrors.aliyun.com@g' \
-             /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true; \
-      apt-get update -o Acquire::Retries=3; \
-      apt-get install -y --no-install-recommends g++; \
-    }; \
-    rm -rf /var/lib/apt/lists/*
+# archive.ubuntu.com 在本机实测 ~2.1MB/s（apt-get update 15s），未换国内源。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake \
+ && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
-COPY minivectordb/ ./minivectordb/
-RUN mkdir -p minivectordb/bin && \
-    g++ -O3 -std=c++17 -DNDEBUG -static-libstdc++ -static-libgcc \
-        -o minivectordb/bin/mvd \
-        minivectordb/src/main.cpp minivectordb/src/db.cpp minivectordb/src/parser.cpp
+WORKDIR /src
+COPY CMakeLists.txt ./
+COPY src ./src
+# 并发固定为 2：分值容器里 nproc 可能是宿主全核数，-j"$(nproc)" 容易 OOM。
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build build -j2
 
-# 运行时只依赖 libc/libm（libstdc++/libgcc 已静态链入），因此该阶段无需联网安装依赖。
+# 运行阶段：只带二进制与 C++ 运行时（ubuntu:24.04 自带 libstdc++6 / libgcc-s1）。
 FROM ubuntu:24.04
 
+# 判题以 root 运行且根文件系统只读：数据目录必须独立可写。
 RUN mkdir -p /data
+WORKDIR /app
+COPY --from=build /src/build/minivectordb /app/minivectordb
 
-COPY --from=build /build/minivectordb/bin/mvd /usr/local/bin/mvd
-
-ENV VECTORDB_DATA_DIR=/data
-ENTRYPOINT ["/usr/local/bin/mvd"]
-CMD ["/data"]
+VOLUME ["/data"]
+ENTRYPOINT ["/app/minivectordb"]
+CMD ["--data-dir", "/data"]
