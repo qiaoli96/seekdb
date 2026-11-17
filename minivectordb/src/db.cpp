@@ -908,6 +908,45 @@ void par_scan_fn(void *ctxv, int tid, uint32_t lo, uint32_t hi) {
 }
 #endif
 
+// Vector literals of a multi-row INSERT are decoded on the pool before the
+// statement is applied. The row loop only replays the recorded error, so the
+// order in which failures surface is unchanged.
+struct VecPrep {
+  std::vector<float> vec;
+  std::string err_code;
+  std::string err_msg;
+};
+
+struct VecPrepJob {
+  const std::vector<std::vector<Literal>> *rows = nullptr;
+  VecPrep *out = nullptr;
+  size_t lit_index = 0;
+  int64_t dim = 0;
+};
+
+void vec_prep_fn(void *ctxv, int, uint32_t lo, uint32_t hi) {
+  VecPrepJob &job = *static_cast<VecPrepJob *>(ctxv);
+  for (uint32_t r = lo; r < hi; ++r) {
+    VecPrep &p = job.out[r];
+    p.err_code.clear();
+    p.err_msg.clear();
+    const std::vector<Literal> &lits = (*job.rows)[r];
+    if (job.lit_index >= lits.size()) {
+      continue;  // wrong column count: the row loop reports it
+    }
+    const Literal &lit = lits[job.lit_index];
+    if (lit.kind != Literal::STR) {
+      continue;  // type mismatch: the row loop reports it
+    }
+    try {
+      parse_vector_literal(lit.s, job.dim, p.vec);
+    } catch (const Error &e) {
+      p.err_code = e.code;
+      p.err_msg = e.message;
+    }
+  }
+}
+
 double l2_squared(const char *a, const char *b, int64_t dim) {
 #if defined(__x86_64__) || defined(__i386__)
   if (have_avx2()) {
@@ -943,6 +982,8 @@ struct Database::Impl {
   bool closed_ = false;
   std::unique_ptr<ScanPool> scan_pool_;
   bool scan_pool_tried_ = false;
+  std::vector<VecPrep> vec_prep_;
+  static constexpr size_t kParInsertMin = 16;
 
   ScanPool *scan_pool() {
     if (!scan_pool_tried_) {
@@ -1551,6 +1592,28 @@ struct Database::Impl {
     std::unordered_set<int64_t> seen;
     int pk_idx = t.pk_idx;
     bool all_columns = ins.columns.empty() || pos.size() == ncols;
+    int vec_k = -1;
+    for (size_t k = 0; k < pos.size(); ++k) {
+      if (t.cols[pos[k]].type == ColType::VECTOR) {
+        vec_k = static_cast<int>(k);
+        break;
+      }
+    }
+    bool prep = false;
+    if (vec_k >= 0 && ins.rows.size() >= kParInsertMin) {
+      if (ScanPool *pool = scan_pool()) {
+        if (vec_prep_.size() < ins.rows.size()) {
+          vec_prep_.resize(ins.rows.size());
+        }
+        VecPrepJob job;
+        job.rows = &ins.rows;
+        job.out = vec_prep_.data();
+        job.lit_index = static_cast<size_t>(vec_k);
+        job.dim = t.cols[pos[static_cast<size_t>(vec_k)]].len;
+        pool->run(vec_prep_fn, &job, static_cast<uint32_t>(ins.rows.size()));
+        prep = true;
+      }
+    }
     std::vector<Value> vals(ncols);
     for (size_t ci = 0; ci < ncols; ++ci) {
       vals[ci].type = t.cols[ci].type;
@@ -1567,7 +1630,8 @@ struct Database::Impl {
     res.affected_rows = 0;
     // Rows are written as they are parsed; a failure part-way rolls the
     // statement back through the same undo log used by every other mutation.
-    for (const auto &lits : ins.rows) {
+    for (size_t ri = 0; ri < ins.rows.size(); ++ri) {
+      const std::vector<Literal> &lits = ins.rows[ri];
       if (lits.size() != pos.size()) {
         raise("column_count_mismatch", "INSERT column count does not match table");
       }
@@ -1614,7 +1678,15 @@ struct Database::Impl {
           if (lit.kind != Literal::STR) {
             raise("type_mismatch", "expected vector literal for " + col.name);
           }
-          parse_vector_literal(lit.s, col.len, v.v);
+          if (prep && static_cast<int>(k) == vec_k) {
+            VecPrep &vp = vec_prep_[ri];
+            if (!vp.err_code.empty()) {
+              raise(vp.err_code.c_str(), vp.err_msg);
+            }
+            v.v.swap(vp.vec);
+          } else {
+            parse_vector_literal(lit.s, col.len, v.v);
+          }
         }
       }
       int64_t pk = vals[pk_idx].i;
