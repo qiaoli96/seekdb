@@ -713,7 +713,7 @@ void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, u
 
 // Queries smaller than this stay on the calling thread; below it the wake-up
 // handshake costs more than the scan it would parallelize.
-constexpr uint32_t kParScanMin = 4096;
+constexpr uint32_t kParScanMin = 256;
 
 // How many threads the scan may use. Workers are only started when the scan
 // first exceeds kParScanMin, so a single-core or quota-limited run pays
