@@ -7,18 +7,27 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cfloat>
 #include <charconv>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <queue>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -694,6 +703,203 @@ void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, u
 }
 #endif
 
+// Queries smaller than this stay on the calling thread; below it the wake-up
+// handshake costs more than the scan it would parallelize.
+constexpr uint32_t kParScanMin = 4096;
+
+// How many threads the scan may use. Workers are only started when the scan
+// first exceeds kParScanMin, so a single-core or quota-limited run pays
+// nothing.
+int scan_thread_budget() {
+  static const int cached = [] {
+    int n = 4;
+    if (const char *env = std::getenv("MVD_SCAN_THREADS")) {
+      n = std::atoi(env);
+    } else {
+#if defined(__linux__)
+      cpu_set_t set;
+      if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        n = std::min(n, CPU_COUNT(&set));
+      }
+      if (FILE *f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+        char quota[32] = {0};
+        long period = 0;
+        if (std::fscanf(f, "%31s %ld", quota, &period) == 2 && period > 0 &&
+            std::strcmp(quota, "max") != 0) {
+          long q = std::atol(quota);
+          if (q > 0) {
+            n = std::min(n, static_cast<int>((q + period - 1) / period));
+          }
+        }
+        std::fclose(f);
+      } else if (FILE *fq = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
+        long q = 0;
+        long period = 0;
+        if (std::fscanf(fq, "%ld", &q) == 1 && q > 0) {
+          if (FILE *fp = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+            if (std::fscanf(fp, "%ld", &period) == 1 && period > 0) {
+              n = std::min(n, static_cast<int>((q + period - 1) / period));
+            }
+            std::fclose(fp);
+          }
+        }
+        std::fclose(fq);
+      }
+#endif
+    }
+    if (n < 1) {
+      n = 1;
+    }
+    if (n > 4) {
+      n = 4;
+    }
+    return n;
+  }();
+  return cached;
+}
+
+// Persistent worker pool for the Top-K scan. The calling thread takes slice 0;
+// workers spin briefly for the next generation and only park on a futex after
+// a burst of queries ends, so back-to-back queries skip thread wake-up cost.
+class ScanPool {
+ public:
+  using Fn = void (*)(void *ctx, int tid, uint32_t lo, uint32_t hi);
+
+  explicit ScanPool(int n) : n_(n > 1 ? n : 1) {
+    threads_.reserve(static_cast<size_t>(n_ - 1));
+    try {
+      for (int i = 1; i < n_; ++i) {
+        threads_.emplace_back(&ScanPool::worker, this, i);
+      }
+    } catch (...) {
+      // Thread creation failed (fd/pid limits): keep the workers we have.
+      n_ = static_cast<int>(threads_.size()) + 1;
+    }
+  }
+
+  ~ScanPool() {
+    stop_.store(true, std::memory_order_release);
+    gen_.fetch_add(1, std::memory_order_release);
+    cv_.notify_all();
+    for (std::thread &t : threads_) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+  }
+
+  ScanPool(const ScanPool &) = delete;
+  ScanPool &operator=(const ScanPool &) = delete;
+
+  int size() const { return n_; }
+
+  void run(Fn fn, void *ctx, uint32_t total) {
+    fn_ = fn;
+    ctx_ = ctx;
+    total_ = total;
+    done_.store(0, std::memory_order_relaxed);
+    gen_.fetch_add(1, std::memory_order_release);
+    cv_.notify_all();
+    run_slice(0);
+    const uint32_t need = static_cast<uint32_t>(n_ - 1);
+    for (int spin = 0; spin < 20000; ++spin) {
+      if (done_.load(std::memory_order_acquire) >= need) {
+        return;
+      }
+#if defined(__x86_64__) || defined(__i386__)
+      _mm_pause();
+#endif
+    }
+    std::unique_lock<std::mutex> lk(m_);
+    done_cv_.wait(lk, [&] { return done_.load(std::memory_order_acquire) >= need; });
+  }
+
+ private:
+  void run_slice(int tid) {
+    const uint32_t step = (total_ + static_cast<uint32_t>(n_) - 1) / static_cast<uint32_t>(n_);
+    const uint32_t lo = static_cast<uint32_t>(tid) * step;
+    const uint32_t hi = lo + step < total_ ? lo + step : total_;
+    if (lo < hi) {
+      fn_(ctx_, tid, lo, hi);
+    }
+  }
+
+  void worker(int tid) {
+    uint64_t seen = 0;
+    for (;;) {
+      // Workers keep spinning between queries: a benchmark issues them
+      // back-to-back and the futex round trip would otherwise cost more than
+      // the slice itself. Park only when the burst ends.
+      uint64_t g = gen_.load(std::memory_order_acquire);
+      if (g == seen) {
+        uint32_t spins = 0;
+        while (g == seen && spins < kIdleSpins) {
+#if defined(__x86_64__) || defined(__i386__)
+          _mm_pause();
+#endif
+          g = gen_.load(std::memory_order_acquire);
+          ++spins;
+        }
+        if (g == seen) {
+          std::unique_lock<std::mutex> lk(m_);
+          cv_.wait(lk, [&] { return gen_.load(std::memory_order_acquire) != seen; });
+          g = gen_.load(std::memory_order_acquire);
+        }
+      }
+      if (stop_.load(std::memory_order_acquire)) {
+        return;
+      }
+      seen = g;
+      run_slice(tid);
+      done_.fetch_add(1, std::memory_order_acq_rel);
+      done_cv_.notify_one();
+    }
+  }
+
+  static constexpr uint32_t kIdleSpins = 200000;
+
+  int n_;
+  Fn fn_ = nullptr;
+  void *ctx_ = nullptr;
+  uint32_t total_ = 0;
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::condition_variable done_cv_;
+  std::atomic<uint64_t> gen_{0};
+  std::atomic<bool> stop_{false};
+  std::atomic<uint32_t> done_{0};
+  std::vector<std::thread> threads_;
+};
+
+#if defined(__x86_64__) || defined(__i386__)
+struct ParScan {
+  const char *map = nullptr;
+  const RowRef *slots = nullptr;
+  const uint32_t *idx = nullptr;
+  int64_t dim = 0;
+  const float *q = nullptr;
+  uint32_t k = 0;
+  std::vector<std::vector<ScanCand>> top;
+  std::vector<uint32_t> got;
+};
+
+void par_scan_fn(void *ctxv, int tid, uint32_t lo, uint32_t hi) {
+  ParScan &p = *static_cast<ParScan *>(ctxv);
+  const size_t t = static_cast<size_t>(tid);
+  std::vector<ScanCand> &top = p.top[t];
+  top.resize(p.k);
+  const uint32_t n = hi - lo;
+  if (p.idx != nullptr) {
+    scan_topk_avx2(p.map, p.slots, p.idx + lo, n, p.dim, p.q, p.k, top.data(), &p.got[t]);
+  } else {
+    scan_topk_avx2(p.map, p.slots + lo, nullptr, n, p.dim, p.q, p.k, top.data(), &p.got[t]);
+    for (uint32_t i = 0; i < p.got[t]; ++i) {
+      top[i].slot += lo;
+    }
+  }
+}
+#endif
+
 double l2_squared(const char *a, const char *b, int64_t dim) {
 #if defined(__x86_64__) || defined(__i386__)
   if (have_avx2()) {
@@ -711,7 +917,10 @@ double l2_distance(const char *a, const char *b, int64_t dim) {
 
 struct Database::Impl {
   explicit Impl(std::string dir) : dir_(std::move(dir)) {}
-  ~Impl() { close_files(); }
+  ~Impl() {
+    scan_pool_.reset();
+    close_files();
+  }
 
   std::string dir_;
   Heap heap_;
@@ -724,6 +933,22 @@ struct Database::Impl {
   int64_t last_lsn_ = 0;
   bool open_ = false;
   bool closed_ = false;
+  std::unique_ptr<ScanPool> scan_pool_;
+  bool scan_pool_tried_ = false;
+
+  ScanPool *scan_pool() {
+    if (!scan_pool_tried_) {
+      scan_pool_tried_ = true;
+      int n = scan_thread_budget();
+      if (n > 1) {
+        scan_pool_.reset(new ScanPool(n));
+        if (scan_pool_->size() < 2) {
+          scan_pool_.reset();
+        }
+      }
+    }
+    return scan_pool_.get();
+  }
 
   void close_files() {
     if (closed_) {
@@ -1759,15 +1984,45 @@ struct Database::Impl {
 
       bool fast_done = false;
 #if defined(__x86_64__) || defined(__i386__)
-      if ((vec_fast || idx_active) && sel.has_limit && !order_desc && limit <= kFastTopK && have_avx2()) {
-        std::vector<ScanCand> top(limit);
-        uint32_t got = 0;
-        scan_topk_avx2(heap_.ptr(0), t.slots.data(), scan_idx, scan_n, dim,
-                       reinterpret_cast<const float *>(q), static_cast<uint32_t>(limit), top.data(),
-                       &got);
-        cands.reserve(got);
-        for (uint32_t i = 0; i < got; ++i) {
-          cands.push_back(DistCand{top[i].d, top[i].pk, top[i].slot});
+      if ((vec_fast || idx_active) && sel.has_limit && !order_desc && limit <= kFastTopK &&
+          have_avx2()) {
+        ScanPool *pool = scan_n >= kParScanMin ? scan_pool() : nullptr;
+        if (pool != nullptr) {
+          ParScan ps;
+          ps.map = heap_.ptr(0);
+          ps.slots = t.slots.data();
+          ps.idx = scan_idx;
+          ps.dim = dim;
+          ps.q = reinterpret_cast<const float *>(q);
+          ps.k = static_cast<uint32_t>(limit);
+          const size_t nt = static_cast<size_t>(pool->size());
+          ps.top.resize(nt);
+          ps.got.assign(nt, 0);
+          pool->run(par_scan_fn, &ps, scan_n);
+          size_t total = 0;
+          for (size_t i = 0; i < nt; ++i) {
+            total += ps.got[i];
+          }
+          cands.reserve(total);
+          for (size_t i = 0; i < nt; ++i) {
+            for (uint32_t j = 0; j < ps.got[i]; ++j) {
+              cands.push_back(DistCand{ps.top[i][j].d, ps.top[i][j].pk, ps.top[i][j].slot});
+            }
+          }
+          std::sort(cands.begin(), cands.end(), better);
+          if (cands.size() > static_cast<size_t>(limit)) {
+            cands.resize(static_cast<size_t>(limit));
+          }
+        } else {
+          std::vector<ScanCand> top(limit);
+          uint32_t got = 0;
+          scan_topk_avx2(heap_.ptr(0), t.slots.data(), scan_idx, scan_n, dim,
+                         reinterpret_cast<const float *>(q), static_cast<uint32_t>(limit),
+                         top.data(), &got);
+          cands.reserve(got);
+          for (uint32_t i = 0; i < got; ++i) {
+            cands.push_back(DistCand{top[i].d, top[i].pk, top[i].slot});
+          }
         }
         fast_done = true;
       }

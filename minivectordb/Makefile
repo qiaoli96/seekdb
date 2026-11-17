@@ -1,6 +1,6 @@
 CXX ?= g++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
-LDFLAGS ?=
+CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -pthread
+LDFLAGS ?= -pthread
 
 SRC := src/main.cpp src/db.cpp src/parser.cpp
 HEADERS := $(wildcard src/*.h)
