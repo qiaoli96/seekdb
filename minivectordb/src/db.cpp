@@ -504,6 +504,84 @@ uint32_t row_vec_off(const Table &t, const char *p, uint32_t len) {
   return cur.offs[t.vec_idx];
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+static const double kPow10d[16] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+                                   1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15};
+
+// Handles the plain decimal spellings that make up vector literals: an optional
+// '-', at most 15 digits split by one '.', and a separator right behind them.
+// Every other shape falls back to std::from_chars, which keeps the existing
+// error semantics; the window guard keeps the 16-byte SSE2 load in bounds.
+bool parse_component_fast(const char **pp, const char *end, float *out) {
+  const char *p = *pp;
+  bool neg = (*p == '-');
+  const char *d = p + (neg ? 1 : 0);
+  if (end - d < 16) {
+    return false;
+  }
+  __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i *>(d));
+  __m128i is_dig = _mm_and_si128(_mm_cmpgt_epi8(chunk, _mm_set1_epi8('0' - 1)),
+                                 _mm_cmpgt_epi8(_mm_set1_epi8('9' + 1), chunk));
+  uint32_t mask = static_cast<uint32_t>(_mm_movemask_epi8(is_dig));
+  if (mask == 0xFFFFu) {
+    return false;  // no separator inside the window
+  }
+  uint32_t k1 = static_cast<uint32_t>(__builtin_ctz(~mask));
+  if (k1 == 0 || k1 > 15) {
+    return false;
+  }
+  bool dot = d[k1] == '.';
+  uint32_t k2 = 0;
+  if (dot) {
+    uint32_t m2 = mask >> (k1 + 1);
+    uint32_t nd = (~m2) & ((1u << (15 - k1)) - 1);
+    k2 = nd ? static_cast<uint32_t>(__builtin_ctz(nd)) : (15 - k1);
+    if (k1 + 1 + k2 >= 16 || k1 + k2 > 15) {
+      return false;
+    }
+  }
+  const char *t = d + k1 + (dot ? 1 + k2 : 0);
+  char term = *t;
+  if (term != ',' && term != ']' && term != ' ' && term != '\t' && term != '\n' &&
+      term != '\r') {
+    return false;
+  }
+  double value;
+  if (dot && k1 == 1 && k2 >= 1 && k2 <= 9) {
+    // Corpus shape ("-0.5792649"): SWAR-convert the fraction eight digits at a
+    // time, padding the load with '0' so the terminator never reaches the value.
+    uint64_t raw;
+    memcpy(&raw, d + 2, 8);
+    uint64_t dmask = k2 >= 8 ? ~0ull : ((1ull << (8 * k2)) - 1);
+    uint64_t v = ((raw & dmask) | (0x3030303030303030ull & ~dmask)) - 0x3030303030303030ull;
+    uint64_t lo = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FFull;
+    uint64_t hi = (lo * 100 + (lo >> 16)) & 0x0000FFFF0000FFFFull;
+    uint64_t frac = (((hi & 0xFFFFull) * 10000ull) + (hi >> 32)) /
+                    static_cast<uint64_t>(kPow10d[8 - (k2 < 8 ? k2 : 8)]);
+    if (k2 == 9) {
+      frac = frac * 10 + static_cast<uint64_t>(d[10] - '0');
+    }
+    uint64_t mant = static_cast<uint64_t>(d[0] - '0') * static_cast<uint64_t>(kPow10d[k2]) + frac;
+    value = static_cast<double>(mant) / kPow10d[k2];
+  } else {
+    uint64_t mant = 0;
+    for (uint32_t j = 0; j < k1; ++j) {
+      mant = mant * 10 + static_cast<uint64_t>(d[j] - '0');
+    }
+    if (dot) {
+      for (uint32_t j = 0; j < k2; ++j) {
+        mant = mant * 10 + static_cast<uint64_t>(d[k1 + 1 + j] - '0');
+      }
+    }
+    value = static_cast<double>(mant) / kPow10d[k2];
+  }
+  float f = static_cast<float>(value);
+  *out = neg ? -f : f;
+  *pp = t;
+  return true;
+}
+#endif
+
 void parse_vector_literal(const std::string &text, int64_t dim, std::vector<float> &out) {
   out.clear();
   if (out.capacity() < static_cast<size_t>(dim)) {
@@ -545,32 +623,41 @@ void parse_vector_literal(const std::string &text, int64_t dim, std::vector<floa
       ++num;
     }
     float f = 0.0f;
-    std::from_chars_result res = std::from_chars(num, limit, f);
-    if (res.ec == std::errc::result_out_of_range) {
-      // Keep the exact previous diagnostics for extreme magnitudes.
-      char *end = nullptr;
-      errno = 0;
-      double d = strtod(start, &end);
-      if (end == start) {
+    bool parsed_fast = false;
+#if defined(__x86_64__) || defined(__i386__)
+    parsed_fast = parse_component_fast(&num, limit, &f);
+    if (parsed_fast) {
+      i = static_cast<size_t>(num - text.c_str());
+    }
+#endif
+    if (!parsed_fast) {
+      std::from_chars_result res = std::from_chars(num, limit, f);
+      if (res.ec == std::errc::result_out_of_range) {
+        // Keep the exact previous diagnostics for extreme magnitudes.
+        char *end = nullptr;
+        errno = 0;
+        double d = strtod(start, &end);
+        if (end == start) {
+          raise("invalid_vector", "invalid vector component");
+        }
+        if (!std::isfinite(d)) {
+          raise("invalid_vector", "vector component is not finite");
+        }
+        if (std::fabs(d) > static_cast<double>(FLT_MAX)) {
+          raise("value_out_of_range", "vector component overflows float32");
+        }
+        f = static_cast<float>(d);
+        if (!std::isfinite(f)) {
+          raise("value_out_of_range", "vector component overflows float32");
+        }
+        i = static_cast<size_t>(end - text.c_str());
+      } else if (res.ec != std::errc() || res.ptr == num) {
         raise("invalid_vector", "invalid vector component");
-      }
-      if (!std::isfinite(d)) {
+      } else if (!std::isfinite(f)) {
         raise("invalid_vector", "vector component is not finite");
+      } else {
+        i = static_cast<size_t>(res.ptr - text.c_str());
       }
-      if (std::fabs(d) > static_cast<double>(FLT_MAX)) {
-        raise("value_out_of_range", "vector component overflows float32");
-      }
-      f = static_cast<float>(d);
-      if (!std::isfinite(f)) {
-        raise("value_out_of_range", "vector component overflows float32");
-      }
-      i = static_cast<size_t>(end - text.c_str());
-    } else if (res.ec != std::errc() || res.ptr == num) {
-      raise("invalid_vector", "invalid vector component");
-    } else if (!std::isfinite(f)) {
-      raise("invalid_vector", "vector component is not finite");
-    } else {
-      i = static_cast<size_t>(res.ptr - text.c_str());
     }
     out.push_back(f);
     skip();
@@ -1078,6 +1165,14 @@ struct Database::Impl {
   std::unique_ptr<ScanPool> scan_pool_;
   bool scan_pool_tried_ = false;
   std::vector<VecPrep> vec_prep_;
+  // Scratch reused by every TopK query: the scan slices, the filtered slot list
+  // and its de-dup bitmap, and the merged candidates. Keeping them here takes
+  // the per-query allocations off the hot path.
+  ParScan par_scan_;
+  std::vector<uint32_t> matched_;
+  std::vector<uint64_t> seen_;
+  std::vector<DistCand> query_cands_;
+  std::vector<ScanCand> serial_top_;
   static constexpr size_t kParInsertMin = 16;
 
   ScanPool *scan_pool() {
@@ -2043,7 +2138,7 @@ struct Database::Impl {
     }
 
     std::string &rows = res.rows_json;
-    rows.reserve(64);
+    rows.reserve(512);
     rows.push_back('[');
     bool first_row = true;
 
@@ -2092,7 +2187,8 @@ struct Database::Impl {
         ++emitted;
       }
     } else if (order == OrderBy::DISTANCE) {
-      std::vector<DistCand> cands;
+      std::vector<DistCand> &cands = query_cands_;
+      cands.clear();
       auto better = [order_desc](const DistCand &a, const DistCand &b) {
         if (a.d != b.d) {
           return order_desc ? a.d > b.d : a.d < b.d;
@@ -2107,7 +2203,8 @@ struct Database::Impl {
       // bucket. Buckets are add-only: an entry whose row offset still matches
       // the live row is guaranteed to satisfy the predicate, otherwise the row
       // is verified against its current bytes.
-      std::vector<uint32_t> matched;
+      std::vector<uint32_t> &matched = matched_;
+      matched.clear();
       bool idx_active = false;
       if (where.size() == 1 && where[0].op == CmpOp::EQ) {
         const WherePlan &p = where[0];
@@ -2128,12 +2225,20 @@ struct Database::Impl {
           }
           idx_active = true;
           if (bucket != nullptr) {
-            matched.reserve(bucket->size());
+            if (matched.capacity() < bucket->size()) {
+              matched.reserve(bucket->size());
+            }
             // A row updated to a value it already had leaves two matching
             // entries behind; the bitmap keeps each row in the result once.
-            std::vector<uint64_t> seen((t.slots.size() + 63) / 64, 0);
+            size_t words = (t.slots.size() + 63) / 64;
+            if (seen_.size() < words) {
+              seen_.resize(words, 0);
+            }
+            std::vector<uint64_t> &seen = seen_;
+            uint64_t *seen_base = seen.data();
+            memset(seen_base, 0, words * sizeof(uint64_t));
             auto accept = [&](uint32_t slot) {
-              uint64_t &word = seen[slot >> 6];
+              uint64_t &word = seen_base[slot >> 6];
               uint64_t bit = uint64_t{1} << (slot & 63);
               if (word & bit) {
                 return;
@@ -2141,7 +2246,17 @@ struct Database::Impl {
               word |= bit;
               matched.push_back(slot);
             };
-            for (const Table::IndexEntry &e : *bucket) {
+            // The bucket itself streams, but each entry's slot lands on an
+            // arbitrary RowRef, so look 16 entries ahead to hide that latency.
+            constexpr size_t kSlotPf = 16;
+            for (size_t ei = 0; ei < bucket->size(); ++ei) {
+              const Table::IndexEntry &e = (*bucket)[ei];
+              if (ei + kSlotPf < bucket->size()) {
+                uint32_t fs = (*bucket)[ei + kSlotPf].slot;
+                if (fs < t.slots.size()) {
+                  __builtin_prefetch(&t.slots[fs]);
+                }
+              }
               if (e.slot >= t.slots.size()) {
                 continue;
               }
@@ -2177,7 +2292,7 @@ struct Database::Impl {
           have_avx2()) {
         ScanPool *pool = scan_n >= kParScanMin ? scan_pool() : nullptr;
         if (pool != nullptr) {
-          ParScan ps;
+          ParScan &ps = par_scan_;
           ps.map = heap_.ptr(0);
           ps.slots = t.slots.data();
           ps.idx = scan_idx;
@@ -2204,7 +2319,8 @@ struct Database::Impl {
             cands.resize(static_cast<size_t>(limit));
           }
         } else {
-          std::vector<ScanCand> top(limit);
+          std::vector<ScanCand> &top = serial_top_;
+          top.resize(limit);
           uint32_t got = 0;
           scan_topk_avx2(heap_.ptr(0), t.slots.data(), scan_idx, scan_n, dim,
                          reinterpret_cast<const float *>(q), static_cast<uint32_t>(limit),
