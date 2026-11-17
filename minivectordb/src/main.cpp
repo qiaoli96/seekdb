@@ -68,6 +68,8 @@ std::string response_prefix(const mvd::JsonValue &id) {
 
 int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
 
   std::string dir = data_dir_from_args(argc, argv);
   mvd::Database db(dir);

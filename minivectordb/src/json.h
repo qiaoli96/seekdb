@@ -200,50 +200,58 @@ class JsonParser {
       if (pos_ >= n_) {
         bad();
       }
-      unsigned char c = static_cast<unsigned char>(p_[pos_++]);
-      if (c == '"') {
+      // Copy whole runs of plain characters; escaping is the uncommon case and
+      // the request bodies are dominated by large SQL literals.
+      size_t run = pos_;
+      while (run < n_ && p_[run] != '"' && p_[run] != '\\') {
+        ++run;
+      }
+      v.s.append(p_ + pos_, run - pos_);
+      pos_ = run;
+      if (pos_ >= n_) {
+        bad();
+      }
+      if (p_[pos_] == '"') {
+        ++pos_;
         break;
       }
-      if (c == '\\') {
-        if (pos_ >= n_) {
-          bad();
-        }
-        char e = p_[pos_++];
-        switch (e) {
-          case '"': v.s.push_back('"'); break;
-          case '\\': v.s.push_back('\\'); break;
-          case '/': v.s.push_back('/'); break;
-          case 'b': v.s.push_back('\b'); break;
-          case 'f': v.s.push_back('\f'); break;
-          case 'n': v.s.push_back('\n'); break;
-          case 'r': v.s.push_back('\r'); break;
-          case 't': v.s.push_back('\t'); break;
-          case 'u': {
-            uint32_t cp = parse_hex4();
-            if (cp >= 0xD800 && cp <= 0xDBFF) {
-              if (pos_ + 1 < n_ && p_[pos_] == '\\' && p_[pos_ + 1] == 'u') {
-                pos_ += 2;
-                uint32_t low = parse_hex4();
-                if (low >= 0xDC00 && low <= 0xDFFF) {
-                  cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-                } else {
-                  cp = 0xFFFD;
-                }
+      ++pos_;  // backslash
+      if (pos_ >= n_) {
+        bad();
+      }
+      char e = p_[pos_++];
+      switch (e) {
+        case '"': v.s.push_back('"'); break;
+        case '\\': v.s.push_back('\\'); break;
+        case '/': v.s.push_back('/'); break;
+        case 'b': v.s.push_back('\b'); break;
+        case 'f': v.s.push_back('\f'); break;
+        case 'n': v.s.push_back('\n'); break;
+        case 'r': v.s.push_back('\r'); break;
+        case 't': v.s.push_back('\t'); break;
+        case 'u': {
+          uint32_t cp = parse_hex4();
+          if (cp >= 0xD800 && cp <= 0xDBFF) {
+            if (pos_ + 1 < n_ && p_[pos_] == '\\' && p_[pos_ + 1] == 'u') {
+              pos_ += 2;
+              uint32_t low = parse_hex4();
+              if (low >= 0xDC00 && low <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
               } else {
                 cp = 0xFFFD;
               }
-            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            } else {
               cp = 0xFFFD;
             }
-            append_utf8(v.s, cp);
-            break;
+          } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            cp = 0xFFFD;
           }
-          default:
-            bad();
+          append_utf8(v.s, cp);
+          break;
         }
-        continue;
+        default:
+          bad();
       }
-      v.s.push_back(static_cast<char>(c));
     }
     return v;
   }

@@ -2,7 +2,10 @@
 
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
+#include <cstring>
+#include <string_view>
 
 namespace mvd {
 
@@ -12,22 +15,34 @@ enum class TokKind { END, IDENT, INT, STR, PUNCT };
 
 struct Tok {
   TokKind kind = TokKind::END;
-  std::string text;  // identifier (as written) / string body
-  std::string upper; // uppercased identifier, for keyword checks
+  // Identifiers and string bodies point into the statement text (or into the
+  // unescape arena for doubled quotes); tokens never own characters.
+  std::string_view text;
   int64_t iv = 0;
   char punct = 0;
 };
 
-std::string upper_copy(const std::string &s) {
-  std::string out = s;
-  for (char &c : out) {
-    c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+bool iequals(const std::string &a, const std::string &b) {
+  if (a.size() != b.size()) {
+    return false;
   }
-  return out;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (toupper(static_cast<unsigned char>(a[i])) != toupper(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
 }
 
-std::vector<Tok> tokenize(const std::string &sql) {
-  std::vector<Tok> out;
+struct TokenList {
+  std::vector<Tok> toks;
+  std::string arena;  // owns unescaped string bodies referenced by toks
+};
+
+TokenList tokenize(const std::string &sql) {
+  TokenList out;
+  out.toks.reserve(sql.size() / 8 + 8);
+  out.arena.reserve(sql.size() + 16);
   size_t i = 0;
   while (i < sql.size()) {
     unsigned char c = static_cast<unsigned char>(sql[i]);
@@ -43,9 +58,8 @@ std::vector<Tok> tokenize(const std::string &sql) {
       }
       Tok t;
       t.kind = TokKind::IDENT;
-      t.text = sql.substr(start, i - start);
-      t.upper = upper_copy(t.text);
-      out.push_back(t);
+      t.text = std::string_view(sql.data() + start, i - start);
+      out.toks.push_back(t);
       continue;
     }
     if (isdigit(c) || (c == '-' && i + 1 < sql.size() &&
@@ -57,44 +71,55 @@ std::vector<Tok> tokenize(const std::string &sql) {
       while (i < sql.size() && isdigit(static_cast<unsigned char>(sql[i]))) {
         ++i;
       }
-      std::string text = sql.substr(start, i - start);
-      errno = 0;
-      char *end = nullptr;
-      long long v = strtoll(text.c_str(), &end, 10);
-      if (errno == ERANGE || end == nullptr || *end != '\0') {
+      long long v = 0;
+      auto res = std::from_chars(sql.data() + start, sql.data() + i, v);
+      if (res.ec != std::errc() || res.ptr != sql.data() + i) {
         raise("value_out_of_range");
       }
       Tok t;
       t.kind = TokKind::INT;
-      t.text = text;
+      t.text = std::string_view(sql.data() + start, i - start);
       t.iv = static_cast<int64_t>(v);
-      out.push_back(t);
+      out.toks.push_back(t);
       continue;
     }
     if (c == '\'') {
       ++i;
-      std::string body;
-      bool closed = false;
+      size_t start = i;
+      bool escaped = false;
       while (i < sql.size()) {
         if (sql[i] == '\'') {
           if (i + 1 < sql.size() && sql[i + 1] == '\'') {
-            body += '\'';
+            escaped = true;
             i += 2;
             continue;
           }
-          ++i;
-          closed = true;
           break;
         }
-        body += sql[i++];
+        ++i;
       }
-      if (!closed) {
+      if (i >= sql.size()) {
         raise("syntax_error");
       }
       Tok t;
       t.kind = TokKind::STR;
-      t.text = body;
-      out.push_back(t);
+      if (!escaped) {
+        t.text = std::string_view(sql.data() + start, i - start);
+      } else {
+        size_t base = out.arena.size();
+        size_t j = start;
+        while (j < i) {
+          if (sql[j] == '\'' && j + 1 < i && sql[j + 1] == '\'') {
+            out.arena.push_back('\'');
+            j += 2;
+          } else {
+            out.arena.push_back(sql[j++]);
+          }
+        }
+        t.text = std::string_view(out.arena.data() + base, out.arena.size() - base);
+      }
+      ++i;  // closing quote
+      out.toks.push_back(t);
       continue;
     }
     if (c == '(' || c == ')' || c == ',' || c == '=' || c == '*' || c == ';' ||
@@ -102,7 +127,7 @@ std::vector<Tok> tokenize(const std::string &sql) {
       Tok t;
       t.kind = TokKind::PUNCT;
       t.punct = static_cast<char>(c);
-      out.push_back(t);
+      out.toks.push_back(t);
       ++i;
       continue;
     }
@@ -110,13 +135,13 @@ std::vector<Tok> tokenize(const std::string &sql) {
   }
   Tok end;
   end.kind = TokKind::END;
-  out.push_back(end);
+  out.toks.push_back(end);
   return out;
 }
 
 class Parser {
  public:
-  explicit Parser(std::vector<Tok> toks) : toks_(std::move(toks)) {}
+  explicit Parser(TokenList toks) : toks_(std::move(toks.toks)), arena_(std::move(toks.arena)) {}
 
   Stmt parse() {
     Stmt stmt;
@@ -203,7 +228,20 @@ class Parser {
   const Tok &next() { return toks_[pos_++]; }
 
   bool peek_kw(const char *kw, size_t off = 0) const {
-    return peek(off).kind == TokKind::IDENT && peek(off).upper == kw;
+    const Tok &t = peek(off);
+    if (t.kind != TokKind::IDENT) {
+      return false;
+    }
+    size_t n = strlen(kw);
+    if (t.text.size() != n) {
+      return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (toupper(static_cast<unsigned char>(t.text[i])) != kw[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void expect_kw(const char *kw) {
@@ -224,7 +262,7 @@ class Parser {
     if (peek().kind != TokKind::IDENT) {
       raise("syntax_error");
     }
-    return next().text;
+    return std::string(next().text);
   }
 
   int64_t expect_int() {
@@ -241,7 +279,7 @@ class Parser {
       lit.i = next().iv;
     } else if (peek().kind == TokKind::STR) {
       lit.kind = Literal::STR;
-      lit.s = next().text;
+      lit.s = std::string(next().text);
     } else {
       raise("syntax_error");
     }
@@ -342,7 +380,7 @@ class Parser {
     if (!table_pk.empty()) {
       bool found = false;
       for (ColumnDef &def : stmt.columns) {
-        if (upper_copy(def.name) == upper_copy(table_pk)) {
+        if (iequals(def.name, table_pk)) {
           def.pk = true;
           found = true;
         }
@@ -399,7 +437,7 @@ class Parser {
     if (peek().kind != TokKind::STR) {
       raise("syntax_error");
     }
-    item.vec_text = next().text;
+    item.vec_text = std::string(next().text);
     expect_punct(')');
   }
 
@@ -494,6 +532,7 @@ class Parser {
   }
 
   std::vector<Tok> toks_;
+  std::string arena_;
   size_t pos_ = 0;
 };
 

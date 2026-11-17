@@ -364,30 +364,37 @@ struct StrCand {
   uint32_t slot = 0;
 };
 
-void encode_value(Buf &buf, const Value &v) {
-  switch (v.type) {
-    case ColType::BIGINT:
-      buf.i64(v.i);
-      break;
-    case ColType::VARCHAR:
-      buf.u32(static_cast<uint32_t>(v.s.size()));
-      buf.bytes(v.s.data(), v.s.size());
-      break;
-    case ColType::VECTOR:
-      buf.bytes(v.v.data(), v.v.size() * 4);
-      break;
+void encode_row_into(const Table &t, const std::vector<Value> &vals, std::string &out,
+                     uint32_t *vec_off) {
+  out.clear();
+  for (size_t i = 0; i < t.cols.size(); ++i) {
+    if (t.cols[i].type == ColType::VECTOR && vec_off != nullptr) {
+      *vec_off = static_cast<uint32_t>(out.size());
+    }
+    const Value &v = vals[i];
+    switch (v.type) {
+      case ColType::BIGINT: {
+        out.append(reinterpret_cast<const char *>(&v.i), 8);
+        break;
+      }
+      case ColType::VARCHAR: {
+        uint32_t n = static_cast<uint32_t>(v.s.size());
+        out.append(reinterpret_cast<const char *>(&n), 4);
+        out.append(v.s.data(), v.s.size());
+        break;
+      }
+      case ColType::VECTOR: {
+        out.append(reinterpret_cast<const char *>(v.v.data()), v.v.size() * 4);
+        break;
+      }
+    }
   }
 }
 
 std::string encode_row(const Table &t, const std::vector<Value> &vals, uint32_t *vec_off) {
-  Buf buf;
-  for (size_t i = 0; i < t.cols.size(); ++i) {
-    if (t.cols[i].type == ColType::VECTOR && vec_off != nullptr) {
-      *vec_off = static_cast<uint32_t>(buf.data.size());
-    }
-    encode_value(buf, vals[i]);
-  }
-  return buf.data;
+  std::string out;
+  encode_row_into(t, vals, out, vec_off);
+  return out;
 }
 
 std::vector<Value> decode_row(const Table &t, const char *p, uint32_t len) {
@@ -429,6 +436,9 @@ uint32_t row_vec_off(const Table &t, const char *p, uint32_t len) {
 
 void parse_vector_literal(const std::string &text, int64_t dim, std::vector<float> &out) {
   out.clear();
+  if (out.capacity() < static_cast<size_t>(dim)) {
+    out.reserve(static_cast<size_t>(dim));
+  }
   size_t i = 0;
   size_t n = text.size();
   auto skip = [&]() {
@@ -534,15 +544,6 @@ Value literal_to_value(const Column &col, const Literal &lit) {
       raise("type_mismatch", "expected vector literal for " + col.name);
     }
     parse_vector_literal(lit.s, col.len, v.v);
-  }
-  return v;
-}
-
-Value default_value(const Column &col) {
-  Value v;
-  v.type = col.type;
-  if (col.type == ColType::VECTOR) {
-    v.v.assign(static_cast<size_t>(col.len), 0.0f);
   }
   return v;
 }
@@ -1313,35 +1314,81 @@ struct Database::Impl {
         pos.push_back(static_cast<size_t>(ci));
       }
     }
-    std::vector<std::vector<Value>> rows;
-    rows.reserve(ins.rows.size());
     std::unordered_set<int64_t> seen;
     int pk_idx = t.pk_idx;
+    bool all_columns = ins.columns.empty() || pos.size() == ncols;
+    std::vector<Value> vals(ncols);
+    for (size_t ci = 0; ci < ncols; ++ci) {
+      vals[ci].type = t.cols[ci].type;
+    }
+    std::string payload;
+    size_t reserve_hint = 64;
+    for (const Column &col : t.cols) {
+      reserve_hint += col.type == ColType::VECTOR ? static_cast<size_t>(col.len) * 4
+                                                  : static_cast<size_t>(col.len) + 8;
+    }
+    payload.reserve(reserve_hint);
+    ExecResult res;
+    res.kind = ExecResult::MODIFIED;
+    res.affected_rows = 0;
+    // Rows are written as they are parsed; a failure part-way rolls the
+    // statement back through the same undo log used by every other mutation.
     for (const auto &lits : ins.rows) {
       if (lits.size() != pos.size()) {
         raise("column_count_mismatch", "INSERT column count does not match table");
       }
-      std::vector<Value> vals(ncols);
-      for (size_t ci = 0; ci < ncols; ++ci) {
-        vals[ci] = default_value(t.cols[ci]);
+      if (!all_columns) {
+        for (size_t ci = 0; ci < ncols; ++ci) {
+          bool set = false;
+          for (size_t k = 0; k < pos.size(); ++k) {
+            if (pos[k] == ci) {
+              set = true;
+              break;
+            }
+          }
+          if (set) {
+            continue;
+          }
+          Value &v = vals[ci];
+          if (v.type == ColType::BIGINT) {
+            v.i = 0;
+          } else if (v.type == ColType::VARCHAR) {
+            v.s.clear();
+          } else {
+            v.v.assign(static_cast<size_t>(t.cols[ci].len), 0.0f);
+          }
+        }
       }
       for (size_t k = 0; k < pos.size(); ++k) {
-        vals[pos[k]] = literal_to_value(t.cols[pos[k]], lits[k]);
+        const Column &col = t.cols[pos[k]];
+        const Literal &lit = lits[k];
+        Value &v = vals[pos[k]];
+        if (col.type == ColType::BIGINT) {
+          if (lit.kind != Literal::INT) {
+            raise("type_mismatch", "expected integer value for " + col.name);
+          }
+          v.i = lit.i;
+        } else if (col.type == ColType::VARCHAR) {
+          if (lit.kind != Literal::STR) {
+            raise("type_mismatch", "expected string value for " + col.name);
+          }
+          if (utf8_length(lit.s) > col.len) {
+            raise("string_too_long", "value exceeds VARCHAR length");
+          }
+          v.s.assign(lit.s);
+        } else {
+          if (lit.kind != Literal::STR) {
+            raise("type_mismatch", "expected vector literal for " + col.name);
+          }
+          parse_vector_literal(lit.s, col.len, v.v);
+        }
       }
       int64_t pk = vals[pk_idx].i;
-      if (t.pk2slot.count(pk) || seen.count(pk)) {
+      if (t.pk2slot.count(pk) || !seen.insert(pk).second) {
         raise("duplicate_key", "duplicate primary key");
       }
-      seen.insert(pk);
-      rows.push_back(std::move(vals));
-    }
-    ExecResult res;
-    res.kind = ExecResult::MODIFIED;
-    res.affected_rows = static_cast<int64_t>(rows.size());
-    for (auto &vals : rows) {
-      int64_t pk = vals[pk_idx].i;
       uint32_t vec_off = 0;
-      std::string payload = encode_row(t, vals, &vec_off);
+      encode_row_into(t, vals, payload, &vec_off);
       int64_t off = heap_.append(payload.data(), static_cast<uint32_t>(payload.size()));
       uint32_t slot = static_cast<uint32_t>(t.slots.size());
       RowRef ref;
@@ -1367,6 +1414,7 @@ struct Database::Impl {
       u.table = t.name;
       u.slot = slot;
       undo_entry(u);
+      ++res.affected_rows;
     }
     return res;
   }
