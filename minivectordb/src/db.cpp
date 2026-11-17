@@ -62,12 +62,20 @@ struct Table {
   std::vector<RowRef> slots;
   std::unordered_map<int64_t, uint32_t> pk2slot;
   std::vector<std::string> indexes;
-  struct EqIndex {
-    std::unordered_map<std::string, std::vector<uint32_t>> by_str;
-    std::unordered_map<int64_t, std::vector<uint32_t>> by_int;
+  // Bucket entry remembers the row offset it was indexed from: an unchanged
+  // offset means the row bytes are untouched, so the predicate need not be
+  // re-checked. Rows rewritten by update get a fresh entry; stale ones fail
+  // the offset test and fall back to re-verification.
+  struct IndexEntry {
+    uint32_t slot = 0;
+    int64_t off = 0;
   };
-  // Add-only equality buckets, built on first use. Entries may be stale after
-  // update/delete/rollback; every candidate is re-checked against the row.
+  struct EqIndex {
+    std::unordered_map<std::string, std::vector<IndexEntry>> by_str;
+    std::unordered_map<int64_t, std::vector<IndexEntry>> by_int;
+  };
+  // Add-only equality buckets, built on first use. Entries whose row was
+  // rewritten since indexing are re-checked against the current row bytes.
   std::unordered_map<int, EqIndex> eq_indexes;
   int pk_idx = -1;
   int vec_idx = -1;
@@ -1626,7 +1634,7 @@ struct Database::Impl {
       t.slots.push_back(ref);
       t.pk2slot[pk] = slot;
       for (const auto &kv : t.eq_indexes) {
-        eq_index_add(t, kv.first, slot, vals[static_cast<size_t>(kv.first)]);
+        eq_index_add(t, kv.first, slot, vals[static_cast<size_t>(kv.first)], off);
       }
       WalOp op;
       op.type = 3;
@@ -1692,15 +1700,16 @@ struct Database::Impl {
     return true;
   }
 
-  void eq_index_add(Table &t, int ci, uint32_t slot, const Value &v) {
+  void eq_index_add(Table &t, int ci, uint32_t slot, const Value &v, int64_t off) {
     auto it = t.eq_indexes.find(ci);
     if (it == t.eq_indexes.end()) {
       return;
     }
+    Table::IndexEntry e{slot, off};
     if (t.cols[static_cast<size_t>(ci)].type == ColType::BIGINT) {
-      it->second.by_int[v.i].push_back(slot);
+      it->second.by_int[v.i].push_back(e);
     } else {
-      it->second.by_str[v.s].push_back(slot);
+      it->second.by_str[v.s].push_back(e);
     }
   }
 
@@ -1722,9 +1731,9 @@ struct Database::Impl {
         continue;
       }
       if (t.cols[static_cast<size_t>(ci)].type == ColType::BIGINT) {
-        idx.by_int[cur.i64(ci)].push_back(si);
+        idx.by_int[cur.i64(ci)].push_back(Table::IndexEntry{si, ref.off});
       } else {
-        idx.by_str[std::string(cur.str(ci))].push_back(si);
+        idx.by_str[std::string(cur.str(ci))].push_back(Table::IndexEntry{si, ref.off});
       }
     }
     return idx;
@@ -1932,8 +1941,9 @@ struct Database::Impl {
       const bool vec_fast = where.empty() && order_col == t.vec_idx;
 
       // A single equality predicate on an ordinary column visits only that
-      // bucket. Buckets are add-only, so every candidate is verified against
-      // the current row bytes before it is scored.
+      // bucket. Buckets are add-only: an entry whose row offset still matches
+      // the live row is guaranteed to satisfy the predicate, otherwise the row
+      // is verified against its current bytes.
       std::vector<uint32_t> matched;
       bool idx_active = false;
       if (where.size() == 1 && where[0].op == CmpOp::EQ) {
@@ -1941,7 +1951,7 @@ struct Database::Impl {
         const Column &col = t.cols[static_cast<size_t>(p.col)];
         if (col.type == ColType::BIGINT || (col.type == ColType::VARCHAR && col.len <= 128)) {
           const Table::EqIndex &idx = eq_index(t, p.col);
-          const std::vector<uint32_t> *bucket = nullptr;
+          const std::vector<Table::IndexEntry> *bucket = nullptr;
           if (col.type == ColType::BIGINT) {
             auto it = idx.by_int.find(p.i);
             if (it != idx.by_int.end()) {
@@ -1956,12 +1966,28 @@ struct Database::Impl {
           idx_active = true;
           if (bucket != nullptr) {
             matched.reserve(bucket->size());
-            for (uint32_t si : *bucket) {
-              if (si >= t.slots.size()) {
+            // A row updated to a value it already had leaves two matching
+            // entries behind; the bitmap keeps each row in the result once.
+            std::vector<uint64_t> seen((t.slots.size() + 63) / 64, 0);
+            auto accept = [&](uint32_t slot) {
+              uint64_t &word = seen[slot >> 6];
+              uint64_t bit = uint64_t{1} << (slot & 63);
+              if (word & bit) {
+                return;
+              }
+              word |= bit;
+              matched.push_back(slot);
+            };
+            for (const Table::IndexEntry &e : *bucket) {
+              if (e.slot >= t.slots.size()) {
                 continue;
               }
-              const RowRef &ref = t.slots[si];
+              const RowRef &ref = t.slots[e.slot];
               if (!ref.alive) {
+                continue;
+              }
+              if (e.off == ref.off) {
+                accept(e.slot);
                 continue;
               }
               Cursor cur;
@@ -1973,7 +1999,7 @@ struct Database::Impl {
               if (!row_matches(t, cur, where)) {
                 continue;
               }
-              matched.push_back(si);
+              accept(e.slot);
             }
           }
         }
@@ -2238,7 +2264,7 @@ struct Database::Impl {
       for (const auto &kv : t.eq_indexes) {
         for (const auto &set : sets) {
           if (set.first == kv.first) {
-            eq_index_add(t, kv.first, si, vals[static_cast<size_t>(kv.first)]);
+            eq_index_add(t, kv.first, si, vals[static_cast<size_t>(kv.first)], off);
             break;
           }
         }
