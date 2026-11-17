@@ -22,6 +22,7 @@
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
+#include <type_traits>
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/time/ob_time_utility.h"
@@ -117,6 +118,7 @@ bool tk_memo_disabled()
   return disabled;
 }
 
+
 void tk_key_put_u8(char *buf, int64_t &pos, const uint8_t v)
 {
   buf[pos++] = static_cast<char>(v);
@@ -144,8 +146,18 @@ void tk_key_put_bytes(char *buf, int64_t &pos, const char *data, const int64_t l
 
 uint64_t tk_memo_hash(const char *data, const int64_t len)
 {
+  // Only a fast reject in front of the full byte comparison, so the mixing does not have to be
+  // cryptographic: eight bytes at a time keeps a ~100 byte key at a dozen rounds.
   uint64_t h = 1469598103934665603ULL;
-  for (int64_t i = 0; i < len; ++i) {
+  const int64_t words = len >> 3;
+  const char *cur = data;
+  for (int64_t i = 0; i < words; ++i) {
+    uint64_t w = 0;
+    MEMCPY(&w, cur, sizeof(w));
+    h = (h ^ w) * 1099511628211ULL;
+    cur += sizeof(w);
+  }
+  for (int64_t i = words << 3; i < len; ++i) {
     h ^= static_cast<uint64_t>(static_cast<unsigned char>(data[i]));
     h *= 1099511628211ULL;
   }
@@ -209,6 +221,117 @@ void tk_memo_store(const char *key, const int64_t key_len, const uint64_t hash,
     }
   }
 }
+// ---------------------------------------------------------------------------------------------
+// Parser/property assembly memo.
+//
+// parse_param() rebuilds the same objects from the same two arguments on every evaluation: the
+// parser name is parsed and serialised, the property json is walked and turned into a property
+// object, and the dictionary check takes a lock. None of that depends on the text, so a slot may
+// keep the finished assembly for this thread. The key is the argument bytes verbatim plus the
+// presence and type shape of both arguments, the collation the dictionary check reads and the
+// dictionary generation; the text is deliberately absent. A slot is only used after the full byte
+// comparison, never because it was "the last one seen", and a miss always runs the complete
+// parse_param path and then refreshes the slot.
+constexpr int64_t TK_ASM_MAX_PARSER_ARG = 256;
+constexpr int64_t TK_ASM_MAX_PROPS_ARG = 4096;
+constexpr int64_t TK_ASM_KEY_CAP = TK_ASM_MAX_PROPS_ARG + TK_ASM_MAX_PARSER_ARG + 64;
+constexpr uint32_t TK_ASM_KEY_MAGIC = 0x314D4B41u; // 'AKM1'
+constexpr uint32_t TK_ASM_KEY_VERSION = 1;
+
+struct TkAsmSlot
+{
+  uint64_t hash_;
+  uint64_t stamp_;
+  bool valid_;
+  int64_t key_len_;
+  int64_t key_cap_;
+  char *key_;
+  int64_t props_cap_;
+  char *props_;
+  int32_t props_len_;
+  int32_t parser_name_len_;
+  int32_t output_mode_;
+  char parser_name_[storage::OB_FT_PARSER_NAME_LENGTH];
+  // ObFTParser (a fixed name buffer plus an integer) and ObFTParserProperty (integers plus ObStrings
+  // that only ever point at string literals) are trivially copyable and own no pointer into the
+  // evaluation, so a byte copy is exactly what assignment would do and stays valid after the
+  // evaluation's own arena is gone. Checked at compile time right below.
+  char parser_blob_[sizeof(storage::ObFTParser)];
+  char property_blob_[sizeof(storage::ObFTParserProperty)];
+};
+
+struct TkAsmThread
+{
+  TkAsmSlot slots_[2];
+  uint64_t stamp_;
+};
+
+static_assert(std::is_trivially_copyable<storage::ObFTParser>::value,
+              "the parser assembly is copied byte for byte");
+static_assert(std::is_trivially_copyable<storage::ObFTParserProperty>::value,
+              "the property assembly is copied byte for byte");
+
+// Plain TLS read: TkAsmThread is an aggregate of plain fields, so this needs no guard variable.
+TkAsmThread &tk_asm_thread()
+{
+  static thread_local TkAsmThread tls;
+  return tls;
+}
+
+TkAsmSlot *tk_asm_find(const char *key, const int64_t key_len, const uint64_t hash)
+{
+  TkAsmSlot *found = nullptr;
+  TkAsmThread &tls = tk_asm_thread();
+  for (int32_t i = 0; i < 2 && nullptr == found; ++i) {
+    TkAsmSlot &slot = tls.slots_[i];
+    if (slot.valid_ && slot.key_len_ == key_len && slot.hash_ == hash
+        && 0 == MEMCMP(slot.key_, key, key_len)) {
+      slot.stamp_ = ++tls.stamp_;
+      found = &slot;
+    }
+  }
+  return found;
+}
+
+// Never called after a hit: only a miss path that ran to success stores, so a slot is always the
+// result of a complete, validated parse_param().
+void tk_asm_store(const char *key, const int64_t key_len, const uint64_t hash,
+                  const storage::ObFTParser &parser,
+                  const storage::ObFTParserProperty &property,
+                  const common::ObString &parser_name,
+                  const common::ObString &props,
+                  const int64_t output_mode)
+{
+  if (key_len > 0 && key_len <= TK_ASM_KEY_CAP
+      && parser_name.length() < storage::OB_FT_PARSER_NAME_LENGTH
+      && props.length() <= TK_ASM_MAX_PROPS_ARG) {
+    TkAsmThread &tls = tk_asm_thread();
+    TkAsmSlot &slot = (tls.slots_[0].stamp_ <= tls.slots_[1].stamp_) ? tls.slots_[0] : tls.slots_[1];
+    slot.valid_ = false;
+    // The properties buffer always keeps room for the terminating byte, so a hit always has a
+    // pointer to hand to ObString even when the canonical form is the empty string.
+    if (tk_memo_reserve(slot.key_, slot.key_cap_, key_len)
+        && tk_memo_reserve(slot.props_, slot.props_cap_, props.length() + 1)) {
+      MEMCPY(slot.key_, key, key_len);
+      if (props.length() > 0) {
+        MEMCPY(slot.props_, props.ptr(), props.length());
+      }
+      slot.props_[props.length()] = '\0';
+      MEMCPY(slot.parser_name_, parser_name.ptr(), parser_name.length());
+      slot.parser_name_[parser_name.length()] = '\0';
+      MEMCPY(slot.parser_blob_, &parser, sizeof(storage::ObFTParser));
+      MEMCPY(slot.property_blob_, &property, sizeof(storage::ObFTParserProperty));
+      slot.key_len_ = key_len;
+      slot.props_len_ = static_cast<int32_t>(props.length());
+      slot.parser_name_len_ = static_cast<int32_t>(parser_name.length());
+      slot.output_mode_ = static_cast<int32_t>(output_mode);
+      slot.hash_ = hash;
+      slot.stamp_ = ++tls.stamp_;
+      slot.valid_ = true;
+    }
+  }
+}
+
 } // namespace
 
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
@@ -503,20 +626,106 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 {
   int ret = OB_SUCCESS;
 
-  ObDatum *parser_params_datum;
-  ObString raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
-
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  
   MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
+
+  char asm_key[TK_ASM_KEY_CAP];
+  int64_t asm_key_pos = 0;
+  uint64_t asm_key_hash = 0;
+  bool asm_cacheable = false;
 
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
-  } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
-  } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  } else {
+    // The two remaining arguments are evaluated here so that their bytes can key the assembly; the
+    // parse functions below evaluate them again, which only reads the datum the expression already
+    // produced. The NULL shape is recorded here exactly as those functions record it.
+    ObDatum *parser_datum = nullptr;
+    ObDatum *props_datum = nullptr;
+    ObString raw_parser;
+    ObString raw_props;
+    bool parser_plain = false;
+    bool props_plain = false;
+    if (expr.arg_cnt_ < 2) {
+      param.parser_is_null_ = true;
+    } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+    } else if (OB_UNLIKELY(parser_datum->is_null())) {
+      param.parser_is_null_ = true;
+    } else if (OB_UNLIKELY(parser_datum->is_outrow() || parser_datum->is_ext())) {
+      // A LOB argument never enters the memo, exactly like a LOB text in the token-stream memo.
+    } else {
+      param.parser_is_null_ = false;
+      parser_plain = true;
+      raw_parser = parser_datum->get_string();
+    }
+    if (OB_SUCC(ret)) {
+      if (expr.arg_cnt_ < 3) {
+        param.properties_is_null_ = true;
+      } else if (OB_FAIL(expr.args_[2]->eval(ctx, props_datum))) {
+      } else if (OB_UNLIKELY(props_datum->is_null())) {
+        param.properties_is_null_ = true;
+      } else if (OB_UNLIKELY(props_datum->is_outrow() || props_datum->is_ext())) {
+      } else {
+        param.properties_is_null_ = false;
+        props_plain = true;
+        raw_props = props_datum->get_string();
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const int64_t parser_len = parser_plain ? raw_parser.length() : 0;
+      const int64_t props_len = props_plain ? raw_props.length() : 0;
+      asm_cacheable = !tk_memo_disabled()
+                      && parser_len <= TK_ASM_MAX_PARSER_ARG
+                      && props_len <= TK_ASM_MAX_PROPS_ARG;
+      if (asm_cacheable) {
+        const uint8_t flags = static_cast<uint8_t>((parser_plain ? 0 : 1) | (props_plain ? 0 : 2));
+        const uint8_t parser_type = expr.arg_cnt_ < 2
+            ? 0 : static_cast<uint8_t>(expr.args_[1]->datum_meta_.get_type());
+        const uint8_t props_type = expr.arg_cnt_ < 3
+            ? 0 : static_cast<uint8_t>(expr.args_[2]->datum_meta_.get_type());
+        tk_key_put_u32(asm_key, asm_key_pos, TK_ASM_KEY_MAGIC);
+        tk_key_put_u32(asm_key, asm_key_pos, TK_ASM_KEY_VERSION);
+        tk_key_put_u64(asm_key, asm_key_pos, static_cast<uint64_t>(ob_tokenize_dict_epoch()));
+        tk_key_put_u8(asm_key, asm_key_pos, flags);
+        tk_key_put_u8(asm_key, asm_key_pos, static_cast<uint8_t>(param.meta_.get_type()));
+        tk_key_put_u8(asm_key, asm_key_pos, parser_type);
+        tk_key_put_u8(asm_key, asm_key_pos, props_type);
+        tk_key_put_u32(asm_key, asm_key_pos, static_cast<uint32_t>(param.meta_.get_collation_type()));
+        tk_key_put_u32(asm_key, asm_key_pos, static_cast<uint32_t>(parser_len));
+        tk_key_put_u32(asm_key, asm_key_pos, static_cast<uint32_t>(props_len));
+        tk_key_put_bytes(asm_key, asm_key_pos, raw_parser.ptr(), parser_len);
+        tk_key_put_bytes(asm_key, asm_key_pos, raw_props.ptr(), props_len);
+        asm_key_hash = tk_memo_hash(asm_key, asm_key_pos);
+      }
+    }
+  }
+
+  TkAsmSlot *asm_slot = nullptr;
+  if (OB_SUCC(ret) && asm_cacheable) {
+    asm_slot = tk_asm_find(asm_key, asm_key_pos, asm_key_hash);
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_NOT_NULL(asm_slot)) {
+      // A hit replaces only the assembly: it was built from byte-identical arguments under the same
+      // dictionary generation, and only a fully successful parse ever stored one. The two pointers
+      // below stay valid for this evaluation because a slot is written only on a miss.
+      MEMCPY(&param.parser_, asm_slot->parser_blob_, sizeof(storage::ObFTParser));
+      MEMCPY(&param.parser_property_, asm_slot->property_blob_, sizeof(storage::ObFTParserProperty));
+      param.parser_name_.assign_ptr(asm_slot->parser_name_, asm_slot->parser_name_len_);
+      param.properties_.assign_ptr(asm_slot->props_, asm_slot->props_len_);
+      param.output_mode_ = static_cast<TokenizeParam::OUTPUT_MODE>(asm_slot->output_mode_);
+    } else {
+      if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
+      } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
+      } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+      } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+      } else if (asm_cacheable) {
+        tk_asm_store(asm_key, asm_key_pos, asm_key_hash, param.parser_, param.parser_property_,
+                     param.parser_name_, param.properties_, param.output_mode_);
+      }
+    }
   }
   return ret;
 }
