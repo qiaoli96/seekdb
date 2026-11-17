@@ -786,8 +786,13 @@ class ScanPool {
   }
 
   ~ScanPool() {
-    stop_.store(true, std::memory_order_release);
-    gen_.fetch_add(1, std::memory_order_release);
+    {
+      // Publish under the mutex: a worker that is between the predicate check
+      // and its enqueue would otherwise miss the notify and park forever.
+      std::lock_guard<std::mutex> lk(m_);
+      stop_.store(true, std::memory_order_release);
+      gen_.fetch_add(1, std::memory_order_release);
+    }
     cv_.notify_all();
     for (std::thread &t : threads_) {
       if (t.joinable()) {
@@ -806,7 +811,10 @@ class ScanPool {
     ctx_ = ctx;
     total_ = total;
     done_.store(0, std::memory_order_relaxed);
-    gen_.fetch_add(1, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      gen_.fetch_add(1, std::memory_order_release);
+    }
     cv_.notify_all();
     run_slice(0);
     const uint32_t need = static_cast<uint32_t>(n_ - 1);
@@ -859,7 +867,12 @@ class ScanPool {
       }
       seen = g;
       run_slice(tid);
-      done_.fetch_add(1, std::memory_order_acq_rel);
+      {
+        // Same rule in the other direction: the completion count is published
+        // under the mutex so the waiting caller cannot miss it.
+        std::lock_guard<std::mutex> lk(m_);
+        done_.fetch_add(1, std::memory_order_release);
+      }
       done_cv_.notify_one();
     }
   }
