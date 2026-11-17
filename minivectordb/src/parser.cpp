@@ -123,7 +123,7 @@ TokenList tokenize(const std::string &sql) {
       continue;
     }
     if (c == '(' || c == ')' || c == ',' || c == '=' || c == '*' || c == ';' ||
-        c == '<' || c == '>' || c == '+' || c == '-') {
+        c == '<' || c == '>' || c == '+' || c == '-' || c == '!') {
       Tok t;
       t.kind = TokKind::PUNCT;
       t.punct = static_cast<char>(c);
@@ -299,6 +299,10 @@ class Parser {
         next();
         return CmpOp::LE;
       }
+      if (peek().kind == TokKind::PUNCT && peek().punct == '>') {
+        next();
+        return CmpOp::NE;
+      }
       return CmpOp::LT;
     }
     if (c == '>') {
@@ -307,6 +311,12 @@ class Parser {
         return CmpOp::GE;
       }
       return CmpOp::GT;
+    }
+    if (c == '!') {
+      if (peek().kind == TokKind::PUNCT && peek().punct == '=') {
+        next();
+        return CmpOp::NE;
+      }
     }
     raise("syntax_error");
   }

@@ -34,7 +34,7 @@ struct Literal {
   std::string s;
 };
 
-enum class CmpOp { EQ, LT, LE, GT, GE };
+enum class CmpOp { EQ, NE, LT, LE, GT, GE };
 
 struct Compare {
   std::string col;

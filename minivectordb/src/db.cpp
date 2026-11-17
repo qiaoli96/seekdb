@@ -551,6 +551,7 @@ Value literal_to_value(const Column &col, const Literal &lit) {
 bool apply_cmp(int cmp, CmpOp op) {
   switch (op) {
     case CmpOp::EQ: return cmp == 0;
+    case CmpOp::NE: return cmp != 0;
     case CmpOp::LT: return cmp < 0;
     case CmpOp::LE: return cmp <= 0;
     case CmpOp::GT: return cmp > 0;
