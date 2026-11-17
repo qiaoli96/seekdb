@@ -87,16 +87,19 @@ TokenList tokenize(const std::string &sql) {
       ++i;
       size_t start = i;
       bool escaped = false;
-      while (i < sql.size()) {
-        if (sql[i] == '\'') {
-          if (i + 1 < sql.size() && sql[i + 1] == '\'') {
-            escaped = true;
-            i += 2;
-            continue;
-          }
+      while (true) {
+        const char *q = static_cast<const char *>(memchr(sql.data() + i, '\'', sql.size() - i));
+        if (q == nullptr) {
+          i = sql.size();
           break;
         }
-        ++i;
+        i = static_cast<size_t>(q - sql.data());
+        if (i + 1 < sql.size() && sql[i + 1] == '\'') {
+          escaped = true;
+          i += 2;
+          continue;
+        }
+        break;
       }
       if (i >= sql.size()) {
         raise("syntax_error");

@@ -202,17 +202,17 @@ class JsonParser {
       }
       // Copy whole runs of plain characters; escaping is the uncommon case and
       // the request bodies are dominated by large SQL literals.
-      size_t run = pos_;
-      while (run < n_ && p_[run] != '"' && p_[run] != '\\') {
-        ++run;
-      }
-      v.s.append(p_ + pos_, run - pos_);
-      pos_ = run;
-      if (pos_ >= n_) {
+      const char *q = static_cast<const char *>(memchr(p_ + pos_, '"', n_ - pos_));
+      if (q == nullptr) {
         bad();
       }
-      if (p_[pos_] == '"') {
-        ++pos_;
+      size_t quote = static_cast<size_t>(q - p_);
+      const char *b = static_cast<const char *>(memchr(p_ + pos_, '\\', quote - pos_));
+      size_t bs = b != nullptr ? static_cast<size_t>(b - p_) : quote;
+      v.s.append(p_ + pos_, bs - pos_);
+      pos_ = bs;
+      if (bs == quote) {
+        pos_ = quote + 1;
         break;
       }
       ++pos_;  // backslash
