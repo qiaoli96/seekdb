@@ -781,9 +781,16 @@ struct ScanCand {
 #if defined(__x86_64__) || defined(__i386__)
 // Ascending ORDER BY distance Top-K over a contiguous row scan. Keeps the
 // exact same arithmetic as l2_sq_avx2 so returned distances are unchanged.
+//
+// kPfLines/kPfDist trade prefetch coverage against instruction count. With two
+// scan threads (the quota-limited case) a core stalls on L3 latency and the
+// deeper lookahead measured ~13% faster on 10k rows; with four threads the
+// ring already supplies bandwidth, where the narrow prefetch is faster.
+template <uint32_t kPfLines, uint32_t kPfDist>
 __attribute__((target("avx2,fma")))
-void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, uint32_t n,
-                    int64_t dim, const float *q, uint32_t k, ScanCand *top, uint32_t *out_n) {
+void scan_topk_avx2_impl(const char *map, const RowRef *slots, const uint32_t *idx, uint32_t n,
+                         int64_t dim, const float *q, uint32_t k, ScanCand *top,
+                         uint32_t *out_n) {
   uint32_t filled = 0;
   for (uint32_t i = 0; i < n; ++i) {
     uint32_t si = idx != nullptr ? idx[i] : i;
@@ -792,16 +799,14 @@ void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, u
       continue;
     }
     {
-      // Prefetch two lines of the row kPfDist ahead; further lines did not pay
-      // off in measurements and the vector walk already overlaps loads.
-      constexpr uint32_t kPfDist = 8;
       uint32_t pi = i + kPfDist;
       if (pi < n) {
         uint32_t pj = idx != nullptr ? idx[pi] : pi;
         const RowRef &pf = slots[pj];
         const char *pv = map + pf.off + pf.vec_off;
-        __builtin_prefetch(pv);
-        __builtin_prefetch(pv + 128);
+        for (uint32_t pfx = 0; pfx < kPfLines; ++pfx) {
+          __builtin_prefetch(pv + pfx * 64);
+        }
       }
     }
     const float *fa = reinterpret_cast<const float *>(map + ref.off + ref.vec_off);
@@ -849,6 +854,17 @@ void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, u
     }
   }
   *out_n = filled;
+}
+
+__attribute__((target("avx2,fma")))
+void scan_topk_avx2(const char *map, const RowRef *slots, const uint32_t *idx, uint32_t n,
+                    int64_t dim, const float *q, uint32_t k, ScanCand *top, uint32_t *out_n,
+                    bool deep_pf) {
+  if (deep_pf) {
+    scan_topk_avx2_impl<4, 12>(map, slots, idx, n, dim, q, k, top, out_n);
+  } else {
+    scan_topk_avx2_impl<2, 8>(map, slots, idx, n, dim, q, k, top, out_n);
+  }
 }
 #endif
 
@@ -1072,6 +1088,7 @@ struct ParScan {
   uint32_t k = 0;
   std::vector<std::vector<ScanCand>> top;
   std::vector<uint32_t> got;
+  bool deep_pf = false;
 };
 
 void par_scan_fn(void *ctxv, int tid, uint32_t lo, uint32_t hi) {
@@ -1081,9 +1098,11 @@ void par_scan_fn(void *ctxv, int tid, uint32_t lo, uint32_t hi) {
   top.resize(p.k);
   const uint32_t n = hi - lo;
   if (p.idx != nullptr) {
-    scan_topk_avx2(p.map, p.slots, p.idx + lo, n, p.dim, p.q, p.k, top.data(), &p.got[t]);
+    scan_topk_avx2(p.map, p.slots, p.idx + lo, n, p.dim, p.q, p.k, top.data(), &p.got[t],
+                   p.deep_pf);
   } else {
-    scan_topk_avx2(p.map, p.slots + lo, nullptr, n, p.dim, p.q, p.k, top.data(), &p.got[t]);
+    scan_topk_avx2(p.map, p.slots + lo, nullptr, n, p.dim, p.q, p.k, top.data(), &p.got[t],
+                   p.deep_pf);
     for (uint32_t i = 0; i < p.got[t]; ++i) {
       top[i].slot += lo;
     }
@@ -2303,8 +2322,9 @@ struct Database::Impl {
           const size_t nt = static_cast<size_t>(pool->size());
           ps.top.resize(nt);
           ps.got.assign(nt, 0);
-          pool->run(par_scan_fn, &ps, scan_n,
-                    active_threads(pool->size(), scan_n, kScanRowsPerThread));
+          const int active = active_threads(pool->size(), scan_n, kScanRowsPerThread);
+          ps.deep_pf = active <= 2;
+          pool->run(par_scan_fn, &ps, scan_n, active);
           size_t total = 0;
           for (size_t i = 0; i < nt; ++i) {
             total += ps.got[i];
@@ -2325,7 +2345,7 @@ struct Database::Impl {
           uint32_t got = 0;
           scan_topk_avx2(heap_.ptr(0), t.slots.data(), scan_idx, scan_n, dim,
                          reinterpret_cast<const float *>(q), static_cast<uint32_t>(limit),
-                         top.data(), &got);
+                         top.data(), &got, true);
           cands.reserve(got);
           for (uint32_t i = 0; i < got; ++i) {
             cands.push_back(DistCand{top[i].d, top[i].pk, top[i].slot});
