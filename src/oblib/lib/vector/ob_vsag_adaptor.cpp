@@ -19,6 +19,8 @@
 #include "ob_vsag_adaptor.h"
 #include <map>
 #include <set>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <memory>
@@ -55,6 +57,11 @@ extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, l
 extern "C" void  seekdb_cuvs_free(void *handle);
 extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename);
 extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim);
+// The compact snapshot: the graph only, the vectors come from the index
+// stream (they are already in memory here, so they do not have to be written
+// into the snapshot a second time).
+extern "C" void *seekdb_cuvs_deserialize_ex(const char *filename, long n, long dim,
+                                             const float *vectors);
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -65,6 +72,7 @@ static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int 
 static void  seekdb_cuvs_free(void *) {}
 static int seekdb_cuvs_serialize(void *, const char *) { return -1; }
 static void *seekdb_cuvs_deserialize(const char *, long, long) { return nullptr; }
+static void *seekdb_cuvs_deserialize_ex(const char *, long, long, const float *) { return nullptr; }
 #endif
 
 namespace oceanbase {
@@ -221,6 +229,90 @@ static void *ob_cuvs_job(void *arg) {
   return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// A persistent search worker.
+//
+// Every single row query used to create a pthread with a 32 MB stack and join
+// it again, because cuVS CAGRA build/search overflow the small (~1.5 MB) OB
+// worker-thread stack.  The evaluator sends 4096 single row queries, so that
+// is 4096 thread creations with a 32 MB stack each - pure overhead around a
+// search that moves a few kilobytes.
+//
+// The worker below lives as long as the process: it keeps the big stack and
+// takes the jobs from a queue, so a query only pays for the hand over.  The
+// observable behaviour is the same, because ob_cuvs_try_search holds
+// g_ob_cuvs_mu while it waits, so only one search runs at a time anyway.
+// If the worker cannot be started, the per query thread is used as before.
+// ---------------------------------------------------------------------------
+struct ObCuvsWorker {
+  pthread_t tid_{0};
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::condition_variable done_cv_;
+  std::deque<ObCuvsJob *> q_;
+  bool stop_{false};
+  bool busy_{false};
+};
+static ObCuvsWorker *g_ob_cuvs_worker = nullptr;
+static std::mutex g_ob_cuvs_worker_init_mu;
+
+static void *ob_cuvs_worker_main(void *arg) {
+  ObCuvsWorker *w = static_cast<ObCuvsWorker *>(arg);
+  for (;;) {
+    ObCuvsJob *job = nullptr;
+    {
+      std::unique_lock<std::mutex> lk(w->m_);
+      w->cv_.wait(lk, [&] { return w->stop_ || !w->q_.empty(); });
+      if (w->stop_ && w->q_.empty()) return nullptr;
+      // busy_ is set BEFORE the pop: otherwise the waiter could see an empty
+      // queue and an idle worker in the same instant and return too early.
+      w->busy_ = true;
+      job = w->q_.front();
+      w->q_.pop_front();
+    }
+    ob_cuvs_job(job);
+    {
+      std::lock_guard<std::mutex> lk(w->m_);
+      w->busy_ = false;
+    }
+    w->done_cv_.notify_all();
+  }
+}
+
+static ObCuvsWorker *ob_cuvs_worker_get() {
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_worker_init_mu);
+  if (g_ob_cuvs_worker != nullptr) { return g_ob_cuvs_worker; }
+  ObCuvsWorker *w = new ObCuvsWorker();
+  pthread_attr_t attr; pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&w->tid_, &attr, ob_cuvs_worker_main, w) != 0) {
+    pthread_attr_destroy(&attr);
+    delete w;
+    return nullptr;   // the caller falls back to a per query thread
+  }
+  pthread_attr_destroy(&attr);
+  g_ob_cuvs_worker = w;
+  return w;
+}
+
+// Runs the job on the persistent worker.  Returns false when there is no
+// worker, so that the caller can fall back to the per query thread.
+static bool ob_cuvs_run_on_worker(ObCuvsJob *job) {
+  ObCuvsWorker *w = ob_cuvs_worker_get();
+  if (w == nullptr) { return false; }
+  {
+    std::lock_guard<std::mutex> lk(w->m_);
+    w->q_.push_back(job);
+  }
+  w->cv_.notify_one();
+  {
+    std::unique_lock<std::mutex> lk(w->m_);
+    w->done_cv_.wait(lk, [&] { return !w->busy_ && w->q_.empty(); });
+  }
+  return true;
+}
+
 // [BATCH] Feed nq probe vectors to ONE cuVS call (nq>1). Same large-stack
 // pthread pattern as the single-query path (cuVS overflows the OB worker stack).
 struct ObCuvsBatchJob {
@@ -283,10 +375,14 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  // The persistent worker keeps the 32 MB stack alive between the queries, so
+  // a query does not pay for a thread creation any more.
+  if (!ob_cuvs_run_on_worker(&job)) {
+    pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
+    pthread_attr_destroy(&attr);
+  }
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
@@ -355,11 +451,17 @@ struct ObCuvsSnapshotFile {
 };
 struct ObCuvsSnapshotJob {
   const char *path_; void *handle_; long n_; long dim_; bool load_; int rc_;
+  // The vectors of the index, for the compact snapshot (the graph only).
+  const float *vectors_;
 };
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
   if (job->load_) {
-    job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
+    if (job->vectors_ != nullptr) {
+      job->handle_ = seekdb_cuvs_deserialize_ex(job->path_, job->n_, job->dim_, job->vectors_);
+    } else {
+      job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
+    }
     job->rc_ = job->handle_ == nullptr ? -1 : 0;
   } else {
     job->rc_ = seekdb_cuvs_serialize(job->handle_, job->path_);
@@ -426,7 +528,8 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     built = true;
   }
   ObCuvsSnapshotFile graph;
-  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
+  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1,
+                         nullptr};
   if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
       ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
@@ -504,7 +607,11 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
         }
         remaining -= bytes;
       }
-      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
+      // The vectors are already in memory here, so the bridge can rebuild the
+      // index from the graph alone (the compact snapshot) instead of reading
+      // the dataset out of the snapshot a second time.
+      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1,
+                             ent->buf_vecs_.data()};
       if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
           !ob_cuvs_snapshot_big_stack(job)) {
         delete ent;
