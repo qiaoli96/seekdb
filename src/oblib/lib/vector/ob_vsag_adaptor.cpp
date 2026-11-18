@@ -55,6 +55,11 @@ extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, l
 extern "C" void  seekdb_cuvs_free(void *handle);
 extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename);
 extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim);
+// The compact snapshot: the graph only, the vectors come from the index
+// stream (they are already in memory here, so they do not have to be written
+// into the snapshot a second time).
+extern "C" void *seekdb_cuvs_deserialize_ex(const char *filename, long n, long dim,
+                                             const float *vectors);
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -65,6 +70,7 @@ static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int 
 static void  seekdb_cuvs_free(void *) {}
 static int seekdb_cuvs_serialize(void *, const char *) { return -1; }
 static void *seekdb_cuvs_deserialize(const char *, long, long) { return nullptr; }
+static void *seekdb_cuvs_deserialize_ex(const char *, long, long, const float *) { return nullptr; }
 #endif
 
 namespace oceanbase {
@@ -355,11 +361,17 @@ struct ObCuvsSnapshotFile {
 };
 struct ObCuvsSnapshotJob {
   const char *path_; void *handle_; long n_; long dim_; bool load_; int rc_;
+  // The vectors of the index, for the compact snapshot (the graph only).
+  const float *vectors_;
 };
 static void *ob_cuvs_snapshot_job(void *arg) {
   ObCuvsSnapshotJob *job = static_cast<ObCuvsSnapshotJob *>(arg);
   if (job->load_) {
-    job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
+    if (job->vectors_ != nullptr) {
+      job->handle_ = seekdb_cuvs_deserialize_ex(job->path_, job->n_, job->dim_, job->vectors_);
+    } else {
+      job->handle_ = seekdb_cuvs_deserialize(job->path_, job->n_, job->dim_);
+    }
     job->rc_ = job->handle_ == nullptr ? -1 : 0;
   } else {
     job->rc_ = seekdb_cuvs_serialize(job->handle_, job->path_);
@@ -426,7 +438,8 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     built = true;
   }
   ObCuvsSnapshotFile graph;
-  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
+  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1,
+                         nullptr};
   if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
       ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
@@ -504,7 +517,11 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
         }
         remaining -= bytes;
       }
-      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1};
+      // The vectors are already in memory here, so the bridge can rebuild the
+      // index from the graph alone (the compact snapshot) instead of reading
+      // the dataset out of the snapshot a second time.
+      ObCuvsSnapshotJob job{graph.path_, nullptr, static_cast<long>(n), dim32, true, -1,
+                             ent->buf_vecs_.data()};
       if (graph.file_ == nullptr || remaining != 0 || ::fflush(graph.file_) != 0 ||
           !ob_cuvs_snapshot_big_stack(job)) {
         delete ent;
